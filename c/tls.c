@@ -7,6 +7,8 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/tls1.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #include "quickjs.h"
 
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
@@ -25,9 +27,6 @@ static void tls_conn_free(TLSConnection *conn) {
     free(conn);
 }
 
-/* Create a Uint8Array from a C buffer. Portable across QuickJS versions:
- * builds an ArrayBuffer with JS_NewArrayBufferCopy, then wraps it via the
- * JS-level Uint8Array constructor. */
 static JSValue u8_new(JSContext *ctx, const uint8_t *data, size_t len) {
     JSValue ab = JS_NewArrayBufferCopy(ctx, data, len);
     if (JS_IsException(ab)) return ab;
@@ -37,7 +36,7 @@ static JSValue u8_new(JSContext *ctx, const uint8_t *data, size_t len) {
     if (JS_IsException(ctor) || JS_IsUndefined(ctor)) {
         JS_FreeValue(ctx, ctor);
         JS_FreeValue(ctx, global);
-        return ab;  /* fallback: raw ArrayBuffer */
+        return ab;
     }
     JSValue args[1] = { ab };
     JSValue ta = JS_CallConstructor(ctx, ctor, 1, args);
@@ -47,15 +46,11 @@ static JSValue u8_new(JSContext *ctx, const uint8_t *data, size_t len) {
     return ta;
 }
 
-/* Get raw bytes from either an ArrayBuffer or a Uint8Array (including
- * subarrays). Returns NULL if the JS value isn't binary. */
 static uint8_t *u8_get(JSContext *ctx, size_t *len, JSValueConst v) {
-    /* Try as ArrayBuffer first */
     size_t l = 0;
     uint8_t *p = JS_GetArrayBuffer(ctx, &l, v);
     if (p) { *len = l; return p; }
 
-    /* Try as TypedArray: read byteOffset / byteLength / buffer */
     JSValue off_v = JS_GetPropertyStr(ctx, v, "byteOffset");
     JSValue len_v = JS_GetPropertyStr(ctx, v, "byteLength");
     JSValue buf_v = JS_GetPropertyStr(ctx, v, "buffer");
@@ -101,14 +96,19 @@ static JSValue js_tls_new(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     conn->ctx = SSL_CTX_new(TLS_client_method());
     if (!conn->ctx) { free(conn); return JS_ThrowInternalError(ctx, "SSL_CTX_new failed"); }
 
-    /* Cap to TLS 1.2 — the TLS 1.3 ClientHello's large key_share extension
-     * has been observed to trigger "illegal parameter" alerts against some
-     * servers when driven through a manual Memory-BIO state machine. */
     SSL_CTX_set_max_proto_version(conn->ctx, TLS1_2_VERSION);
 
-    /* MVP: no certificate validation. Swap to SSL_VERIFY_PEER and load a CA
-     * bundle for production-grade safety. */
-    SSL_CTX_set_verify(conn->ctx, SSL_VERIFY_NONE, NULL);
+    /* Load system CA bundle for peer verification.
+     * On Debian/Ubuntu: /etc/ssl/certs/ca-certificates.crt
+     * On RHEL/Fedora: /etc/pki/tls/certs/ca-bundle.crt
+     * OpenSSL probes multiple standard locations automatically. */
+    if (SSL_CTX_set_default_verify_paths(conn->ctx) != 1) {
+        tls_conn_free(conn);
+        return JS_ThrowInternalError(ctx,
+            "Failed to load system CA bundle (install ca-certificates?)");
+    }
+
+    SSL_CTX_set_verify(conn->ctx, SSL_VERIFY_PEER, NULL);
 
     conn->ssl = SSL_new(conn->ctx);
     if (!conn->ssl) { tls_conn_free(conn); return JS_ThrowInternalError(ctx, "SSL_new failed"); }
@@ -125,7 +125,6 @@ static JSValue js_tls_new(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     return JS_NewInt64(ctx, (int64_t)(intptr_t)conn);
 }
 
-/* Must be called BEFORE handshake for proper SNI. */
 static JSValue js_tls_set_server_name(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv) {
     (void)this_val; (void)argc;
@@ -136,7 +135,14 @@ static JSValue js_tls_set_server_name(JSContext *ctx, JSValueConst this_val,
 
     const char *name = JS_ToCString(ctx, argv[1]);
     if (!name) return JS_EXCEPTION;
+
+    /* SNI (Server Name Indication) — selects the vhost */
     SSL_set_tlsext_host_name(conn->ssl, name);
+
+    /* Hostname verification — ensures the cert's CN/SAN matches
+     * the requested hostname. Requires SSL_VERIFY_PEER (set in new). */
+    SSL_set1_host(conn->ssl, name);
+
     JS_FreeCString(ctx, name);
     return JS_UNDEFINED;
 }
@@ -155,13 +161,33 @@ static JSValue js_tls_handshake(JSContext *ctx, JSValueConst this_val, int argc,
     if (err == SSL_ERROR_WANT_READ)  return JS_NewInt32(ctx, 2);
     if (err == SSL_ERROR_WANT_WRITE) return JS_NewInt32(ctx, 3);
 
+    /* Certificate / hostname verification failure?
+     * Surfaced as a distinct, human-readable message. */
+    long vres = SSL_get_verify_result(conn->ssl);
+    if (vres != X509_V_OK) {
+        const char *reason = X509_verify_cert_error_string(vres);
+        return JS_ThrowInternalError(ctx,
+            "TLS cert verification failed: %s", reason ? reason : "unknown");
+    }
+
     char err_buf[256];
     ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
     return JS_ThrowInternalError(ctx, "TLS handshake failed: %s", err_buf);
 }
 
-/* Plaintext read as string — kept for compatibility; not used by the
- * HTTP client anymore (readBytes is preferred for binary safety). */
+/* Utility — query current verify result (for debugging / UI messages). */
+static JSValue js_tls_get_verify_result(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc;
+    int64_t conn_ptr;
+    if (JS_ToInt64(ctx, &conn_ptr, argv[0])) return JS_EXCEPTION;
+    TLSConnection *conn = (TLSConnection *)(intptr_t)conn_ptr;
+    if (!conn) return JS_ThrowInternalError(ctx, "invalid connection");
+
+    long vres = SSL_get_verify_result(conn->ssl);
+    if (vres == X509_V_OK) return JS_NewString(ctx, "OK");
+    return JS_NewString(ctx, X509_verify_cert_error_string(vres));
+}
+
 static JSValue js_tls_read(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val; (void)argc;
     int64_t conn_ptr;
@@ -180,9 +206,6 @@ static JSValue js_tls_read(JSContext *ctx, JSValueConst this_val, int argc, JSVa
     return JS_NewInt32(ctx, -4);
 }
 
-/* Plaintext read as raw bytes (Uint8Array). Binary-safe — the HTTP client
- * accumulates these across calls and decodes UTF-8 once at the end, which
- * prevents split multibyte sequences from becoming U+FFFD. */
 static JSValue js_tls_read_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val; (void)argc;
     int64_t conn_ptr;
@@ -230,7 +253,6 @@ static JSValue js_tls_write(JSContext *ctx, JSValueConst this_val, int argc, JSV
     return JS_NewInt32(ctx, -4);
 }
 
-/* Ciphertext out — returns Uint8Array (binary safe). */
 static JSValue js_tls_get_outgoing(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val; (void)argc;
     int64_t conn_ptr;
@@ -252,7 +274,6 @@ static JSValue js_tls_get_outgoing(JSContext *ctx, JSValueConst this_val, int ar
     return out;
 }
 
-/* Ciphertext in — accepts Uint8Array or ArrayBuffer (binary safe). */
 static JSValue js_tls_feed_incoming(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val; (void)argc;
     int64_t conn_ptr;
@@ -268,7 +289,6 @@ static JSValue js_tls_feed_incoming(JSContext *ctx, JSValueConst this_val, int a
     return JS_NewInt32(ctx, n);
 }
 
-/* Binary-safe send to a socket fd. */
 static JSValue js_tls_send_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val; (void)argc;
     int fd;
@@ -286,11 +306,6 @@ static JSValue js_tls_send_bytes(JSContext *ctx, JSValueConst this_val, int argc
     return JS_NewInt32(ctx, (int32_t)sent);
 }
 
-/* Binary-safe recv from a socket fd.
- *  - Uint8Array with length > 0  → data received
- *  - Uint8Array with length == 0 → EAGAIN (nothing right now)
- *  - null                        → EOF (peer closed)
- */
 static JSValue js_tls_recv_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val; (void)argc;
     int fd, maxlen;
@@ -329,6 +344,7 @@ static const JSCFunctionListEntry tls_funcs[] = {
     JS_CFUNC_DEF("new", 0, js_tls_new),
     JS_CFUNC_DEF("setServerName", 2, js_tls_set_server_name),
     JS_CFUNC_DEF("handshake", 1, js_tls_handshake),
+    JS_CFUNC_DEF("getVerifyResult", 1, js_tls_get_verify_result),
     JS_CFUNC_DEF("read", 1, js_tls_read),
     JS_CFUNC_DEF("readBytes", 1, js_tls_read_bytes),
     JS_CFUNC_DEF("write", 2, js_tls_write),

@@ -4,3 +4,5 @@ qjsbrowser
 lib/*.so
 quickjs-*/
 quickjs-*.tar.xz
+qjsNetworkSockets-main.tar.gz
+qjsNetworkSockets-main

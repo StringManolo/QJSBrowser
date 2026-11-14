@@ -1,18 +1,24 @@
 CC ?= gcc
 
+# ---------- QuickJS ----------
 QJS_VER := 2025-09-13-2
 QJS_TAR := quickjs-$(QJS_VER).tar.xz
 QJS_URL := https://bellard.org/quickjs/$(QJS_TAR)
 QJS     := quickjs-2025-09-13
 
+# ---------- qjsNetworkSockets ----------
 NET_REF ?= main
 NET_TAR := qjsNetworkSockets-$(NET_REF).tar.gz
 NET_URL := https://github.com/StringManolo/qjsNetworkSockets/archive/refs/heads/$(NET_REF).tar.gz
 NET_DIR := qjsNetworkSockets-$(NET_REF)
 
+# ---------- OpenSSL ----------
+OPENSSL_CFLAGS := $(shell pkg-config --cflags openssl 2>/dev/null)
+OPENSSL_LIBS   := $(shell pkg-config --libs   openssl 2>/dev/null || echo -lssl -lcrypto)
+
 APP_CFLAGS := -Wall -Wextra -Wno-unused-parameter -O2 -fPIC -I$(QJS)
 
-all: qjsbrowser lib/tui.so lib/network_sockets.so
+all: qjsbrowser lib/tui.so lib/network_sockets.so lib/tls.so
 
 # ---------------- QuickJS ----------------
 $(QJS)/quickjs.c:
@@ -44,18 +50,19 @@ lib/tui.so: c/tui.c
 	@mkdir -p lib
 	$(CC) $(APP_CFLAGS) -shared -o $@ c/tui.c -lncursesw
 
+lib/tls.so: c/tls.c
+	@mkdir -p lib
+	$(CC) $(APP_CFLAGS) $(OPENSSL_CFLAGS) -shared -o $@ c/tls.c $(OPENSSL_LIBS)
+
 # ---------------- limpieza ----------------
-# clean: solo artefactos de compilación (deja las fuentes descargadas)
 clean:
-	rm -f qjsbrowser lib/tui.so lib/network_sockets.so
+	rm -f qjsbrowser lib/tui.so lib/network_sockets.so lib/tls.so
 	-$(MAKE) -C $(QJS) clean >/dev/null 2>&1 || true
 	-rm -f $(QJS)/*.o $(QJS)/libquickjs.a
 
-# clean-src: solo las fuentes descargadas (conserva binarios)
 clean-src:
 	rm -rf $(QJS) $(QJS_TAR) $(NET_DIR) $(NET_TAR)
 
-# distclean: vuelta al estado original del repo
 distclean: clean clean-src
 
 .PHONY: all clean clean-src distclean

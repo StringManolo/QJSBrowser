@@ -16,7 +16,12 @@ const WELCOME =
   '  r          reload\n' +
   '  g / :      edit URL\n' +
   '  Tab        toggle address/page\n' +
-  '  q          quit\n';
+  '  q          quit\n\n' +
+  'Mouse:\n' +
+  '  click ◀ ▶ ⟳ ⌂   toolbar actions\n' +
+  '  click address    focus URL bar\n' +
+  '  click [N] link   navigate\n' +
+  '  wheel up/down    scroll\n';
 
 export function createController(deps) {
   const { tui, net, keys, epfd, httpClient, theme,
@@ -31,7 +36,7 @@ export function createController(deps) {
   let statusText = 'ready';
   let cursorPos = null;
 
-  // ---------- address bar renderer ----------
+  // ---------- address bar ----------
   function renderAddressBar(x, y, w, focused) {
     const bg = focused ? P.addressFocus : P.address;
     tui.fillPair(y, x, 1, w, bg);
@@ -71,39 +76,23 @@ export function createController(deps) {
     cursorPos = null;
 
     tui.erase();
-
-    // Outer window
     drawWindow(tui, theme, { x: 0, y: 0, w: cols, h: rows, title: 'QJSBrowser', focused: true, style: 0 });
 
-    // Toolbar row (row 1)
     const tbW = cols - 2;
     const tbUsed = toolbar.render(1, 1, tbW, mode);
 
-    // Address bar (rest of toolbar row)
     const addrX = 1 + tbUsed;
     const addrW = tbW - tbUsed;
-    if (addrW > 2) {
-      renderAddressBar(addrX, 1, addrW, mode === 'omnibox');
-    }
+    if (addrW > 2) renderAddressBar(addrX, 1, addrW, mode === 'omnibox');
 
-    // Separator
-    if (rows > 4) {
-      tui.hline(2, 1, cols - 2, P.separator, '─');
-    }
+    if (rows > 4) tui.hline(2, 1, cols - 2, P.separator, '─');
 
-    // Page area
     const pageY = 3;
     const pageH = rows - 6;
-    if (pageH > 0) {
-      pageView.render(1, pageY, cols - 2, pageH);
-    }
+    if (pageH > 0) pageView.render(1, pageY, cols - 2, pageH);
 
-    // Bottom separator
-    if (rows > 5) {
-      tui.hline(rows - 3, 1, cols - 2, P.separator, '─');
-    }
+    if (rows > 5) tui.hline(rows - 3, 1, cols - 2, P.separator, '─');
 
-    // Status bar
     if (rows > 4) {
       const stY = rows - 2;
       const stW = cols - 2;
@@ -112,7 +101,6 @@ export function createController(deps) {
       tui.printPair(stY, 1, line, P.status);
     }
 
-    // Cursor
     if (mode === 'omnibox' && cursorPos) {
       tui.setCursor(1);
       tui.move(cursorPos.y, Math.min(cursorPos.x, cols - 2));
@@ -129,7 +117,8 @@ export function createController(deps) {
     let ch;
     while ((ch = tui.getch()) !== keys.ERR) {
       if (ch === keys.CTRL_C) { running = false; return; }
-      if (ch === 9) {  // Tab
+      if (ch === keys.KEY_MOUSE) { handleMouse(); continue; }
+      if (ch === keys.TAB) {
         mode = (mode === 'omnibox') ? 'page' : 'omnibox';
         if (mode === 'omnibox') omnibox.setText(omnibox.text);
         continue;
@@ -153,30 +142,16 @@ export function createController(deps) {
     const { rows, cols } = tui.size();
     const pageH = rows - 6;
 
-    if (ch === 'g'.charCodeAt(0) || ch === ':'.charCodeAt(0)) {
-      mode = 'omnibox';
-      return;
-    }
+    if (ch === 'g'.charCodeAt(0) || ch === ':'.charCodeAt(0)) { mode = 'omnibox'; return; }
     if (ch === 'q'.charCodeAt(0)) { running = false; return; }
-    if (ch === 'r'.charCodeAt(0)) {
-      if (currentUrl) navigate(currentUrl, { fromHistory: true });
-      return;
-    }
+    if (ch === 'r'.charCodeAt(0)) { if (currentUrl) navigate(currentUrl, { fromHistory: true }); return; }
     if (ch === '['.charCodeAt(0)) { goBack();    return; }
     if (ch === ']'.charCodeAt(0)) { goForward(); return; }
 
-    if (ch === 'j'.charCodeAt(0) || ch === keys.ARROW_DOWN) {
-      pageView.scroll(1, cols - 2, pageH); return;
-    }
-    if (ch === 'k'.charCodeAt(0) || ch === keys.ARROW_UP) {
-      pageView.scroll(-1, cols - 2, pageH); return;
-    }
-    if (ch === keys.SPACE) {
-      pageView.scroll(Math.max(1, pageH - 2), cols - 2, pageH); return;
-    }
-    if (ch === 'b'.charCodeAt(0)) {
-      pageView.scroll(-Math.max(1, pageH - 2), cols - 2, pageH); return;
-    }
+    if (ch === 'j'.charCodeAt(0) || ch === keys.ARROW_DOWN) { pageView.scroll(1, cols - 2, pageH); return; }
+    if (ch === 'k'.charCodeAt(0) || ch === keys.ARROW_UP)   { pageView.scroll(-1, cols - 2, pageH); return; }
+    if (ch === keys.SPACE) { pageView.scroll(Math.max(1, pageH - 2), cols - 2, pageH); return; }
+    if (ch === 'b'.charCodeAt(0)) { pageView.scroll(-Math.max(1, pageH - 2), cols - 2, pageH); return; }
 
     if (ch >= '1'.charCodeAt(0) && ch <= '9'.charCodeAt(0)) {
       const n = ch - '0'.charCodeAt(0);
@@ -185,6 +160,75 @@ export function createController(deps) {
       else      statusText = `No link [${n}]`;
       return;
     }
+  }
+
+  // ---------- mouse ----------
+  function handleMouse() {
+    const ev = tui.getMouse();
+    if (!ev) return;
+
+    const { x, y, bstate } = ev;
+
+    // Wheel scroll (works anywhere)
+    if (bstate & tui.BUTTON4_PRESSED) {
+      const { cols, rows } = tui.size();
+      pageView.scroll(-3, cols - 2, rows - 6);
+      return;
+    }
+    if (bstate & tui.BUTTON5_PRESSED) {
+      const { cols, rows } = tui.size();
+      pageView.scroll(3, cols - 2, rows - 6);
+      return;
+    }
+
+    // Left click
+    if (!(bstate & (tui.BUTTON1_CLICKED | tui.BUTTON1_PRESSED))) return;
+
+    const hit = toolbar.hitTest(x, y);
+    if (hit) {
+      if (hit.type === 'address') {
+        if (mode !== 'omnibox') {
+          mode = 'omnibox';
+          omnibox.setText(omnibox.text);
+        }
+        return;
+      }
+      if (hit.type === 'button') {
+        switch (hit.id) {
+          case 'back':    goBack();    break;
+          case 'forward': goForward(); break;
+          case 'reload':  if (currentUrl) navigate(currentUrl, { fromHistory: true }); break;
+          case 'home':    mode = 'omnibox'; omnibox.clear(); break;
+        }
+        return;
+      }
+    }
+
+    // Page area click
+    const { rows, cols } = tui.size();
+    const pageY = 3, pageH = rows - 6, pageX = 1, pageW = cols - 2;
+    if (y >= pageY && y < pageY + pageH && x >= pageX && x < pageX + pageW) {
+      handlePageClick(x - pageX, y - pageY, pageW);
+      return;
+    }
+  }
+
+  function handlePageClick(relX, relY, pageW) {
+    const line = pageView.lineAt(relY, pageW);
+    if (!line) { mode = 'page'; return; }
+
+    const re = /\[(\d+)\]/g;
+    let m;
+    while ((m = re.exec(line)) !== null) {
+      const start = m.index;
+      const end = start + m[0].length;
+      if (relX >= start && relX < end) {
+        const n = parseInt(m[1], 10);
+        const link = pageView.links.find(l => l.n === n);
+        if (link) { navigate(link.href); return; }
+      }
+    }
+    mode = 'page';
   }
 
   // ---------- navigation ----------
@@ -214,10 +258,7 @@ export function createController(deps) {
   }
 
   // ---------- callbacks from httpClient ----------
-  function handleStatus(url, msg) {
-    statusText = msg;
-    render();
-  }
+  function handleStatus(url, msg) { statusText = msg; render(); }
 
   function handleError(url, msg) {
     statusText = 'Error: ' + msg;
@@ -254,7 +295,6 @@ export function createController(deps) {
     render();
   }
 
-  // ---------- init ----------
   pageView.setContent(WELCOME, []);
 
   return {

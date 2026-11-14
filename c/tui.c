@@ -7,8 +7,6 @@
 
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
 
-// ---------- existing primitives ----------
-
 static JSValue t_init(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
   (void)c; (void)v; (void)ac; (void)av;
   initscr(); raw(); noecho(); nonl(); keypad(stdscr, TRUE);
@@ -80,8 +78,6 @@ static JSValue t_get_locale(JSContext *c, JSValueConst v, int ac, JSValueConst *
   return JS_NewString(c, l ? l : "?");
 }
 
-// ---------- new: color + widget primitives ----------
-
 static JSValue t_init_colors(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
   (void)v; (void)ac; (void)av;
   if (!has_colors()) return JS_NewInt32(c, 0);
@@ -108,11 +104,9 @@ static JSValue t_print_pair(JSContext *c, JSValueConst v, int ac, JSValueConst *
   const char *s = JS_ToCString(c, av[2]);
   if (!s) return JS_EXCEPTION;
   if (JS_ToInt32(c, &pairId, av[3])) { JS_FreeCString(c, s); return JS_EXCEPTION; }
-
   attrset(COLOR_PAIR(pairId));
   mvaddstr(y, x, s);
   attrset(A_NORMAL);
-
   JS_FreeCString(c, s);
   return JS_UNDEFINED;
 }
@@ -125,7 +119,6 @@ static JSValue t_fill_pair(JSContext *c, JSValueConst v, int ac, JSValueConst *a
   if (JS_ToInt32(c, &h, av[2])) return JS_EXCEPTION;
   if (JS_ToInt32(c, &w, av[3])) return JS_EXCEPTION;
   if (JS_ToInt32(c, &pairId, av[4])) return JS_EXCEPTION;
-
   attrset(COLOR_PAIR(pairId));
   for (int i = 0; i < h; i++) mvhline(y + i, x, ' ', w);
   attrset(A_NORMAL);
@@ -141,7 +134,6 @@ static JSValue t_box(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
   if (JS_ToInt32(c, &w, av[3])) return JS_EXCEPTION;
   if (JS_ToInt32(c, &pairId, av[4])) return JS_EXCEPTION;
   if (JS_ToInt32(c, &style, av[5])) return JS_EXCEPTION;
-
   if (h < 2 || w < 2) return JS_UNDEFINED;
 
   const char *tl, *tr, *bl, *br, *hc, *vc;
@@ -153,7 +145,6 @@ static JSValue t_box(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
   }
 
   attrset(COLOR_PAIR(pairId));
-
   int hc_len = strlen(hc);
   int line_len = (w - 2) * hc_len + strlen(tl) + strlen(tr) + 1;
   char *top = malloc(line_len);
@@ -192,7 +183,6 @@ static JSValue t_hline(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
   if (JS_ToInt32(c, &pairId, av[3])) return JS_EXCEPTION;
   const char *ch = JS_ToCString(c, av[4]);
   if (!ch) return JS_EXCEPTION;
-
   int ch_len = strlen(ch);
   char *line = malloc(w * ch_len + 1);
   if (line) {
@@ -215,7 +205,38 @@ static JSValue t_set_cursor(JSContext *c, JSValueConst v, int ac, JSValueConst *
   return JS_UNDEFINED;
 }
 
-// ---------- registration ----------
+/* ---------- MOUSE ---------- */
+
+static JSValue t_mouse_enable(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
+  (void)c; (void)v; (void)ac; (void)av;
+  mmask_t supported = mousemask(
+    BUTTON1_CLICKED | BUTTON1_PRESSED | BUTTON1_RELEASED |
+    BUTTON4_PRESSED | BUTTON5_PRESSED,
+    NULL
+  );
+  mouseinterval(100);
+  return JS_NewBool(c, supported != 0);
+}
+
+static JSValue t_mouse_disable(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
+  (void)c; (void)v; (void)ac; (void)av;
+  mousemask(0, NULL);
+  return JS_UNDEFINED;
+}
+
+static JSValue t_get_mouse(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
+  (void)v; (void)ac; (void)av;
+  MEVENT event;
+  if (getmouse(&event) != OK) return JS_NULL;
+  JSValue o = JS_NewObject(c);
+  JS_SetPropertyStr(c, o, "x",      JS_NewInt32(c, event.x));
+  JS_SetPropertyStr(c, o, "y",      JS_NewInt32(c, event.y));
+  JS_SetPropertyStr(c, o, "bstate", JS_NewInt64(c, (int64_t)event.bstate));
+  JS_SetPropertyStr(c, o, "id",     JS_NewInt32(c, event.id));
+  return o;
+}
+
+/* ---------- registration ---------- */
 
 static const JSCFunctionListEntry tui_funcs[] = {
   JS_CFUNC_DEF("init", 0, t_init),
@@ -238,6 +259,9 @@ static const JSCFunctionListEntry tui_funcs[] = {
   JS_CFUNC_DEF("box", 6, t_box),
   JS_CFUNC_DEF("hline", 5, t_hline),
   JS_CFUNC_DEF("setCursor", 1, t_set_cursor),
+  JS_CFUNC_DEF("mouseEnable", 0, t_mouse_enable),
+  JS_CFUNC_DEF("mouseDisable", 0, t_mouse_disable),
+  JS_CFUNC_DEF("getMouse", 0, t_get_mouse),
 };
 
 static const JSCFunctionListEntry tui_consts[] = {
@@ -255,7 +279,13 @@ static const JSCFunctionListEntry tui_consts[] = {
   JS_PROP_INT32_DEF("KEY_HOME",      KEY_HOME,      JS_PROP_CONFIGURABLE),
   JS_PROP_INT32_DEF("KEY_END",       KEY_END,       JS_PROP_CONFIGURABLE),
   JS_PROP_INT32_DEF("KEY_RESIZE",    KEY_RESIZE,    JS_PROP_CONFIGURABLE),
+  JS_PROP_INT32_DEF("KEY_MOUSE",     KEY_MOUSE,     JS_PROP_CONFIGURABLE),
   JS_PROP_INT32_DEF("ERR",           ERR,           JS_PROP_CONFIGURABLE),
+  JS_PROP_INT64_DEF("BUTTON1_CLICKED",  BUTTON1_CLICKED,  JS_PROP_CONFIGURABLE),
+  JS_PROP_INT64_DEF("BUTTON1_PRESSED",  BUTTON1_PRESSED,  JS_PROP_CONFIGURABLE),
+  JS_PROP_INT64_DEF("BUTTON1_RELEASED", BUTTON1_RELEASED, JS_PROP_CONFIGURABLE),
+  JS_PROP_INT64_DEF("BUTTON4_PRESSED",  BUTTON4_PRESSED,  JS_PROP_CONFIGURABLE),
+  JS_PROP_INT64_DEF("BUTTON5_PRESSED",  BUTTON5_PRESSED,  JS_PROP_CONFIGURABLE),
 };
 
 static int tui_mod_init(JSContext *ctx, JSModuleDef *m) {

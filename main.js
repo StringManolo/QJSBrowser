@@ -12,15 +12,16 @@ import { createHistory }    from 'src/browser/history.js';
 import { createController } from 'src/browser/controller.js';
 
 tui.init();
+tui.mouseEnable();                    // ★ nuevo
 
 const theme = createTheme(tui);
 const keys  = buildKeyMap(tui);
 const epfd  = net.epoll_create1(0);
 net.epoll_ctl(epfd, net.EPOLL_CTL_ADD, 0, net.EPOLLIN);
 
-const omnibox  = createOmnibox();
-const pageView = createPageView(tui, theme);
-const history  = createHistory();
+const omnibox   = createOmnibox();
+const pageView  = createPageView(tui, theme);
+const history   = createHistory();
 const cookieJar = createCookieJar();
 
 const httpClient = createHttpClient(net, epfd, tls, cookieJar);
@@ -48,4 +49,5 @@ while (controller.isRunning()) {
   }
 }
 
+tui.mouseDisable();                   // ★ nuevo
 tui.end();

@@ -9,6 +9,7 @@ export const ASCII = {
   ENTER:      13,
   ENTER2:     10,
   SPACE:      32,
+  TAB:        9,
 };
 
 export function buildKeyMap(tui) {
@@ -23,6 +24,7 @@ export function buildKeyMap(tui) {
     DELETE:      tui.KEY_DC,
     NC_ENTER:    tui.KEY_ENTER,
     NC_BACKSP:   tui.KEY_BACKSPACE,
+    KEY_MOUSE:   tui.KEY_MOUSE,
     ERR:         tui.ERR,
   };
 }

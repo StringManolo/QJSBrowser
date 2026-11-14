@@ -52,8 +52,17 @@ export function createPageView(tui, theme) {
     return { scrollY, maxScroll: ms };
   }
 
+  /* Get the wrapped line at a given visual row inside the viewport.
+   * viewRow is 0-based from the top of the visible page area. */
+  function lineAt(viewRow, cols) {
+    const lines = layout(cols);
+    const idx = scrollY + viewRow;
+    if (idx < 0 || idx >= lines.length) return null;
+    return lines[idx];
+  }
+
   return {
-    setContent, render, scroll, maxScroll,
+    setContent, render, scroll, maxScroll, lineAt,
     get links()   { return links; },
     get scrollY() { return scrollY; },
     get raw()     { return content; },

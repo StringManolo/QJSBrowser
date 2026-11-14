@@ -217,16 +217,17 @@ export function createController(deps) {
     const line = pageView.lineAt(relY, pageW);
     if (!line) { mode = 'page'; return; }
 
-    const re = /\[(\d+)\]/g;
-    let m;
-    while ((m = re.exec(line)) !== null) {
-      const start = m.index;
-      const end = start + m[0].length;
-      if (relX >= start && relX < end) {
-        const n = parseInt(m[1], 10);
-        const link = pageView.links.find(l => l.n === n);
-        if (link) { navigate(link.href); return; }
+    let cx = 0;
+    for (const seg of line) {
+      const w = seg.text.length;
+      if (w > 0 && relX >= cx && relX < cx + w) {
+        if (seg.linkN !== null) {
+          const link = pageView.links.find(l => l.n === seg.linkN);
+          if (link) { navigate(link.href); return; }
+        }
+        break;
       }
+      cx += w;
     }
     mode = 'page';
   }
@@ -266,6 +267,7 @@ export function createController(deps) {
     render();
   }
 
+
   function handleResponse(url, resp, options) {
     currentUrl = url;
     if (!options.fromHistory) history.push(url);
@@ -277,21 +279,20 @@ export function createController(deps) {
     const ct = (resp.headers['content-type'] || '').toLowerCase();
     const looksHtml = ct.includes('html') || /^\s*</.test(resp.body);
 
-    let text, links = [];
+    let plainLen = 0;
+    let linksCount = 0;
+
     if (looksHtml) {
       const parsed = htmlToText(resp.body, url);
-      text = parsed.text;
-      links = parsed.links;
-      if (links.length > 0) {
-        text += '\n\n─── Links ───\n';
-        for (const l of links) text += `[${l.n}] ${l.href}\n`;
-      }
+      pageView.setContent(parsed.segments, parsed.links);
+      plainLen = parsed.text.length;
+      linksCount = parsed.links.length;
     } else {
-      text = resp.body;
+      pageView.setContent(resp.body, []);
+      plainLen = resp.body.length;
     }
 
-    pageView.setContent(text, links);
-    statusText = `HTTP ${resp.status} ${resp.statusText} — ${text.length} chars, ${links.length} links`;
+    statusText = `HTTP ${resp.status} ${resp.statusText} — ${plainLen} chars, ${linksCount} links`;
     render();
   }
 

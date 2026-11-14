@@ -1,28 +1,73 @@
 export function createPageView(tui, theme) {
-  let content = '';
-  let scrollY = 0;
+  let segments = [{ text: '', linkN: null }];
   let links = [];
+  let scrollY = 0;
   let cachedLines = null;
   let cachedCols = 0;
 
-  function setContent(text, newLinks) {
-    content = text;
+  function setContent(segmentsOrText, newLinks) {
+    if (typeof segmentsOrText === 'string') {
+      segments = segmentsOrText.length > 0
+        ? [{ text: segmentsOrText, linkN: null }]
+        : [{ text: '', linkN: null }];
+    } else {
+      segments = (segmentsOrText && segmentsOrText.length > 0)
+        ? segmentsOrText
+        : [{ text: '', linkN: null }];
+    }
     links = newLinks || [];
     scrollY = 0;
     cachedLines = null;
   }
 
+  /* Wrap rich segments into visual lines.
+   * Each visual line is an array of { text, linkN, pair }.
+   * Wrapping is done per segment so link identity survives across lines. */
   function layout(cols) {
     if (cachedLines && cachedCols === cols) return cachedLines;
-    const out = [];
-    for (const line of content.split('\n')) {
-      if (line.length <= cols) out.push(line);
-      else for (let i = 0; i < line.length; i += cols)
-        out.push(line.slice(i, i + cols));
+
+    const P = theme.pairs;
+    const lines = [[]];
+    let col = 0;
+
+    for (const seg of segments) {
+      const pair = seg.linkN !== null ? P.link : P.page;
+      const text = seg.text;
+      let i = 0;
+      while (i < text.length) {
+        const nl = text.indexOf('\n', i);
+        const end = nl < 0 ? text.length : nl;
+        let chunk = text.slice(i, end);
+
+        while (chunk.length > 0) {
+          const remaining = cols - col;
+          if (remaining <= 0) {
+            lines.push([]);
+            col = 0;
+            continue;
+          }
+          if (chunk.length <= remaining) {
+            lines[lines.length - 1].push({ text: chunk, linkN: seg.linkN, pair });
+            col += chunk.length;
+            chunk = '';
+          } else {
+            lines[lines.length - 1].push({ text: chunk.slice(0, remaining), linkN: seg.linkN, pair });
+            chunk = chunk.slice(remaining);
+            lines.push([]);
+            col = 0;
+          }
+        }
+
+        if (nl < 0) break;
+        lines.push([]);
+        col = 0;
+        i = nl + 1;
+      }
     }
-    cachedLines = out;
+
+    cachedLines = lines;
     cachedCols = cols;
-    return out;
+    return lines;
   }
 
   function maxScroll(cols, viewH) {
@@ -44,16 +89,20 @@ export function createPageView(tui, theme) {
 
     for (let i = 0; i < h; i++) {
       const idx = i + scrollY;
-      if (idx < lines.length) {
-        tui.printPair(y + i, x, lines[idx], P.page);
+      if (idx >= lines.length) continue;
+      const lineSegs = lines[idx];
+      let cx = x;
+      for (const seg of lineSegs) {
+        if (seg.text.length === 0) continue;
+        tui.printPair(y + i, cx, seg.text, seg.pair);
+        cx += seg.text.length;
       }
     }
 
     return { scrollY, maxScroll: ms };
   }
 
-  /* Get the wrapped line at a given visual row inside the viewport.
-   * viewRow is 0-based from the top of the visible page area. */
+  /* Returns the visual line at viewRow as an array of segments. */
   function lineAt(viewRow, cols) {
     const lines = layout(cols);
     const idx = scrollY + viewRow;
@@ -63,8 +112,9 @@ export function createPageView(tui, theme) {
 
   return {
     setContent, render, scroll, maxScroll, lineAt,
-    get links()   { return links; },
-    get scrollY() { return scrollY; },
-    get raw()     { return content; },
+    get links()    { return links; },
+    get scrollY()  { return scrollY; },
+    get segments() { return segments; },
+    get raw()      { return segments.map(s => s.text).join(''); },
   };
 }

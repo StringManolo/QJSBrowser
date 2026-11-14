@@ -8,20 +8,16 @@
 
 typedef JSModuleDef *(*init_module_fn)(JSContext *, const char *);
 
-typedef struct { init_module_fn net, tui; } Registry;
+typedef struct { init_module_fn net, tui, tls; } Registry;
 
-/* Try hard to get a UTF-8 locale active.
- * Returns the locale name that worked, or NULL if UTF-8 unavailable. */
 static const char *ensure_utf8_locale(void) {
   static const char *candidates[] = {
-    "",                                   /* respect env (LANG, LC_ALL, ...) */
-    "C.UTF-8", "C.utf8", "C.UTF8",        /* built-in on glibc >= 2.35 */
+    "", "C.UTF-8", "C.utf8", "C.UTF8",
     "en_US.UTF-8", "en_US.utf8",
     "en_GB.UTF-8", "en_GB.utf8",
     "es_ES.UTF-8", "es_ES.utf8",
     NULL
   };
-
   for (int i = 0; candidates[i]; i++) {
     if (!setlocale(LC_ALL, candidates[i])) continue;
     const char *cs = nl_langinfo(CODESET);
@@ -46,6 +42,7 @@ static JSModuleDef *browser_module_loader(JSContext *ctx,
   Registry *r = opaque;
   if (!strcmp(module_name, "network_sockets") && r->net) return r->net(ctx, module_name);
   if (!strcmp(module_name, "tui")             && r->tui) return r->tui(ctx, module_name);
+  if (!strcmp(module_name, "tls")             && r->tls) return r->tls(ctx, module_name);
 
   size_t len;
   char *src = read_file(module_name, &len);
@@ -71,19 +68,12 @@ static JSModuleDef *browser_module_loader(JSContext *ctx,
 }
 
 int main(int argc, char **argv) {
-  /* 1. Locale FIRST — before any UI, before QuickJS. */
   const char *loc = ensure_utf8_locale();
   if (!loc) {
     fprintf(stderr,
-      "\n"
-      "WARNING: no UTF-8 locale available.\n"
-      "         The TUI will render non-ASCII characters (─ ↓ ↑ —) incorrectly.\n"
-      "         Fix it with one of:\n"
-      "           • Debian/Ubuntu:  apt install locales && localedef -i en_US -f UTF-8 en_US.UTF-8\n"
-      "           • Alpine:         apk add musl-locales\n"
-      "           • Arch:           edit /etc/locale.gen (uncomment en_US.UTF-8) && locale-gen\n"
-      "           • Any (glibc>=2.35): export LANG=C.UTF-8\n"
-      "\n");
+      "\nWARNING: no UTF-8 locale available. TUI will show mojibake.\n"
+      "Fix: apt install locales && localedef -i en_US -f UTF-8 en_US.UTF-8\n"
+      "Or:  export LANG=C.UTF-8\n\n");
   } else if (loc[0] == '\0') {
     fprintf(stderr, "[locale] environment: %s (%s)\n",
             setlocale(LC_CTYPE, NULL), nl_langinfo(CODESET));
@@ -93,7 +83,8 @@ int main(int argc, char **argv) {
 
   const char *net_path = argc > 1 ? argv[1] : "./lib/network_sockets.so";
   const char *tui_path = argc > 2 ? argv[2] : "./lib/tui.so";
-  const char *js_path  = argc > 3 ? argv[3] : "./main.js";
+  const char *tls_path = argc > 3 ? argv[3] : "./lib/tls.so";
+  const char *js_path  = argc > 4 ? argv[4] : "./main.js";
 
   JSRuntime *rt = JS_NewRuntime();
   JSContext *ctx = JS_NewContext(rt);
@@ -101,10 +92,18 @@ int main(int argc, char **argv) {
   Registry reg = {0};
   void *h_net = dlopen(net_path, RTLD_NOW);
   void *h_tui = dlopen(tui_path, RTLD_NOW);
-  if (!h_net || !h_tui) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+  void *h_tls = dlopen(tls_path, RTLD_NOW);
+  if (!h_net || !h_tui || !h_tls) {
+    fprintf(stderr, "dlopen: %s\n", dlerror());
+    return 1;
+  }
   reg.net = (init_module_fn)dlsym(h_net, "js_init_module");
   reg.tui = (init_module_fn)dlsym(h_tui, "js_init_module");
-  if (!reg.net || !reg.tui) { fprintf(stderr, "dlsym failed\n"); return 1; }
+  reg.tls = (init_module_fn)dlsym(h_tls, "js_init_module");
+  if (!reg.net || !reg.tui || !reg.tls) {
+    fprintf(stderr, "dlsym failed\n");
+    return 1;
+  }
 
   JS_SetModuleLoaderFunc(rt, NULL, browser_module_loader, &reg);
 
@@ -129,6 +128,6 @@ int main(int argc, char **argv) {
   JS_FreeContext(ctx);
   JS_FreeRuntime(rt);
   free(src);
-  dlclose(h_net); dlclose(h_tui);
+  dlclose(h_net); dlclose(h_tui); dlclose(h_tls);
   return rc;
 }

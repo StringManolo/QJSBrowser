@@ -19,8 +19,10 @@ export function htmlToText(html, baseUrl) {
     }
   );
 
-  const text = html
-    .replace(/<\/(p|div|h[1-6]|li|tr|td|blockquote|pre|section|article)>/gi, '\n')
+
+    const text = html
+    .replace(/<\/(p|div|h[1-6]|li|tr|td|blockquote|pre|section|article|header|footer|nav|aside)>/gi, '\n\n')
+    .replace(/<(p|div|h[1-6]|li|tr|td|blockquote|pre|section|article|header|footer|nav|aside)\b[^>]*>/gi, '\n')
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<hr\s*\/?>/gi, '\n────\n')
     .replace(/<[^>]+>/g, '')

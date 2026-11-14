@@ -3,6 +3,61 @@ import { parseHttpResponse, isRedirect } from 'src/net/http-parser.js';
 
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 
+function concatBytes(a, b) {
+  if (!a || a.length === 0) return b;
+  if (!b || b.length === 0) return a;
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+
+/* Full UTF-8 decoder: byte array → JS string (UTF-16).
+ * Handles partial sequences properly across concatenation. */
+function decodeUtf8(bytes) {
+  let out = '';
+  let i = 0;
+  while (i < bytes.length) {
+    const b0 = bytes[i];
+    if (b0 < 0x80) {
+      out += String.fromCharCode(b0);
+      i++;
+    } else if (b0 < 0xC2) {
+      // 0x80-0xBF: orphan continuation, 0xC0/0xC1: overlong
+      out += '\uFFFD';
+      i++;
+    } else if (b0 < 0xE0) {
+      if (i + 1 >= bytes.length) { out += '\uFFFD'; break; }
+      const b1 = bytes[i + 1];
+      if ((b1 & 0xC0) !== 0x80) { out += '\uFFFD'; i++; continue; }
+      const cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F);
+      out += String.fromCharCode(cp);
+      i += 2;
+    } else if (b0 < 0xF0) {
+      if (i + 2 >= bytes.length) { out += '\uFFFD'; break; }
+      const b1 = bytes[i + 1], b2 = bytes[i + 2];
+      if ((b1 & 0xC0) !== 0x80 || (b2 & 0xC0) !== 0x80) { out += '\uFFFD'; i++; continue; }
+      const cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
+      out += String.fromCharCode(cp);
+      i += 3;
+    } else if (b0 < 0xF5) {
+      if (i + 3 >= bytes.length) { out += '\uFFFD'; break; }
+      const b1 = bytes[i + 1], b2 = bytes[i + 2], b3 = bytes[i + 3];
+      if ((b1 & 0xC0) !== 0x80 || (b2 & 0xC0) !== 0x80 || (b3 & 0xC0) !== 0x80) {
+        out += '\uFFFD'; i++; continue;
+      }
+      let cp = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F);
+      cp -= 0x10000;
+      out += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
+      i += 4;
+    } else {
+      out += '\uFFFD';
+      i++;
+    }
+  }
+  return out;
+}
+
 export function createHttpClient(net, epfd, tls) {
   const connections = {};
   let callbacks = { onStatus(){}, onResponse(){}, onError(){} };
@@ -28,46 +83,44 @@ export function createHttpClient(net, epfd, tls) {
 
   function setEpoll(fd, events) {
     try { net.epoll_ctl(epfd, net.EPOLL_CTL_MOD, fd, events); }
-    catch (_) { /* fd may be gone */ }
+    catch (_) {}
   }
 
-  // ---------- TLS helpers ----------
+  // ---------- TLS plumbing ----------
 
-  // Drain encrypted bytes produced by OpenSSL into the socket.
   function flushTlsOut(fd, c) {
-    const fromBio = tls.getOutgoing(c.tlsConn);
-    if (fromBio && fromBio.length > 0) c.tlsOut += fromBio;
-    if (c.tlsOut.length > 0) {
-      const sent = net.send(fd, c.tlsOut);
-      if (sent > 0) c.tlsOut = c.tlsOut.slice(sent);
+    for (;;) {
+      const chunk = tls.getOutgoing(c.tlsConn);
+      if (!chunk || chunk.length === 0) break;
+      c.tlsOut = concatBytes(c.tlsOut, chunk);
     }
+    while (c.tlsOut.length > 0) {
+      const sent = tls.sendBytes(fd, c.tlsOut);
+      if (!sent || sent < 0) break;
+      c.tlsOut = c.tlsOut.subarray(sent);
+    }
+    return c.tlsOut.length === 0;
   }
 
-  // Advances handshake and, once complete, sends the HTTP request.
-  // Returns true if connection should keep going, false if it errored/closed.
-  function driveTlsHandshake(fd, c) {
+  function stepTls(fd, c) {
     let res;
     try { res = tls.handshake(c.tlsConn); }
     catch (e) {
       closeConnection(fd);
-      callbacks.onError(c.url, 'TLS handshake failed: ' + (e.message || e));
+      callbacks.onError(c.url, 'TLS handshake: ' + (e.message || e));
       return false;
     }
 
-    // Always flush whatever OpenSSL has produced (ClientHello, Finished, etc.)
-    flushTlsOut(fd, c);
+    const drained = flushTlsOut(fd, c);
 
     if (res === 1) {
-      // Handshake complete → write HTTP request through TLS
       try { tls.write(c.tlsConn, c.request); }
       catch (e) {
         closeConnection(fd);
-        callbacks.onError(c.url, 'TLS write failed: ' + (e.message || e));
+        callbacks.onError(c.url, 'TLS write: ' + (e.message || e));
         return false;
       }
-      flushTlsOut(fd, c);
-
-      if (c.tlsOut.length === 0) {
+      if (flushTlsOut(fd, c)) {
         c.state = 'receiving';
         setEpoll(fd, net.EPOLLIN);
       } else {
@@ -77,13 +130,11 @@ export function createHttpClient(net, epfd, tls) {
       return true;
     }
 
-    if (res === 2) { // WANT_READ
-      setEpoll(fd, c.tlsOut.length > 0
-        ? (net.EPOLLIN | net.EPOLLOUT)
-        : net.EPOLLIN);
+    if (res === 2) {
+      setEpoll(fd, drained ? net.EPOLLIN : (net.EPOLLIN | net.EPOLLOUT));
       return true;
     }
-    if (res === 3) { // WANT_WRITE
+    if (res === 3) {
       setEpoll(fd, net.EPOLLIN | net.EPOLLOUT);
       return true;
     }
@@ -93,42 +144,37 @@ export function createHttpClient(net, epfd, tls) {
     return false;
   }
 
-  // Feed encrypted socket bytes into TLS; drain decrypted bytes into c.recv.
-  // Returns true on success, false on fatal error.
-  function feedTlsIn(fd, c, chunk) {
-    if (chunk && chunk.length > 0) {
-      try { tls.feedIncoming(c.tlsConn, chunk); }
+  // Feed ciphertext, drain plaintext bytes into c.recvBytes.
+  function feedTlsIn(fd, c, bytes) {
+    if (bytes && bytes.length > 0) {
+      try { tls.feedIncoming(c.tlsConn, bytes); }
       catch (e) {
         closeConnection(fd);
-        callbacks.onError(c.url, 'TLS feed failed: ' + (e.message || e));
+        callbacks.onError(c.url, 'TLS feed: ' + (e.message || e));
         return false;
       }
     }
-
     for (;;) {
       let out;
-      try { out = tls.read(c.tlsConn); }
+      try { out = tls.readBytes(c.tlsConn); }
       catch (e) {
         closeConnection(fd);
-        callbacks.onError(c.url, 'TLS read failed: ' + (e.message || e));
+        callbacks.onError(c.url, 'TLS read: ' + (e.message || e));
         return false;
       }
-
-      if (out === -1) return true; // clean close_notify — wait for socket FIN
-      if (out === -2) return true; // no more data available right now
+      if (out === -1) return true;
+      if (out === -2) return true;
       if (out === -3) { setEpoll(fd, net.EPOLLIN | net.EPOLLOUT); return true; }
-
-      if (typeof out === 'string') {
-        if (out.length === 0) return true;
-        c.recv += out;
-        if (c.recv.length > MAX_RESPONSE_BYTES) {
-          c.recv = c.recv.slice(0, MAX_RESPONSE_BYTES);
-          c.truncated = true;
-          return false;
-        }
-      } else {
+      if (typeof out === 'number') {
         closeConnection(fd);
-        callbacks.onError(c.url, 'TLS read error');
+        callbacks.onError(c.url, 'TLS read status ' + out);
+        return false;
+      }
+      if (out.length === 0) return true;
+      c.recvBytes = concatBytes(c.recvBytes, out);
+      if (c.recvBytes.length > MAX_RESPONSE_BYTES) {
+        c.recvBytes = c.recvBytes.subarray(0, MAX_RESPONSE_BYTES);
+        c.truncated = true;
         return false;
       }
     }
@@ -137,10 +183,12 @@ export function createHttpClient(net, epfd, tls) {
   // ---------- public API ----------
 
   function fetch(url, options = {}) {
-    const p = options.parsed || parseUrl(url);
+    // Always honor the url argument — options.parsed is a hint only
+    const p = parseUrl(url);
     if (!p) { callbacks.onError(url, 'Invalid URL'); return; }
     if (p.scheme !== 'http' && p.scheme !== 'https') {
-      callbacks.onError(url, 'Unsupported scheme: ' + p.scheme); return;
+      callbacks.onError(url, 'Unsupported scheme: ' + p.scheme);
+      return;
     }
 
     let ip;
@@ -158,10 +206,11 @@ export function createHttpClient(net, epfd, tls) {
       options,
       request:   buildRequest(p),
       sent:      0,
-      recv:      '',
+      recv:      '',               // plain HTTP (string)
+      recvBytes: new Uint8Array(0),// TLS (bytes)
       redirects: options.redirectCount || 0,
       tlsConn:   null,
-      tlsOut:    '',
+      tlsOut:    new Uint8Array(0),
       truncated: false,
     };
 
@@ -169,7 +218,7 @@ export function createHttpClient(net, epfd, tls) {
       try {
         conn.tlsConn = tls.new();
         if (typeof tls.setServerName === 'function')
-          tls.setServerName(conn.tlsConn, p.host); // SNI — required by most servers
+          tls.setServerName(conn.tlsConn, p.host);
       } catch (e) {
         try { net.close(fd); } catch (_) {}
         callbacks.onError(url, 'TLS init failed: ' + (e.message || e));
@@ -182,7 +231,7 @@ export function createHttpClient(net, epfd, tls) {
     try { net.epoll_ctl(epfd, net.EPOLL_CTL_ADD, fd, net.EPOLLOUT); }
     catch (e) {
       closeConnection(fd);
-      callbacks.onError(url, 'epoll_ctl failed: ' + (e.message || e));
+      callbacks.onError(url, 'epoll_ctl: ' + (e.message || e));
     }
   }
 
@@ -191,7 +240,7 @@ export function createHttpClient(net, epfd, tls) {
     const c = connections[fd];
     if (!c) return;
 
-    // ---- state: connecting ----
+    // ---- connecting ----
     if (c.state === 'connecting' && (ev.events & net.EPOLLOUT)) {
       if (!net.is_connected(fd)) {
         closeConnection(fd);
@@ -200,7 +249,7 @@ export function createHttpClient(net, epfd, tls) {
       }
       if (c.tlsConn) {
         c.state = 'tls_handshake';
-        driveTlsHandshake(fd, c);
+        stepTls(fd, c);
       } else {
         const sent = net.send(fd, c.request);
         if (sent >= c.request.length) {
@@ -215,38 +264,52 @@ export function createHttpClient(net, epfd, tls) {
       return;
     }
 
-    // ---- state: tls_handshake ----
+    // ---- tls_handshake ----
     if (c.state === 'tls_handshake') {
       if (ev.events & net.EPOLLIN) {
-        const chunk = net.recv(fd, 8192);
-        if (chunk === '') {
+        let chunk;
+        try { chunk = tls.recvBytes(fd, 8192); }
+        catch (e) {
+          closeConnection(fd);
+          callbacks.onError(c.url, 'TLS recv: ' + (e.message || e));
+          return;
+        }
+        if (chunk === null) {
           closeConnection(fd);
           callbacks.onError(c.url, 'Connection closed during TLS handshake');
           return;
         }
-        try { tls.feedIncoming(c.tlsConn, chunk); }
-        catch (e) {
-          closeConnection(fd);
-          callbacks.onError(c.url, 'TLS feed (handshake): ' + (e.message || e));
-          return;
+        if (chunk.length > 0) {
+          try { tls.feedIncoming(c.tlsConn, chunk); }
+          catch (e) {
+            closeConnection(fd);
+            callbacks.onError(c.url, 'TLS feed (handshake): ' + (e.message || e));
+            return;
+          }
         }
       }
-      driveTlsHandshake(fd, c);
+      stepTls(fd, c);
       return;
     }
 
-    // ---- state: sending (plain or TLS flush) ----
+    // ---- sending ----
     if (c.state === 'sending') {
       if (c.tlsConn) {
         if (ev.events & net.EPOLLIN) {
-          // Socket readable during send — possible with renegotiation; just feed
-          const chunk = net.recv(fd, 8192);
-          if (chunk) { try { tls.feedIncoming(c.tlsConn, chunk); } catch (_) {} }
+          let chunk;
+          try { chunk = tls.recvBytes(fd, 8192); } catch (_) { chunk = null; }
+          if (chunk === null) {
+            closeConnection(fd);
+            callbacks.onError(c.url, 'Connection closed while flushing TLS');
+            return;
+          }
+          if (chunk.length > 0) { try { tls.feedIncoming(c.tlsConn, chunk); } catch (_) {} }
         }
-        flushTlsOut(fd, c);
-        if (c.tlsOut.length === 0) {
-          c.state = 'receiving';
-          setEpoll(fd, net.EPOLLIN);
+        if (ev.events & net.EPOLLOUT) {
+          if (flushTlsOut(fd, c)) {
+            c.state = 'receiving';
+            setEpoll(fd, net.EPOLLIN);
+          }
         }
       } else {
         if (ev.events & net.EPOLLOUT) {
@@ -261,32 +324,44 @@ export function createHttpClient(net, epfd, tls) {
       return;
     }
 
-    // ---- state: receiving ----
+    // ---- receiving ----
     if (c.state === 'receiving' && (ev.events & net.EPOLLIN)) {
-      const chunk = net.recv(fd, 8192);
-
-      if (chunk === '') {
-        // Socket closed — drain any buffered plaintext for TLS before finalizing
-        if (c.tlsConn) {
-          try {
-            for (;;) {
-              const out = tls.read(c.tlsConn);
-              if (typeof out !== 'string' || out.length === 0) break;
-              c.recv += out;
-            }
-          } catch (_) { /* ignore */ }
-        }
-        closeConnection(fd);
-        processResponse(c);
-        return;
-      }
 
       if (c.tlsConn) {
-        if (!feedTlsIn(fd, c, chunk)) {
-          if (c.truncated) { closeConnection(fd); processResponse(c); }
+        let chunk;
+        try { chunk = tls.recvBytes(fd, 8192); }
+        catch (e) {
+          closeConnection(fd);
+          callbacks.onError(c.url, 'TLS recv: ' + (e.message || e));
           return;
         }
+        if (chunk === null) {
+          // EOF: drain any remaining plaintext bytes from OpenSSL
+          try {
+            for (;;) {
+              const out = tls.readBytes(c.tlsConn);
+              if (typeof out === 'number') break;
+              if (out.length === 0) break;
+              c.recvBytes = concatBytes(c.recvBytes, out);
+            }
+          } catch (_) {}
+          closeConnection(fd);
+          processResponse(c);
+          return;
+        }
+        if (chunk.length > 0) {
+          if (!feedTlsIn(fd, c, chunk)) {
+            if (c.truncated) { closeConnection(fd); processResponse(c); }
+            return;
+          }
+        }
       } else {
+        const chunk = net.recv(fd, 8192);
+        if (chunk === '') {
+          closeConnection(fd);
+          processResponse(c);
+          return;
+        }
         c.recv += chunk;
         if (c.recv.length > MAX_RESPONSE_BYTES) {
           c.recv = c.recv.slice(0, MAX_RESPONSE_BYTES);
@@ -297,28 +372,35 @@ export function createHttpClient(net, epfd, tls) {
         }
       }
 
-      callbacks.onStatus(c.url, 'Receiving… ' + c.recv.length + ' bytes');
+      const size = c.tlsConn ? c.recvBytes.length : c.recv.length;
+      callbacks.onStatus(c.url, 'Receiving… ' + size + ' bytes');
     }
   }
 
   function processResponse(c) {
-    const resp = parseHttpResponse(c.recv);
+    const raw = c.tlsConn ? decodeUtf8(c.recvBytes) : c.recv;
+    const resp = parseHttpResponse(raw);
     if (!resp) {
       callbacks.onError(c.url, 'Malformed HTTP response');
       return;
     }
-
     if (isRedirect(resp.status) && resp.headers.location) {
       if (c.redirects >= 10) {
         callbacks.onError(c.url, 'Too many redirects (limit 10)');
         return;
       }
       const target = resolveUrl(c.url, resp.headers.location);
+      if (target === c.url) {
+        callbacks.onError(c.url, 'Redirect loop: ' + target);
+        return;
+      }
       callbacks.onStatus(c.url, `Redirect ${resp.status} → ${target}`);
-      fetch(target, { ...c.options, redirectCount: c.redirects + 1 });
+      // ★ CRITICAL: drop `parsed` so fetch() re-parses the NEW url
+      const nextOpts = { redirectCount: c.redirects + 1 };
+      if (c.options && c.options.fromHistory) nextOpts.fromHistory = true;
+      fetch(target, nextOpts);
       return;
     }
-
     if (c.truncated) callbacks.onStatus(c.url, 'Response truncated at 5MB');
     callbacks.onResponse(c.url, resp, c.options);
   }

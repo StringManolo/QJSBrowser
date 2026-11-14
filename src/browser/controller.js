@@ -117,7 +117,7 @@ export function createController(deps) {
   function navigate(url, options = {}) {
     const p = parseUrl(url);
     if (!p) { statusBar.set('Invalid URL: ' + url); render(); return; }
-    if (p.scheme !== 'http') {
+    if (p.scheme !== 'http' && p.scheme !== 'https') {
       statusBar.set('Only http:// supported (got ' + p.scheme + '://)');
       render(); return;
     }

@@ -1,33 +1,26 @@
 # QJSBrowser
 
-> A web browser built from scratch, in the terminal, written mostly in JavaScript on top of QuickJS. Minimal C host, ncurses UI, non-blocking network I/O via `epoll`, native HTTP/HTTPS.
+> A web browser built from scratch, in the terminal, written mostly in JavaScript on top of QuickJS. Minimal C host, ncurses UI with a desktop-like layout, non-blocking network I/O via `epoll`, native HTTP/HTTPS with certificate validation.
 
-```
- QJSBrowser                                                       Ctrl+C = quit
- URL> https://example.com
-─────────────────────────────────────────────────────────────────────────────
-Example Domain
-
-This domain is for use in documentation examples without needing
-permission. This is not a service; avoid relying on it for testing
-and monitoring purposes.
-
-HTTP 200 OK — 170 chars, 0 links  [j/k:scroll 1-9:link [:back ]:fwd ...]
-```
+![QJSBrowser screenshot](docs/screenshot.png)
 
 ---
 
 ## ✨ Features
 
 - **Embedded JS engine** — [QuickJS](https://bellard.org/quickjs/) (Bellard), compiled into the `qjsbrowser` binary.
-- **ncurses (wide) UI** — UTF-8, colors, full keyboard support (arrows, Home/End, Ctrl+U/W/L).
+- **Desktop-style TUI** — ncurses (wide) with 256-color palette, Unicode box-drawing, window chrome, tab bar, toolbar, status bar.
 - **Non-blocking network** — `AF_INET` sockets + `epoll`, all driven from a **JavaScript** event loop.
-- **HTTP/1.0** with headers, `Content-Length`, redirects (301/302/303/307/308, limit 10).
-- **HTTPS** via OpenSSL with Memory BIOs — non-blocking handshake, correct SNI.
-- **History** back/forward with `[` / `]`.
-- **Numbered links** — `1`–`9` to follow link N on the page.
-- **HTML → text** — strips `<script>`, `<style>`, extracts `<a href>`, resolves relative URLs.
-- **The whole "browser" is JS.** The C code only exposes primitives: syscalls, ncurses, OpenSSL.
+- **HTTP/1.0** with headers, `Content-Length`, redirects (301/302/303/307/308, limit 10, loop detection).
+- **HTTPS** via OpenSSL with Memory BIOs — non-blocking handshake, SNI, **certificate + hostname validation** against the system CA bundle.
+- **Cookies** — in-memory jar with domain/path matching, `Secure`, `Max-Age`/`Expires`, RFC 6265 ordering. Survives redirects.
+- **Charset-aware decoding** — honors `Content-Type: charset=...`, sniffs UTF-8 vs Latin-1 when absent.
+- **HTML entities** — numeric (`&#39;`, `&#x27;`) and named (`&amp;`, `&copy;`, `&mdash;`, etc.).
+- **Rich links** — rendered in bright blue, clickable over their entire extent (not just the `[N]` marker).
+- **Tabs** — new/close/switch via keyboard (`Ctrl+T`, `Ctrl+W`) or mouse. Each tab keeps its own history, scroll, mode, status.
+- **Mouse** — click tabs, toolbar buttons, address bar, links; wheel to scroll.
+- **History** — per-tab back/forward (`[`, `]`).
+- **Everything else is JS** — the C code only exposes primitives: syscalls, ncurses, OpenSSL.
 
 ---
 
@@ -35,17 +28,18 @@ HTTP 200 OK — 170 chars, 0 links  [j/k:scroll 1-9:link [:back ]:fwd ...]
 
 ### Requirements
 
-- `gcc`, `make`, `curl`, `tar`
+- `gcc`, `make`, `curl`, `tar`, `pkg-config`
 - `libncursesw5-dev` (or equivalent; **`ncursesw`, not `ncurses`**)
 - `libssl-dev` (OpenSSL ≥ 1.1.1)
-- A UTF-8 locale available (glibc ≥ 2.35 ships `C.UTF-8` built-in)
+- `ca-certificates` (for TLS verification)
+- A UTF-8 locale (glibc ≥ 2.35 ships `C.UTF-8` built-in)
 
 ```bash
 # Debian / Ubuntu
-apt install build-essential pkg-config libncursesw5-dev libssl-dev curl
+apt install build-essential pkg-config libncursesw5-dev libssl-dev ca-certificates curl
 
 # Alpine
-apk add build-base ncurses-dev openssl-dev curl
+apk add build-base ncurses-dev openssl-dev ca-certificates curl
 ```
 
 ### Build
@@ -67,7 +61,14 @@ Both are vendored into the project tree. Subsequent builds only recompile what c
 ./qjsbrowser ./lib/network_sockets.so ./lib/tui.so ./lib/tls.so ./main.js
 ```
 
-All four arguments are optional (defaults are provided). You can add a `make run` target if you prefer.
+All four arguments are optional (defaults are provided). Add a `make run` target if you prefer:
+
+```makefile
+run: all
+	./qjsbrowser ./lib/network_sockets.so ./lib/tui.so ./lib/tls.so ./main.js
+
+.PHONY: run
+```
 
 ### Cleanup
 
@@ -81,7 +82,16 @@ All four arguments are optional (defaults are provided). You can add a `make run
 
 ## ⌨️ Keybindings
 
-### Omnibox mode (URL editing)
+### Global
+
+| Key | Action |
+|---|---|
+| `Ctrl+C` | Quit |
+| `Ctrl+T` | New tab |
+| `Ctrl+W` | Close current tab (in page mode) |
+| `Tab` | Toggle between address bar and page |
+
+### Omnibox mode (address bar)
 
 | Key | Action |
 |---|---|
@@ -103,24 +113,36 @@ All four arguments are optional (defaults are provided). You can add a `make run
 | `1`–`9` | Follow link N |
 | `[` / `]` | Back / forward |
 | `r` | Reload |
-| `g` / `:` | Edit URL |
+| `g` / `:` | Edit URL (returns to omnibox) |
 | `q` | Quit |
-| `Ctrl+C` | Quit (from any mode) |
+
+### Mouse
+
+| Action | Result |
+|---|---|
+| Click tab | Activate it |
+| Click `×` on a tab | Close it |
+| Click `+` | New tab |
+| Click `◀` `▶` `⟳` `⌂` | Toolbar actions |
+| Click address bar | Focus omnibox |
+| Click anywhere on a blue link | Follow it |
+| Wheel up/down | Scroll page |
 
 ---
 
 ## 🏛️ Architecture
 
-Three strict layers. Only the top one is touched to add features.
+Four strict layers. Only the top one is touched to add features.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  main.js + src/**/*.js                                       │
 │  ▸ Event loop (while + net.epoll_wait)                       │
-│  ▸ HTTP client (fetch, redirects, receive loop)              │
-│  ▸ HTML → text                                               │
-│  ▸ Widgets (omnibox, page-view, status-bar)                  │
-│  ▸ Controller (key routing, modes, history)                  │
+│  ▸ HTTP client (fetch, TLS handshake, redirects, cookies)    │
+│  ▸ Charset-aware decoding, HTML → segments                   │
+│  ▸ Widgets (tab bar, toolbar, omnibox, page view, status)    │
+│  ▸ Tab manager + per-tab state                               │
+│  ▸ Controller (input routing, mouse, modes)                  │
 ├──────────────────────────────────────────────────────────────┤
 │  lib/network_sockets.so   lib/tui.so   lib/tls.so            │
 │  ▸ syscalls + epoll       ▸ ncursesw   ▸ OpenSSL BIOs        │
@@ -139,7 +161,8 @@ Three strict layers. Only the top one is touched to add features.
 
 - **`-rdynamic`** exports the `JS_*` symbols from the executable. The `.so` modules are loaded with `dlopen` and resolve `JS_NewObject`, `JS_ToCString`, etc. from the host. **They never link QuickJS themselves**, avoiding duplicate runtimes in memory.
 - **The event loop lives in JS.** `net.epoll_wait` is a syscall exposed as a function; the `while (running) { ... }` is in `main.js`. Adding a new fd (tab, parallel request, timer) is one line of JS.
-- **The `.so` modules are stateless where possible.** `tls.so` does hold per-connection state (required by OpenSSL) but identifies it by an opaque handle that JS owns. `network_sockets.so` is 100% pure syscalls.
+- **Binary safety across the JS/C boundary.** TLS ciphertext, socket reads/writes, and `Uint8Array` interop use `JS_NewArrayBufferCopy` / `JS_GetArrayBuffer` (not `JS_NewStringLen`), so multibyte sequences survive round-trips.
+- **Per-tab state.** Each tab owns its omnibox, page view, history, mode, status. The HTTP client tags every connection with `options.tabId`; callbacks route responses back to the right tab even after redirects.
 
 ---
 
@@ -151,7 +174,7 @@ QJSBrowser/
 ├── Makefile
 ├── c/
 │   ├── main.c                      # host: dlopen + QuickJS init + loader
-│   ├── tui.c                       # ncursesw wrapper
+│   ├── tui.c                       # ncursesw wrapper + color + mouse
 │   └── tls.c                       # OpenSSL wrapper (Memory BIOs)
 ├── lib/                            # artifacts (git-ignored)
 │   ├── network_sockets.so
@@ -164,21 +187,27 @@ QJSBrowser/
 │   │   └── keys.js                 # key map (ASCII + ncurses)
 │   ├── net/
 │   │   ├── http-parser.js          # parseHttpResponse, isRedirect
-│   │   └── http-client.js          # non-blocking fetch + TLS + redirects
+│   │   ├── http-client.js          # non-blocking fetch + TLS + redirects + cookies
+│   │   └── cookies.js              # RFC 6265 cookie jar
 │   ├── content/
-│   │   └── html-to-text.js         # HTML strip + numbered links
+│   │   └── html-to-text.js         # HTML → rich segments + links + entities
 │   ├── ui/
-│   │   ├── omnibox.js
-│   │   ├── page-view.js
-│   │   └── status-bar.js
+│   │   ├── theme.js                # 256-color palette definition
+│   │   ├── window.js               # window chrome helper
+│   │   ├── tab-bar.js              # tab bar widget (clickable)
+│   │   ├── toolbar.js              # toolbar widget (clickable)
+│   │   ├── omnibox.js              # address bar state machine
+│   │   └── page-view.js            # rich-segment rendering with scroll
 │   └── browser/
-│       ├── history.js
-│       └── controller.js           # modes, routing, orchestration
+│       ├── tab.js                  # per-tab state factory
+│       ├── tab-manager.js          # tabs collection + active index
+│       ├── history.js              # back/forward stack
+│       └── controller.js           # input routing, mouse, orchestration
 └── quickjs-2025-09-13/             # vendored (auto-downloaded)
 └── qjsNetworkSockets-main/         # vendored (auto-downloaded)
 ```
 
-No JS file exceeds ~200 lines. To add a feature (e.g. tabs), create `src/ui/tab-bar.js` + `src/browser/tabs.js` and wire them in `main.js`. `controller.js` only grows with high-level routing logic.
+No JS file exceeds ~350 lines. To add a feature (e.g. find-in-page), create `src/ui/find-bar.js` + wire it in `controller.js`.
 
 ---
 
@@ -206,14 +235,17 @@ To debug without corrupting the ncurses UI, redirect `stderr` to a file:
 
 ### Adding a new syscall / primitive
 
-1. Add the C function to the relevant `.so` (`c/tui.c`, etc.).
+1. Add the C function to the relevant `.so` (`c/tui.c`, `c/tls.c`, etc.).
 2. Register it in the module's `JSCFunctionListEntry` array.
-3. `make` (only that `.so` is recompiled).
+3. `make lib/tui.so` (only that `.so` is recompiled).
 4. Call it from JS: `tui.newFunction(...)`.
 
-### Example: exposing `fstat` from `network_sockets`
+### Adding a new UI widget
 
-If you ever need a file's size before reading it, it's a ~10-line C function + one array entry. No changes to `main.c` or the rest of the architecture.
+1. Create `src/ui/my-widget.js` exporting a factory function.
+2. It receives `(tui, theme)` and returns an object with `render(...)` and optionally `hitTest(x, y)`.
+3. Instantiate it in `controller.js` and call its `render` from the main `render()`.
+4. For click support, call its `hitTest` from `handleMouse` before falling through to page click.
 
 ---
 
@@ -221,16 +253,19 @@ If you ever need a file's size before reading it, it's a ~10-line C function + o
 
 | Area | Status | Notes |
 |---|---|---|
-| **TLS certificate validation** | ❌ Disabled | `SSL_VERIFY_NONE` in `c/tls.c`. Accepts expired, self-signed, mismatched certs. Fix: 3 lines when you want hardening. |
-| **HTTP/1.0** | ✅ | No keep-alive, no chunked encoding. `Connection: close` terminates after the response. |
-| **HTTP/1.1 chunked** | ❌ | Would need an incremental parser. Some modern servers require it. |
+| **HTTP/1.0 only** | ✅ | No keep-alive, no chunked encoding. `Connection: close` terminates after the response. |
+| **HTTP/1.1 chunked** | ❌ | Some servers require it. Would need an incremental parser. |
 | **`<script>` execution** | ❌ | HTML is stripped, scripts don't run. No DOM, no CSS. |
 | **Images** | ❌ | Text only. Kitty/Sixel would be the next jump. |
-| **Cookies** | ❌ | No `Set-Cookie` / `Cookie` handling. |
 | **Forms / POST** | ❌ | GET only. |
-| **Tabs** | ❌ | One active connection at a time. |
-| **TLS 1.3 / ALPN** | ✅ automatic | OpenSSL negotiates it; no HTTP/2. |
-| **Binary safety** | ⚠️ | Binary data travels as `JSValue` strings. QuickJS preserves bytes, but if corruption appears with non-ASCII content, migrate to `Uint8Array` in the `.so` modules. |
+| **Cookies persistence** | ❌ | In-memory only. Cleared on exit. |
+| **TLS 1.3** | ⚠️ | Capped to TLS 1.2 to avoid `key_share` issues over Memory BIOs. |
+| **ALPN / HTTP/2** | ❌ | Always negotiates HTTP/1.x. |
+| **Certificate pinning** | ❌ | System CA bundle only. |
+| **Visited links** | ❌ | No per-URL state yet. `theme.js` has the color pair ready. |
+| **Underlined links** | ❌ | Bright blue only. Underline needs an `A_UNDERLINE` extension to `printPair`. |
+| **Tab overflow** | ⚠️ | Tabs beyond the width limit are simply not drawn. Close some with `×`. |
+| **Binary body content** | ⚠️ | Body is decoded as text. Images/PDFs would need `Uint8Array` downstream of the decoder. |
 
 ---
 
@@ -238,22 +273,14 @@ If you ever need a file's size before reading it, it's a ~10-line C function + o
 
 In impact order (highest first):
 
-1. **TLS certificate validation** — load `ca-certificates.crt` from the system, `SSL_VERIFY_PEER`, surface errors.
-2. **Cookies + session** — in-memory persistence across navigations.
-3. **`<script>` execution** — mini-DOM in JS + isolate page context from browser context.
+1. **`<script>` execution** — mini-DOM in JS + isolate page context from browser context. Enables SPAs.
+2. **Forms + POST** — submit `<form>` on Enter.
+3. **gzip / deflate** — small `zlib.so` for servers that ignore `Accept-Encoding: identity`.
 4. **Chunked transfer encoding** — incremental response parser.
-5. **POST + forms** — submit `<form>` on submit.
-6. **Images (Kitty graphics)** — `tui.image(x, y, w, h, png)` in `c/tui.c`, render `<img>` as placeholders first, then real.
-7. **Tabs** — multiple live connections, `Ctrl+T` / `Ctrl+W`.
-8. **Basic CSS** — bold, italic, underline, colors. Requires a minimal layout engine.
-
----
-
-## 🙏 Credits
-
-- **[QuickJS](https://bellard.org/quickjs/)** — Fabrice Bellard. The JS engine.
-- **[qjsNetworkSockets](https://github.com/StringManolo/qjsNetworkSockets)** — StringManolo. The sockets module.
-- **[OpenSSL](https://www.openssl.org/)** — TLS.
-- **[ncursesw](https://invisible-island.net/ncurses/)** — the UI.
-
+5. **Persistent cookies** — write the jar to disk between sessions.
+6. **Images (Kitty graphics)** — `tui.image(x, y, w, h, png)` in `c/tui.c`, render `<img>` inline.
+7. **Find in page** — `Ctrl+F` opens a find-bar widget, highlights matches.
+8. **Visited link colors** — remember which URLs were visited, use `theme.pairs.visited`.
+9. **TLS 1.3** — switch `tls.so` to a different handshake strategy (or wait for OpenSSL to fix the `key_share` issue).
+10. **Bookmarks** — persistent list, `Ctrl+D` to add, `:bookmarks` to open.
 

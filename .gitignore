@@ -1,0 +1,6 @@
+qjsbrowser
+*.o
+*.a
+lib/*.so
+quickjs-*/
+quickjs-*.tar.xz

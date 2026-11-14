@@ -127,7 +127,7 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
     try { res = tls.handshake(c.tlsConn); }
     catch (e) {
       closeConnection(fd);
-      callbacks.onError(c.url, e.message || String(e));
+      callbacks.onError(c.url, e.message || String(e), c.options);
       return false;
     }
     const drained = flushTlsOut(fd, c);
@@ -135,28 +135,17 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
       try { tls.write(c.tlsConn, c.request); }
       catch (e) {
         closeConnection(fd);
-        callbacks.onError(c.url, 'TLS write: ' + (e.message || e));
+        callbacks.onError(c.url, 'TLS write: ' + (e.message || e), c.options);
         return false;
       }
-      if (flushTlsOut(fd, c)) {
-        c.state = 'receiving';
-        setEpoll(fd, net.EPOLLIN);
-      } else {
-        c.state = 'sending';
-        setEpoll(fd, net.EPOLLIN | net.EPOLLOUT);
-      }
+      if (flushTlsOut(fd, c)) { c.state = 'receiving'; setEpoll(fd, net.EPOLLIN); }
+      else                    { c.state = 'sending';   setEpoll(fd, net.EPOLLIN | net.EPOLLOUT); }
       return true;
     }
-    if (res === 2) {
-      setEpoll(fd, drained ? net.EPOLLIN : (net.EPOLLIN | net.EPOLLOUT));
-      return true;
-    }
-    if (res === 3) {
-      setEpoll(fd, net.EPOLLIN | net.EPOLLOUT);
-      return true;
-    }
+    if (res === 2) { setEpoll(fd, drained ? net.EPOLLIN : (net.EPOLLIN | net.EPOLLOUT)); return true; }
+    if (res === 3) { setEpoll(fd, net.EPOLLIN | net.EPOLLOUT); return true; }
     closeConnection(fd);
-    callbacks.onError(c.url, 'TLS handshake error code ' + res);
+    callbacks.onError(c.url, 'TLS handshake error code ' + res, c.options);
     return false;
   }
 
@@ -165,7 +154,7 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
       try { tls.feedIncoming(c.tlsConn, bytes); }
       catch (e) {
         closeConnection(fd);
-        callbacks.onError(c.url, 'TLS feed: ' + (e.message || e));
+        callbacks.onError(c.url, 'TLS feed: ' + (e.message || e), c.options);
         return false;
       }
     }
@@ -174,7 +163,7 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
       try { out = tls.readBytes(c.tlsConn); }
       catch (e) {
         closeConnection(fd);
-        callbacks.onError(c.url, 'TLS read: ' + (e.message || e));
+        callbacks.onError(c.url, 'TLS read: ' + (e.message || e), c.options);
         return false;
       }
       if (out === -1) return true;
@@ -182,7 +171,7 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
       if (out === -3) { setEpoll(fd, net.EPOLLIN | net.EPOLLOUT); return true; }
       if (typeof out === 'number') {
         closeConnection(fd);
-        callbacks.onError(c.url, 'TLS read status ' + out);
+        callbacks.onError(c.url, 'TLS read status ' + out, c.options);
         return false;
       }
       if (out.length === 0) return true;
@@ -197,15 +186,15 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
 
   function fetch(url, options = {}) {
     const p = parseUrl(url);
-    if (!p) { callbacks.onError(url, 'Invalid URL'); return; }
+    if (!p) { callbacks.onError(url, 'Invalid URL', options); return; }
     if (p.scheme !== 'http' && p.scheme !== 'https') {
-      callbacks.onError(url, 'Unsupported scheme: ' + p.scheme);
+      callbacks.onError(url, 'Unsupported scheme: ' + p.scheme, options);
       return;
     }
 
     let ip;
     try { ip = net.gethostbyname(p.host); }
-    catch (e) { callbacks.onError(url, 'DNS failed: ' + p.host); return; }
+    catch (e) { callbacks.onError(url, 'DNS failed: ' + p.host, options); return; }
 
     const fd = net.socket(net.AF_INET, net.SOCK_STREAM, 0);
     net.setnonblocking(fd);
@@ -236,7 +225,7 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
           tls.setServerName(conn.tlsConn, p.host);
       } catch (e) {
         try { net.close(fd); } catch (_) {}
-        callbacks.onError(url, 'TLS init failed: ' + (e.message || e));
+        callbacks.onError(url, 'TLS init failed: ' + (e.message || e), options);
         return;
       }
     } else {
@@ -244,11 +233,11 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
     }
 
     connections[fd] = conn;
-    callbacks.onStatus(url, 'Connecting ' + p.host + ':' + p.port);
+    callbacks.onStatus(url, 'Connecting ' + p.host + ':' + p.port, options);
     try { net.epoll_ctl(epfd, net.EPOLL_CTL_ADD, fd, net.EPOLLOUT); }
     catch (e) {
       closeConnection(fd);
-      callbacks.onError(url, 'epoll_ctl: ' + (e.message || e));
+      callbacks.onError(url, 'epoll_ctl: ' + (e.message || e), options);
     }
   }
 
@@ -260,7 +249,7 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
     if (c.state === 'connecting' && (ev.events & net.EPOLLOUT)) {
       if (!net.is_connected(fd)) {
         closeConnection(fd);
-        callbacks.onError(c.url, 'Connection failed');
+        callbacks.onError(c.url, 'Connection failed', c.options);
         return;
       }
       if (c.tlsConn) { c.state = 'tls_handshake'; stepTls(fd, c); }
@@ -279,15 +268,15 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
       if (ev.events & net.EPOLLIN) {
         let chunk;
         try { chunk = tls.recvBytes(fd, 8192); }
-        catch (e) { closeConnection(fd); callbacks.onError(c.url, 'TLS recv: ' + (e.message || e)); return; }
+        catch (e) { closeConnection(fd); callbacks.onError(c.url, 'TLS recv: ' + (e.message || e), c.options); return; }
         if (chunk === null) {
           closeConnection(fd);
-          callbacks.onError(c.url, 'Connection closed during TLS handshake');
+          callbacks.onError(c.url, 'Connection closed during TLS handshake', c.options);
           return;
         }
         if (chunk.length > 0) {
           try { tls.feedIncoming(c.tlsConn, chunk); }
-          catch (e) { closeConnection(fd); callbacks.onError(c.url, 'TLS feed: ' + (e.message || e)); return; }
+          catch (e) { closeConnection(fd); callbacks.onError(c.url, 'TLS feed: ' + (e.message || e), c.options); return; }
         }
       }
       stepTls(fd, c);
@@ -299,7 +288,11 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
         if (ev.events & net.EPOLLIN) {
           let chunk;
           try { chunk = tls.recvBytes(fd, 8192); } catch (_) { chunk = null; }
-          if (chunk === null) { closeConnection(fd); callbacks.onError(c.url, 'Connection closed while flushing TLS'); return; }
+          if (chunk === null) {
+            closeConnection(fd);
+            callbacks.onError(c.url, 'Connection closed while flushing TLS', c.options);
+            return;
+          }
           if (chunk.length > 0) { try { tls.feedIncoming(c.tlsConn, chunk); } catch (_) {} }
         }
         if (ev.events & net.EPOLLOUT) {
@@ -320,7 +313,7 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
     if (c.state === 'receiving' && (ev.events & net.EPOLLIN)) {
       let chunk;
       try { chunk = tls.recvBytes(fd, 8192); }
-      catch (e) { closeConnection(fd); callbacks.onError(c.url, 'recv: ' + (e.message || e)); return; }
+      catch (e) { closeConnection(fd); callbacks.onError(c.url, 'recv: ' + (e.message || e), c.options); return; }
 
       if (chunk === null) {
         if (c.tlsConn) {
@@ -356,7 +349,7 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
         }
       }
 
-      callbacks.onStatus(c.url, 'Receiving… ' + c.recvBytes.length + ' bytes');
+      callbacks.onStatus(c.url, 'Receiving… ' + c.recvBytes.length + ' bytes', c.options);
     }
   }
 
@@ -368,38 +361,36 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
         sep = i; break;
       }
     }
-    if (sep < 0) { callbacks.onError(c.url, 'Malformed HTTP response'); return; }
+    if (sep < 0) { callbacks.onError(c.url, 'Malformed HTTP response', c.options); return; }
 
     const head = decodeUtf8(c.recvBytes.subarray(0, sep));
     const contentType = (head.match(/^content-type:\s*(.+)$/im) || [])[1] || '';
     const body = decodeBody(c.recvBytes.subarray(sep + 4), contentType);
 
     const resp = parseHttpResponse(head + '\r\n\r\n' + body);
-    if (!resp) { callbacks.onError(c.url, 'Malformed HTTP response'); return; }
+    if (!resp) { callbacks.onError(c.url, 'Malformed HTTP response', c.options); return; }
 
-    /* ★ Cookies FIRST — some servers set a session cookie on the
-     *   redirect response that must be sent on the next request. */
     if (cookieJar && resp.setCookies && resp.setCookies.length > 0) {
       for (const sc of resp.setCookies) cookieJar.store(sc, c.url);
     }
 
     if (isRedirect(resp.status) && resp.headers.location) {
       if (c.redirects >= 10) {
-        callbacks.onError(c.url, 'Too many redirects (limit 10)');
+        callbacks.onError(c.url, 'Too many redirects (limit 10)', c.options);
         return;
       }
       const target = resolveUrl(c.url, resp.headers.location);
       if (target === c.url) {
-        callbacks.onError(c.url, 'Redirect loop: ' + target);
+        callbacks.onError(c.url, 'Redirect loop: ' + target, c.options);
         return;
       }
-      callbacks.onStatus(c.url, `Redirect ${resp.status} → ${target}`);
-      const nextOpts = { redirectCount: c.redirects + 1 };
-      if (c.options && c.options.fromHistory) nextOpts.fromHistory = true;
+      callbacks.onStatus(c.url, `Redirect ${resp.status} → ${target}`, c.options);
+      // ★ preserve everything (tabId, fromHistory) through the redirect chain
+      const nextOpts = { ...c.options, redirectCount: c.redirects + 1 };
       fetch(target, nextOpts);
       return;
     }
-    if (c.truncated) callbacks.onStatus(c.url, 'Response truncated at 5MB');
+    if (c.truncated) callbacks.onStatus(c.url, 'Response truncated at 5MB', c.options);
     callbacks.onResponse(c.url, resp, c.options);
   }
 

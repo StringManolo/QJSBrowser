@@ -1,6 +1,7 @@
 export const ASCII = {
   ESC:        27,
   CTRL_C:     3,
+  CTRL_T:     20,
   CTRL_U:     21,
   CTRL_W:     23,
   CTRL_L:     12,

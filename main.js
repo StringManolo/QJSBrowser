@@ -3,31 +3,31 @@ import tui from 'tui';
 import tls from 'tls';
 
 import { buildKeyMap }      from 'src/base/keys.js';
+import { createTheme }      from 'src/ui/theme.js';
 import { createHttpClient } from 'src/net/http-client.js';
 import { createCookieJar }  from 'src/net/cookies.js';
 import { createOmnibox }    from 'src/ui/omnibox.js';
 import { createPageView }   from 'src/ui/page-view.js';
-import { createStatusBar }  from 'src/ui/status-bar.js';
 import { createHistory }    from 'src/browser/history.js';
 import { createController } from 'src/browser/controller.js';
 
 tui.init();
 
-const keys = buildKeyMap(tui);
-const epfd = net.epoll_create1(0);
+const theme = createTheme(tui);
+const keys  = buildKeyMap(tui);
+const epfd  = net.epoll_create1(0);
 net.epoll_ctl(epfd, net.EPOLL_CTL_ADD, 0, net.EPOLLIN);
 
-const omnibox   = createOmnibox();
-const pageView  = createPageView();
-const statusBar = createStatusBar();
-const history   = createHistory();
+const omnibox  = createOmnibox();
+const pageView = createPageView(tui, theme);
+const history  = createHistory();
 const cookieJar = createCookieJar();
 
 const httpClient = createHttpClient(net, epfd, tls, cookieJar);
 
 const controller = createController({
-  tui, net, keys, epfd, httpClient,
-  omnibox, pageView, statusBar, history,
+  tui, net, keys, epfd, httpClient, theme,
+  omnibox, pageView, history,
 });
 
 httpClient.setCallbacks({

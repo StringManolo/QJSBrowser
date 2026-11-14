@@ -42,17 +42,8 @@ export function createOmnibox() {
     return null;
   }
 
-  function render(tui, row, cols, active) {
-    const A_REVERSE = tui.A_REVERSE;
-    const A_BOLD    = tui.A_BOLD;
-    tui.move(row, 0); tui.clrtoeol();
-    const label = active ? ' URL> ' : ' URL  ';
-    tui.print(row, 0, label + text);
-    return { cursorCol: label.length + cursor };
-  }
-
   return {
-    setText, clear, handleKey, render,
+    setText, clear, handleKey,
     get text()   { return text; },
     get cursor() { return cursor; },
   };

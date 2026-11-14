@@ -1,4 +1,4 @@
-export function createPageView() {
+export function createPageView(tui, theme) {
   let content = '';
   let scrollY = 0;
   let links = [];
@@ -26,37 +26,36 @@ export function createPageView() {
   }
 
   function maxScroll(cols, viewH) {
-    const lines = layout(cols);
-    return Math.max(0, lines.length - viewH);
+    return Math.max(0, layout(cols).length - viewH);
   }
 
   function scroll(dy, cols, viewH) {
     scrollY = Math.max(0, Math.min(scrollY + dy, maxScroll(cols, viewH)));
   }
 
-  function scrollTo(y, cols, viewH) {
-    scrollY = Math.max(0, Math.min(y, maxScroll(cols, viewH)));
-  }
+  function render(x, y, w, h) {
+    const P = theme.pairs;
+    tui.fillPair(y, x, h, w, P.page);
 
-  function render(tui, topRow, height, cols) {
-    const lines = layout(cols);
-    const ms = Math.max(0, lines.length - height);
+    const lines = layout(w);
+    const ms = Math.max(0, lines.length - h);
     if (scrollY > ms) scrollY = ms;
     if (scrollY < 0)  scrollY = 0;
 
-    for (let i = 0; i < height; i++) {
-      tui.move(topRow + i, 0);
-      tui.clrtoeol();
+    for (let i = 0; i < h; i++) {
       const idx = i + scrollY;
-      if (idx < lines.length) tui.print(topRow + i, 0, lines[idx]);
+      if (idx < lines.length) {
+        tui.printPair(y + i, x, lines[idx], P.page);
+      }
     }
+
     return { scrollY, maxScroll: ms };
   }
 
   return {
-    setContent, render, scroll, scrollTo, maxScroll,
-    get links()    { return links; },
-    get scrollY()  { return scrollY; },
-    get raw()      { return content; },
+    setContent, render, scroll, maxScroll,
+    get links()   { return links; },
+    get scrollY() { return scrollY; },
+    get raw()     { return content; },
   };
 }

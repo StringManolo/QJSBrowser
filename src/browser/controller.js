@@ -1,5 +1,7 @@
-import { parseUrl }       from 'src/base/url.js';
-import { htmlToText }     from 'src/content/html-to-text.js';
+import { parseUrl }      from 'src/base/url.js';
+import { htmlToText }    from 'src/content/html-to-text.js';
+import { drawWindow }    from 'src/ui/window.js';
+import { createToolbar } from 'src/ui/toolbar.js';
 
 const WELCOME =
   'Welcome to QJSBrowser!\n\n' +
@@ -7,52 +9,118 @@ const WELCOME =
   'Keyboard — page mode:\n' +
   '  j / ↓      scroll down\n' +
   '  k / ↑      scroll up\n' +
-  '  space      page down\n' +
+  '  Space      page down\n' +
   '  b          page up\n' +
   '  1-9        follow link N\n' +
   '  [  / ]     back / forward\n' +
   '  r          reload\n' +
-  '  g  or :    edit URL\n' +
-  '  q          quit\n\n' +
-  'Keyboard — omnibox mode:\n' +
-  '  Enter      navigate\n' +
-  '  Esc        back to page mode\n' +
-  '  Ctrl+U     clear line\n' +
-  '  Ctrl+W     delete word\n';
+  '  g / :      edit URL\n' +
+  '  Tab        toggle address/page\n' +
+  '  q          quit\n';
 
 export function createController(deps) {
-  const { tui, net, keys, epfd, httpClient,
-          omnibox, pageView, statusBar, history } = deps;
+  const { tui, net, keys, epfd, httpClient, theme,
+          omnibox, pageView, history } = deps;
 
-  let mode = 'omnibox';   // 'omnibox' | 'page'
+  const P = theme.pairs;
+  const toolbar = createToolbar(tui, theme);
+
+  let mode = 'omnibox';
   let running = true;
   let currentUrl = '';
+  let statusText = 'ready';
+  let cursorPos = null;
 
-  // ---------- render ----------
+  // ---------- address bar renderer ----------
+  function renderAddressBar(x, y, w, focused) {
+    const bg = focused ? P.addressFocus : P.address;
+    tui.fillPair(y, x, 1, w, bg);
+
+    const text = omnibox.text;
+    const cursor = omnibox.cursor;
+    const pad = 1;
+    const avail = Math.max(1, w - pad * 2);
+
+    let viewStart = 0;
+    let viewEnd = text.length;
+    if (text.length > avail) {
+      if (cursor < avail) {
+        viewEnd = avail;
+      } else {
+        viewStart = cursor - avail + 1;
+        viewEnd = cursor + 1;
+      }
+    }
+
+    const visible = text.slice(viewStart, viewEnd);
+    const content = ' '.repeat(pad) + visible;
+    const padded = content + ' '.repeat(Math.max(0, w - content.length));
+    tui.printPair(y, x, padded.slice(0, w), bg);
+
+    if (focused) {
+      const curInView = (cursor >= viewStart && cursor <= viewEnd)
+        ? (cursor - viewStart) + pad
+        : -1;
+      if (curInView >= 0) cursorPos = { y, x: x + curInView };
+    }
+  }
+
+  // ---------- full screen render ----------
   function render() {
     const { rows, cols } = tui.size();
+    cursorPos = null;
 
-    tui.attron(tui.A_REVERSE | tui.A_BOLD);
-    tui.print(0, 0, ' QJSBrowser ');
-    const qh = ' Ctrl+C = quit ';
-    tui.print(0, cols - qh.length, qh);
-    tui.attroff(tui.A_REVERSE | tui.A_BOLD);
+    tui.erase();
 
-    const { cursorCol } = omnibox.render(tui, 1, cols, mode === 'omnibox');
+    // Outer window
+    drawWindow(tui, theme, { x: 0, y: 0, w: cols, h: rows, title: 'QJSBrowser', focused: true, style: 0 });
 
-    tui.move(2, 0); tui.clrtoeol();
-    tui.print(2, 0, '─'.repeat(cols));
+    // Toolbar row (row 1)
+    const tbW = cols - 2;
+    const tbUsed = toolbar.render(1, 1, tbW, mode);
 
-    const { scrollY, maxScroll } = pageView.render(tui, 3, rows - 4, cols);
+    // Address bar (rest of toolbar row)
+    const addrX = 1 + tbUsed;
+    const addrW = tbW - tbUsed;
+    if (addrW > 2) {
+      renderAddressBar(addrX, 1, addrW, mode === 'omnibox');
+    }
 
-    const scrollInfo = maxScroll > 0 ? ` [${scrollY}/${maxScroll}]` : '';
-    const hints = mode === 'omnibox'
-      ? ' [Enter=goto Esc=page]'
-      : ' [j/k:scroll 1-9:link [:back ]:fwd g:goto r:reload q:quit]';
-    statusBar.render(tui, rows - 1, cols, scrollInfo + hints);
+    // Separator
+    if (rows > 4) {
+      tui.hline(2, 1, cols - 2, P.separator, '─');
+    }
 
-    if (mode === 'omnibox')
-      tui.move(1, Math.min(cursorCol, cols - 1));
+    // Page area
+    const pageY = 3;
+    const pageH = rows - 6;
+    if (pageH > 0) {
+      pageView.render(1, pageY, cols - 2, pageH);
+    }
+
+    // Bottom separator
+    if (rows > 5) {
+      tui.hline(rows - 3, 1, cols - 2, P.separator, '─');
+    }
+
+    // Status bar
+    if (rows > 4) {
+      const stY = rows - 2;
+      const stW = cols - 2;
+      tui.fillPair(stY, 1, 1, stW, P.status);
+      const line = (' ' + statusText).slice(0, stW).padEnd(stW);
+      tui.printPair(stY, 1, line, P.status);
+    }
+
+    // Cursor
+    if (mode === 'omnibox' && cursorPos) {
+      tui.setCursor(1);
+      tui.move(cursorPos.y, Math.min(cursorPos.x, cols - 2));
+    } else {
+      tui.setCursor(0);
+      tui.move(rows - 1, 0);
+    }
+
     tui.refresh();
   }
 
@@ -61,6 +129,11 @@ export function createController(deps) {
     let ch;
     while ((ch = tui.getch()) !== keys.ERR) {
       if (ch === keys.CTRL_C) { running = false; return; }
+      if (ch === 9) {  // Tab
+        mode = (mode === 'omnibox') ? 'page' : 'omnibox';
+        if (mode === 'omnibox') omnibox.setText(omnibox.text);
+        continue;
+      }
       if (mode === 'omnibox') handleOmniboxKey(ch);
       else                    handlePageKey(ch);
     }
@@ -78,10 +151,11 @@ export function createController(deps) {
 
   function handlePageKey(ch) {
     const { rows, cols } = tui.size();
-    const pageH = rows - 4;
+    const pageH = rows - 6;
 
     if (ch === 'g'.charCodeAt(0) || ch === ':'.charCodeAt(0)) {
-      mode = 'omnibox'; return;
+      mode = 'omnibox';
+      return;
     }
     if (ch === 'q'.charCodeAt(0)) { running = false; return; }
     if (ch === 'r'.charCodeAt(0)) {
@@ -92,23 +166,23 @@ export function createController(deps) {
     if (ch === ']'.charCodeAt(0)) { goForward(); return; }
 
     if (ch === 'j'.charCodeAt(0) || ch === keys.ARROW_DOWN) {
-      pageView.scroll(1, cols, pageH); return;
+      pageView.scroll(1, cols - 2, pageH); return;
     }
     if (ch === 'k'.charCodeAt(0) || ch === keys.ARROW_UP) {
-      pageView.scroll(-1, cols, pageH); return;
+      pageView.scroll(-1, cols - 2, pageH); return;
     }
     if (ch === keys.SPACE) {
-      pageView.scroll(Math.max(1, pageH - 2), cols, pageH); return;
+      pageView.scroll(Math.max(1, pageH - 2), cols - 2, pageH); return;
     }
     if (ch === 'b'.charCodeAt(0)) {
-      pageView.scroll(-Math.max(1, pageH - 2), cols, pageH); return;
+      pageView.scroll(-Math.max(1, pageH - 2), cols - 2, pageH); return;
     }
 
     if (ch >= '1'.charCodeAt(0) && ch <= '9'.charCodeAt(0)) {
       const n = ch - '0'.charCodeAt(0);
       const link = pageView.links.find(l => l.n === n);
       if (link) navigate(link.href);
-      else      statusBar.set(`No link [${n}]`);
+      else      statusText = `No link [${n}]`;
       return;
     }
   }
@@ -116,9 +190,9 @@ export function createController(deps) {
   // ---------- navigation ----------
   function navigate(url, options = {}) {
     const p = parseUrl(url);
-    if (!p) { statusBar.set('Invalid URL: ' + url); render(); return; }
+    if (!p) { statusText = 'Invalid URL: ' + url; render(); return; }
     if (p.scheme !== 'http' && p.scheme !== 'https') {
-      statusBar.set('Unsupported scheme: ' + p.scheme + '://');
+      statusText = 'Unsupported scheme: ' + p.scheme + '://';
       render(); return;
     }
     pageView.setContent('Loading ' + url + ' …', []);
@@ -127,23 +201,26 @@ export function createController(deps) {
 
   function goBack() {
     const url = history.back();
-    if (!url) { statusBar.set('No history back'); render(); return; }
+    if (!url) { statusText = 'No history back'; render(); return; }
     omnibox.setText(url);
     navigate(url, { fromHistory: true });
   }
 
   function goForward() {
     const url = history.forward();
-    if (!url) { statusBar.set('No history forward'); render(); return; }
+    if (!url) { statusText = 'No history forward'; render(); return; }
     omnibox.setText(url);
     navigate(url, { fromHistory: true });
   }
 
   // ---------- callbacks from httpClient ----------
-  function handleStatus(url, msg) { statusBar.set(msg); render(); }
+  function handleStatus(url, msg) {
+    statusText = msg;
+    render();
+  }
 
   function handleError(url, msg) {
-    statusBar.set('Error: ' + msg);
+    statusText = 'Error: ' + msg;
     pageView.setContent('Failed: ' + url + '\n\n' + msg, []);
     render();
   }
@@ -173,16 +250,12 @@ export function createController(deps) {
     }
 
     pageView.setContent(text, links);
-    statusBar.set(
-      `HTTP ${resp.status} ${resp.statusText} — ` +
-      `${text.length} chars, ${links.length} links`
-    );
+    statusText = `HTTP ${resp.status} ${resp.statusText} — ${text.length} chars, ${links.length} links`;
     render();
   }
 
   // ---------- init ----------
   pageView.setContent(WELCOME, []);
-  statusBar.set('ready');
 
   return {
     render, handleInput,

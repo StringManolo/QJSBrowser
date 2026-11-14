@@ -12,33 +12,32 @@ function concatBytes(a, b) {
   return out;
 }
 
-/* Full UTF-8 decoder: byte array → JS string (UTF-16).
- * Handles partial sequences properly across concatenation. */
+function stringToBytes(s) {
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xFF;
+  return out;
+}
+
 function decodeUtf8(bytes) {
   let out = '';
   let i = 0;
   while (i < bytes.length) {
     const b0 = bytes[i];
     if (b0 < 0x80) {
-      out += String.fromCharCode(b0);
-      i++;
+      out += String.fromCharCode(b0); i++;
     } else if (b0 < 0xC2) {
-      // 0x80-0xBF: orphan continuation, 0xC0/0xC1: overlong
-      out += '\uFFFD';
-      i++;
+      out += '\uFFFD'; i++;
     } else if (b0 < 0xE0) {
       if (i + 1 >= bytes.length) { out += '\uFFFD'; break; }
       const b1 = bytes[i + 1];
       if ((b1 & 0xC0) !== 0x80) { out += '\uFFFD'; i++; continue; }
-      const cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F);
-      out += String.fromCharCode(cp);
+      out += String.fromCharCode(((b0 & 0x1F) << 6) | (b1 & 0x3F));
       i += 2;
     } else if (b0 < 0xF0) {
       if (i + 2 >= bytes.length) { out += '\uFFFD'; break; }
       const b1 = bytes[i + 1], b2 = bytes[i + 2];
       if ((b1 & 0xC0) !== 0x80 || (b2 & 0xC0) !== 0x80) { out += '\uFFFD'; i++; continue; }
-      const cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
-      out += String.fromCharCode(cp);
+      out += String.fromCharCode(((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F));
       i += 3;
     } else if (b0 < 0xF5) {
       if (i + 3 >= bytes.length) { out += '\uFFFD'; break; }
@@ -51,11 +50,42 @@ function decodeUtf8(bytes) {
       out += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
       i += 4;
     } else {
-      out += '\uFFFD';
-      i++;
+      out += '\uFFFD'; i++;
     }
   }
   return out;
+}
+
+function decodeLatin1(bytes) {
+  let out = '';
+  for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+  return out;
+}
+
+/* Charset-aware decoder. Respects Content-Type charset if present;
+ * otherwise sniffs UTF-8 vs Latin-1 by replacement-char density. */
+function decodeBody(bytes, contentType) {
+  const ct = (contentType || '').toLowerCase();
+  const match = ct.match(/charset\s*=\s*["']?([^"';\s]+)/);
+  const charset = match ? match[1] : null;
+
+  if (charset) {
+    if (charset === 'iso-8859-1' || charset === 'latin1' ||
+        charset === 'latin-1'   || charset === 'windows-1252') {
+      return decodeLatin1(bytes);
+    }
+    if (charset === 'utf-8' || charset === 'utf8') {
+      return decodeUtf8(bytes);
+    }
+  }
+
+  const utf8 = decodeUtf8(bytes);
+  let bad = 0;
+  for (let i = 0; i < utf8.length; i++) {
+    if (utf8.charCodeAt(i) === 0xFFFD) bad++;
+  }
+  if (bad > 0 && bad * 20 > utf8.length) return decodeLatin1(bytes);
+  return utf8;
 }
 
 export function createHttpClient(net, epfd, tls) {
@@ -69,6 +99,7 @@ export function createHttpClient(net, epfd, tls) {
       `GET ${p.path} HTTP/1.0\r\n` +
       `Host: ${p.host}\r\n` +
       `User-Agent: QJSBrowser/0.1\r\n` +
+      `Accept-Encoding: identity\r\n` +
       `Connection: close\r\n\r\n`
     );
   }
@@ -85,8 +116,6 @@ export function createHttpClient(net, epfd, tls) {
     try { net.epoll_ctl(epfd, net.EPOLL_CTL_MOD, fd, events); }
     catch (_) {}
   }
-
-  // ---------- TLS plumbing ----------
 
   function flushTlsOut(fd, c) {
     for (;;) {
@@ -110,9 +139,7 @@ export function createHttpClient(net, epfd, tls) {
       callbacks.onError(c.url, 'TLS handshake: ' + (e.message || e));
       return false;
     }
-
     const drained = flushTlsOut(fd, c);
-
     if (res === 1) {
       try { tls.write(c.tlsConn, c.request); }
       catch (e) {
@@ -129,7 +156,6 @@ export function createHttpClient(net, epfd, tls) {
       }
       return true;
     }
-
     if (res === 2) {
       setEpoll(fd, drained ? net.EPOLLIN : (net.EPOLLIN | net.EPOLLOUT));
       return true;
@@ -138,13 +164,11 @@ export function createHttpClient(net, epfd, tls) {
       setEpoll(fd, net.EPOLLIN | net.EPOLLOUT);
       return true;
     }
-
     closeConnection(fd);
     callbacks.onError(c.url, 'TLS handshake error code ' + res);
     return false;
   }
 
-  // Feed ciphertext, drain plaintext bytes into c.recvBytes.
   function feedTlsIn(fd, c, bytes) {
     if (bytes && bytes.length > 0) {
       try { tls.feedIncoming(c.tlsConn, bytes); }
@@ -180,10 +204,7 @@ export function createHttpClient(net, epfd, tls) {
     }
   }
 
-  // ---------- public API ----------
-
   function fetch(url, options = {}) {
-    // Always honor the url argument — options.parsed is a hint only
     const p = parseUrl(url);
     if (!p) { callbacks.onError(url, 'Invalid URL'); return; }
     if (p.scheme !== 'http' && p.scheme !== 'https') {
@@ -200,18 +221,18 @@ export function createHttpClient(net, epfd, tls) {
     net.connect(fd, ip, p.port);
 
     const conn = {
-      state:     'connecting',
+      state:        'connecting',
       url,
-      parsed:    p,
+      parsed:       p,
       options,
-      request:   buildRequest(p),
-      sent:      0,
-      recv:      '',               // plain HTTP (string)
-      recvBytes: new Uint8Array(0),// TLS (bytes)
-      redirects: options.redirectCount || 0,
-      tlsConn:   null,
-      tlsOut:    new Uint8Array(0),
-      truncated: false,
+      request:      buildRequest(p),
+      requestBytes: null,
+      sent:         0,
+      recvBytes:    new Uint8Array(0),
+      redirects:    options.redirectCount || 0,
+      tlsConn:      null,
+      tlsOut:       new Uint8Array(0),
+      truncated:    false,
     };
 
     if (p.scheme === 'https') {
@@ -224,6 +245,8 @@ export function createHttpClient(net, epfd, tls) {
         callbacks.onError(url, 'TLS init failed: ' + (e.message || e));
         return;
       }
+    } else {
+      conn.requestBytes = stringToBytes(conn.request);
     }
 
     connections[fd] = conn;
@@ -240,7 +263,6 @@ export function createHttpClient(net, epfd, tls) {
     const c = connections[fd];
     if (!c) return;
 
-    // ---- connecting ----
     if (c.state === 'connecting' && (ev.events & net.EPOLLOUT)) {
       if (!net.is_connected(fd)) {
         closeConnection(fd);
@@ -251,8 +273,8 @@ export function createHttpClient(net, epfd, tls) {
         c.state = 'tls_handshake';
         stepTls(fd, c);
       } else {
-        const sent = net.send(fd, c.request);
-        if (sent >= c.request.length) {
+        const sent = tls.sendBytes(fd, c.requestBytes);
+        if (sent >= c.requestBytes.length) {
           c.state = 'receiving';
           setEpoll(fd, net.EPOLLIN);
         } else {
@@ -264,7 +286,6 @@ export function createHttpClient(net, epfd, tls) {
       return;
     }
 
-    // ---- tls_handshake ----
     if (c.state === 'tls_handshake') {
       if (ev.events & net.EPOLLIN) {
         let chunk;
@@ -292,7 +313,6 @@ export function createHttpClient(net, epfd, tls) {
       return;
     }
 
-    // ---- sending ----
     if (c.state === 'sending') {
       if (c.tlsConn) {
         if (ev.events & net.EPOLLIN) {
@@ -313,9 +333,9 @@ export function createHttpClient(net, epfd, tls) {
         }
       } else {
         if (ev.events & net.EPOLLOUT) {
-          const remaining = c.request.slice(c.sent);
-          c.sent += net.send(fd, remaining);
-          if (c.sent >= c.request.length) {
+          const remaining = c.requestBytes.subarray(c.sent);
+          c.sent += tls.sendBytes(fd, remaining);
+          if (c.sent >= c.requestBytes.length) {
             c.state = 'receiving';
             setEpoll(fd, net.EPOLLIN);
           }
@@ -324,19 +344,17 @@ export function createHttpClient(net, epfd, tls) {
       return;
     }
 
-    // ---- receiving ----
     if (c.state === 'receiving' && (ev.events & net.EPOLLIN)) {
+      let chunk;
+      try { chunk = tls.recvBytes(fd, 8192); }
+      catch (e) {
+        closeConnection(fd);
+        callbacks.onError(c.url, 'recv: ' + (e.message || e));
+        return;
+      }
 
-      if (c.tlsConn) {
-        let chunk;
-        try { chunk = tls.recvBytes(fd, 8192); }
-        catch (e) {
-          closeConnection(fd);
-          callbacks.onError(c.url, 'TLS recv: ' + (e.message || e));
-          return;
-        }
-        if (chunk === null) {
-          // EOF: drain any remaining plaintext bytes from OpenSSL
+      if (chunk === null) {
+        if (c.tlsConn) {
           try {
             for (;;) {
               const out = tls.readBytes(c.tlsConn);
@@ -345,45 +363,62 @@ export function createHttpClient(net, epfd, tls) {
               c.recvBytes = concatBytes(c.recvBytes, out);
             }
           } catch (_) {}
-          closeConnection(fd);
-          processResponse(c);
-          return;
         }
-        if (chunk.length > 0) {
+        closeConnection(fd);
+        processResponse(c);
+        return;
+      }
+
+      if (chunk.length > 0) {
+        if (c.tlsConn) {
           if (!feedTlsIn(fd, c, chunk)) {
             if (c.truncated) { closeConnection(fd); processResponse(c); }
             return;
           }
-        }
-      } else {
-        const chunk = net.recv(fd, 8192);
-        if (chunk === '') {
-          closeConnection(fd);
-          processResponse(c);
-          return;
-        }
-        c.recv += chunk;
-        if (c.recv.length > MAX_RESPONSE_BYTES) {
-          c.recv = c.recv.slice(0, MAX_RESPONSE_BYTES);
-          c.truncated = true;
-          closeConnection(fd);
-          processResponse(c);
-          return;
+        } else {
+          c.recvBytes = concatBytes(c.recvBytes, chunk);
+          if (c.recvBytes.length > MAX_RESPONSE_BYTES) {
+            c.recvBytes = c.recvBytes.subarray(0, MAX_RESPONSE_BYTES);
+            c.truncated = true;
+            closeConnection(fd);
+            processResponse(c);
+            return;
+          }
         }
       }
 
-      const size = c.tlsConn ? c.recvBytes.length : c.recv.length;
-      callbacks.onStatus(c.url, 'Receiving… ' + size + ' bytes');
+      callbacks.onStatus(c.url, 'Receiving… ' + c.recvBytes.length + ' bytes');
     }
   }
 
   function processResponse(c) {
-    const raw = c.tlsConn ? decodeUtf8(c.recvBytes) : c.recv;
-    const resp = parseHttpResponse(raw);
+    // Locate end-of-headers (CRLFCRLF) without decoding
+    let sep = -1;
+    for (let i = 0; i < c.recvBytes.length - 3; i++) {
+      if (c.recvBytes[i]   === 0x0D && c.recvBytes[i+1] === 0x0A &&
+          c.recvBytes[i+2] === 0x0D && c.recvBytes[i+3] === 0x0A) {
+        sep = i;
+        break;
+      }
+    }
+    if (sep < 0) {
+      callbacks.onError(c.url, 'Malformed HTTP response');
+      return;
+    }
+
+    // Headers are always ASCII per RFC 7230 → safe as UTF-8
+    const head = decodeUtf8(c.recvBytes.subarray(0, sep));
+    const contentType = (head.match(/^content-type:\s*(.+)$/im) || [])[1] || '';
+
+    // Body: honor declared charset, else sniff
+    const body = decodeBody(c.recvBytes.subarray(sep + 4), contentType);
+
+    const resp = parseHttpResponse(head + '\r\n\r\n' + body);
     if (!resp) {
       callbacks.onError(c.url, 'Malformed HTTP response');
       return;
     }
+
     if (isRedirect(resp.status) && resp.headers.location) {
       if (c.redirects >= 10) {
         callbacks.onError(c.url, 'Too many redirects (limit 10)');
@@ -395,7 +430,6 @@ export function createHttpClient(net, epfd, tls) {
         return;
       }
       callbacks.onStatus(c.url, `Redirect ${resp.status} → ${target}`);
-      // ★ CRITICAL: drop `parsed` so fetch() re-parses the NEW url
       const nextOpts = { redirectCount: c.redirects + 1 };
       if (c.options && c.options.fromHistory) nextOpts.fromHistory = true;
       fetch(target, nextOpts);

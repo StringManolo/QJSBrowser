@@ -118,9 +118,10 @@ export function createController(deps) {
     const p = parseUrl(url);
     if (!p) { statusBar.set('Invalid URL: ' + url); render(); return; }
     if (p.scheme !== 'http' && p.scheme !== 'https') {
-      statusBar.set('Only http:// supported (got ' + p.scheme + '://)');
+      statusBar.set('Unsupported scheme: ' + p.scheme + '://');
       render(); return;
     }
+    pageView.setContent('Loading ' + url + ' …', []);
     httpClient.fetch(url, { ...options, parsed: p });
   }
 

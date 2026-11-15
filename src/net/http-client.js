@@ -1,7 +1,7 @@
 import { parseUrl, resolveUrl } from 'src/base/url.js';
 import { parseHttpResponse, isRedirect } from 'src/net/http-parser.js';
 
-const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+const MAX_RESPONSE_BYTES = 20 * 1024 * 1024;
 
 function concatBytes(a, b) {
   if (!a || a.length === 0) return b;
@@ -353,7 +353,7 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
     }
   }
 
-  function processResponse(c) {
+    function processResponse(c) {
     let sep = -1;
     for (let i = 0; i < c.recvBytes.length - 3; i++) {
       if (c.recvBytes[i]   === 0x0D && c.recvBytes[i+1] === 0x0A &&
@@ -365,10 +365,18 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
 
     const head = decodeUtf8(c.recvBytes.subarray(0, sep));
     const contentType = (head.match(/^content-type:\s*(.+)$/im) || [])[1] || '';
-    const body = decodeBody(c.recvBytes.subarray(sep + 4), contentType);
+    const bodyBytes = c.recvBytes.subarray(sep + 4);
+
+    // Force binary mode for image content-types — no point decoding garbage
+    const isImage = contentType.toLowerCase().startsWith('image/');
+    const isBinary = !!(c.options && c.options.binary) || isImage;
+    const body = isBinary ? '' : decodeBody(bodyBytes, contentType);
 
     const resp = parseHttpResponse(head + '\r\n\r\n' + body);
     if (!resp) { callbacks.onError(c.url, 'Malformed HTTP response', c.options); return; }
+
+    resp.rawBytes = bodyBytes;
+    resp.contentType = contentType;
 
     if (cookieJar && resp.setCookies && resp.setCookies.length > 0) {
       for (const sc of resp.setCookies) cookieJar.store(sc, c.url);
@@ -385,12 +393,11 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
         return;
       }
       callbacks.onStatus(c.url, `Redirect ${resp.status} → ${target}`, c.options);
-      // ★ preserve everything (tabId, fromHistory) through the redirect chain
       const nextOpts = { ...c.options, redirectCount: c.redirects + 1 };
       fetch(target, nextOpts);
       return;
     }
-    if (c.truncated) callbacks.onStatus(c.url, 'Response truncated at 5MB', c.options);
+    if (c.truncated) callbacks.onStatus(c.url, 'Response truncated at 20MB', c.options);
     callbacks.onResponse(c.url, resp, c.options);
   }
 

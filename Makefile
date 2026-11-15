@@ -12,13 +12,16 @@ NET_TAR := qjsNetworkSockets-$(NET_REF).tar.gz
 NET_URL := https://github.com/StringManolo/qjsNetworkSockets/archive/refs/heads/$(NET_REF).tar.gz
 NET_DIR := qjsNetworkSockets-$(NET_REF)
 
+# ---------- stb_image ----------
+STB_URL := https://raw.githubusercontent.com/nothings/stb/master/stb_image.h
+
 # ---------- OpenSSL ----------
 OPENSSL_CFLAGS := $(shell pkg-config --cflags openssl 2>/dev/null)
 OPENSSL_LIBS   := $(shell pkg-config --libs   openssl 2>/dev/null || echo -lssl -lcrypto)
 
-APP_CFLAGS := -Wall -Wextra -Wno-unused-parameter -O2 -fPIC -I$(QJS)
+APP_CFLAGS := -Wall -Wextra -Wno-unused-parameter -O2 -fPIC -I$(QJS) -I.
 
-all: qjsbrowser lib/tui.so lib/network_sockets.so lib/tls.so
+all: qjsbrowser lib/tui.so lib/network_sockets.so lib/tls.so lib/image.so
 
 # ---------------- QuickJS ----------------
 $(QJS)/quickjs.c:
@@ -42,7 +45,13 @@ lib/network_sockets.so: $(NET_DIR)/src/qjs_sockets.c $(QJS)/quickjs.c
 	$(CC) -shared -fPIC -O2 -I$(QJS) -Wno-unused-parameter \
 	      -o $@ $(NET_DIR)/src/qjs_sockets.c
 
-# ---------------- app ----------------
+# ---------------- stb_image ----------------
+stb_image.h:
+	@echo ">> Descargando stb_image.h..."
+	@test -f stb_image.h || curl -L --fail --silent --show-error -o stb_image.h "$(STB_URL)"
+	@test -f stb_image.h || { echo "ERROR: stb_image.h descarga falló"; exit 1; }
+
+# ---------------- app modules ----------------
 qjsbrowser: c/main.c $(QJS)/libquickjs.a
 	$(CC) $(APP_CFLAGS) -rdynamic -o $@ c/main.c $(QJS)/libquickjs.a -lm -lpthread -ldl
 
@@ -54,14 +63,18 @@ lib/tls.so: c/tls.c
 	@mkdir -p lib
 	$(CC) $(APP_CFLAGS) $(OPENSSL_CFLAGS) -shared -o $@ c/tls.c $(OPENSSL_LIBS)
 
+lib/image.so: c/image.c stb_image.h $(QJS)/quickjs.c
+	@mkdir -p lib
+	$(CC) $(APP_CFLAGS) -shared -o $@ c/image.c
+
 # ---------------- limpieza ----------------
 clean:
-	rm -f qjsbrowser lib/tui.so lib/network_sockets.so lib/tls.so
+	rm -f qjsbrowser lib/tui.so lib/network_sockets.so lib/tls.so lib/image.so
 	-$(MAKE) -C $(QJS) clean >/dev/null 2>&1 || true
 	-rm -f $(QJS)/*.o $(QJS)/libquickjs.a
 
 clean-src:
-	rm -rf $(QJS) $(QJS_TAR) $(NET_DIR) $(NET_TAR)
+	rm -rf $(QJS) $(QJS_TAR) $(NET_DIR) $(NET_TAR) stb_image.h
 
 distclean: clean clean-src
 

@@ -3,6 +3,7 @@
 #include <locale.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include "quickjs.h"
 
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
@@ -236,6 +237,94 @@ static JSValue t_get_mouse(JSContext *c, JSValueConst v, int ac, JSValueConst *a
   return o;
 }
 
+/* ---------- TRUECOLOR CELLS ---------- */
+
+typedef struct {
+    int y, x;
+    int fg, bg;
+    char ch[8];
+} RgbCell;
+
+static RgbCell *g_pending = NULL;
+static int g_pending_n   = 0;
+static int g_pending_cap = 0;
+
+/* Previous frame's pixel cells — used to detect when pixels need clearing */
+static RgbCell *g_prev = NULL;
+static int g_prev_n   = 0;
+static int g_prev_cap = 0;
+
+static JSValue t_print_rgb(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
+  (void)v; (void)ac;
+  int y, x, fg, bg;
+  if (JS_ToInt32(c, &y,  av[0])) return JS_EXCEPTION;
+  if (JS_ToInt32(c, &x,  av[1])) return JS_EXCEPTION;
+  if (JS_ToInt32(c, &fg, av[2])) return JS_EXCEPTION;
+  if (JS_ToInt32(c, &bg, av[3])) return JS_EXCEPTION;
+  const char *ch = JS_ToCString(c, av[4]);
+  if (!ch) return JS_EXCEPTION;
+
+  if (g_pending_n >= g_pending_cap) {
+    g_pending_cap = g_pending_cap ? g_pending_cap * 2 : 256;
+    g_pending = realloc(g_pending, g_pending_cap * sizeof(RgbCell));
+  }
+  RgbCell *cell = &g_pending[g_pending_n++];
+  cell->y = y; cell->x = x; cell->fg = fg; cell->bg = bg;
+  strncpy(cell->ch, ch, 7);
+  cell->ch[7] = 0;
+
+  JS_FreeCString(c, ch);
+  return JS_UNDEFINED;
+}
+
+/* Called by render() right after erase(). If prev frame had pixels, forces
+ * ncurses to fully redraw everything on next refresh() — this is the only
+ * reliable way to erase raw ANSI cells written outside ncurses' model. */
+static JSValue t_maybe_clearok(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
+  (void)c; (void)v; (void)ac; (void)av;
+  if (g_prev_n > 0) clearok(stdscr, TRUE);
+  return JS_UNDEFINED;
+}
+
+static JSValue t_flush_images(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
+  (void)v; (void)ac;
+  int cursor_y = 0, cursor_x = 0;
+  if (ac >= 1) JS_ToInt32(c, &cursor_y, av[0]);
+  if (ac >= 2) JS_ToInt32(c, &cursor_x, av[1]);
+
+  fflush(stdout);
+
+  for (int i = 0; i < g_pending_n; i++) {
+    RgbCell *cell = &g_pending[i];
+    int r   = (cell->fg >> 16) & 0xFF;
+    int g   = (cell->fg >>  8) & 0xFF;
+    int b   =  cell->fg        & 0xFF;
+    int br  = (cell->bg >> 16) & 0xFF;
+    int bg_ = (cell->bg >>  8) & 0xFF;
+    int bb  =  cell->bg        & 0xFF;
+    printf("\033[%d;%dH\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm%s\033[0m",
+           cell->y + 1, cell->x + 1,
+           r, g, b, br, bg_, bb,
+           cell->ch);
+  }
+
+  printf("\033[%d;%dH", cursor_y + 1, cursor_x + 1);
+  fflush(stdout);
+
+  /* Save current as prev for next frame */
+  if (g_pending_n > g_prev_cap) {
+    g_prev_cap = g_pending_n;
+    g_prev = realloc(g_prev, g_prev_cap * sizeof(RgbCell));
+  }
+  if (g_prev && g_pending_n > 0) {
+    memcpy(g_prev, g_pending, g_pending_n * sizeof(RgbCell));
+  }
+  g_prev_n = g_pending_n;
+
+  g_pending_n = 0;
+  return JS_UNDEFINED;
+}
+
 /* ---------- registration ---------- */
 
 static const JSCFunctionListEntry tui_funcs[] = {
@@ -262,6 +351,9 @@ static const JSCFunctionListEntry tui_funcs[] = {
   JS_CFUNC_DEF("mouseEnable", 0, t_mouse_enable),
   JS_CFUNC_DEF("mouseDisable", 0, t_mouse_disable),
   JS_CFUNC_DEF("getMouse", 0, t_get_mouse),
+  JS_CFUNC_DEF("printRgb", 5, t_print_rgb),
+  JS_CFUNC_DEF("flushImages", 2, t_flush_images),
+  JS_CFUNC_DEF("maybeClearok", 0, t_maybe_clearok),
 };
 
 static const JSCFunctionListEntry tui_consts[] = {

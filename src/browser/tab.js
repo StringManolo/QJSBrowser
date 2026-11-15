@@ -4,12 +4,12 @@ import { createHistory }  from 'src/browser/history.js';
 
 let nextTabId = 1;
 
-export function createTab(tui, theme) {
+export function createTab(tui, theme, imageView) {
   return {
     id: nextTabId++,
-    omnibox:  createOmnibox(),
-    pageView: createPageView(tui, theme),
-    history:  createHistory(),
+    omnibox:   createOmnibox(),
+    pageView:  createPageView(tui, theme, imageView),
+    history:   createHistory(),
     currentUrl: '',
     mode: 'omnibox',
     statusText: 'New Tab',

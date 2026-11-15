@@ -1,5 +1,5 @@
-export function createPageView(tui, theme) {
-  let segments = [{ text: '', linkN: null }];
+export function createPageView(tui, theme, imageView) {
+  let segments = [{ text: '' }];
   let links = [];
   let scrollY = 0;
   let cachedLines = null;
@@ -8,21 +8,20 @@ export function createPageView(tui, theme) {
   function setContent(segmentsOrText, newLinks) {
     if (typeof segmentsOrText === 'string') {
       segments = segmentsOrText.length > 0
-        ? [{ text: segmentsOrText, linkN: null }]
-        : [{ text: '', linkN: null }];
+        ? [{ text: segmentsOrText }]
+        : [{ text: '' }];
     } else {
       segments = (segmentsOrText && segmentsOrText.length > 0)
         ? segmentsOrText
-        : [{ text: '', linkN: null }];
+        : [{ text: '' }];
     }
     links = newLinks || [];
     scrollY = 0;
     cachedLines = null;
   }
 
-  /* Wrap rich segments into visual lines.
-   * Each visual line is an array of { text, linkN, pair }.
-   * Wrapping is done per segment so link identity survives across lines. */
+  function invalidate() { cachedLines = null; }
+
   function layout(cols) {
     if (cachedLines && cachedCols === cols) return cachedLines;
 
@@ -31,6 +30,33 @@ export function createPageView(tui, theme) {
     let col = 0;
 
     for (const seg of segments) {
+      // ---- image segment ----
+      if (seg.type === 'img') {
+        // Ensure we're at column 0
+        if (col > 0) { lines.push([]); col = 0; }
+
+        if (imageView && imageView.has(seg.src)) {
+          const cells = imageView.get(seg.src);
+          // Reserve cells.rows lines, each with one img item
+          for (let r = 0; r < cells.rows; r++) {
+            lines[lines.length - 1].push({
+              kind: 'img', src: seg.src, rowIdx: r, cols: cells.cols
+            });
+            lines.push([]);
+          }
+        } else {
+          const alt = seg.alt || seg.src;
+          const ph = `[IMG: ${alt}]`;
+          lines[lines.length - 1].push({
+            kind: 'text', text: ph, linkN: null, pair: P.page
+          });
+          lines.push([]);
+        }
+        col = 0;
+        continue;
+      }
+
+      // ---- text segment ----
       const pair = seg.linkN !== null ? P.link : P.page;
       const text = seg.text;
       let i = 0;
@@ -41,27 +67,19 @@ export function createPageView(tui, theme) {
 
         while (chunk.length > 0) {
           const remaining = cols - col;
-          if (remaining <= 0) {
-            lines.push([]);
-            col = 0;
-            continue;
-          }
+          if (remaining <= 0) { lines.push([]); col = 0; continue; }
           if (chunk.length <= remaining) {
-            lines[lines.length - 1].push({ text: chunk, linkN: seg.linkN, pair });
+            lines[lines.length - 1].push({ kind: 'text', text: chunk, linkN: seg.linkN, pair });
             col += chunk.length;
             chunk = '';
           } else {
-            lines[lines.length - 1].push({ text: chunk.slice(0, remaining), linkN: seg.linkN, pair });
+            lines[lines.length - 1].push({ kind: 'text', text: chunk.slice(0, remaining), linkN: seg.linkN, pair });
             chunk = chunk.slice(remaining);
-            lines.push([]);
-            col = 0;
+            lines.push([]); col = 0;
           }
         }
-
         if (nl < 0) break;
-        lines.push([]);
-        col = 0;
-        i = nl + 1;
+        lines.push([]); col = 0; i = nl + 1;
       }
     }
 
@@ -70,13 +88,8 @@ export function createPageView(tui, theme) {
     return lines;
   }
 
-  function maxScroll(cols, viewH) {
-    return Math.max(0, layout(cols).length - viewH);
-  }
-
-  function scroll(dy, cols, viewH) {
-    scrollY = Math.max(0, Math.min(scrollY + dy, maxScroll(cols, viewH)));
-  }
+  function maxScroll(cols, viewH) { return Math.max(0, layout(cols).length - viewH); }
+  function scroll(dy, cols, viewH) { scrollY = Math.max(0, Math.min(scrollY + dy, maxScroll(cols, viewH))); }
 
   function render(x, y, w, h) {
     const P = theme.pairs;
@@ -90,9 +103,13 @@ export function createPageView(tui, theme) {
     for (let i = 0; i < h; i++) {
       const idx = i + scrollY;
       if (idx >= lines.length) continue;
-      const lineSegs = lines[idx];
       let cx = x;
-      for (const seg of lineSegs) {
+      for (const seg of lines[idx]) {
+        if (seg.kind === 'img') {
+          if (imageView) imageView.renderRow(cx, y + i, seg.src, seg.rowIdx);
+          cx += seg.cols;
+          break;
+        }
         if (seg.text.length === 0) continue;
         tui.printPair(y + i, cx, seg.text, seg.pair);
         cx += seg.text.length;
@@ -102,7 +119,6 @@ export function createPageView(tui, theme) {
     return { scrollY, maxScroll: ms };
   }
 
-  /* Returns the visual line at viewRow as an array of segments. */
   function lineAt(viewRow, cols) {
     const lines = layout(cols);
     const idx = scrollY + viewRow;
@@ -111,10 +127,9 @@ export function createPageView(tui, theme) {
   }
 
   return {
-    setContent, render, scroll, maxScroll, lineAt,
+    setContent, render, scroll, maxScroll, lineAt, invalidate,
     get links()    { return links; },
     get scrollY()  { return scrollY; },
     get segments() { return segments; },
-    get raw()      { return segments.map(s => s.text).join(''); },
   };
 }

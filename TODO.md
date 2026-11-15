@@ -8,3 +8,5 @@
 - Add Settings button to click on UI 
 - Añadir scroll bar oara saber el tamaño de la web (feedback visual)
 - Add home webpage for HOME button
+- Add CSS
+- Load .png .joeg, webp, raw files properly (as images not text)

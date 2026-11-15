@@ -40,11 +40,19 @@ function cleanInlineText(s) {
   return decodeHtmlEntities(s.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ')).trim();
 }
 
-/* Returns:
- *   segments: [{ text, linkN: number|null }, ...]  — inline flow to render
- *   links:    [{ n, href, text }, ...]              — for programmatic lookup
- *   text:     string                                 — plain text (for status bar)
- */
+/* Parse an HTML dimension attribute ("100", "100px", "100%", "auto", etc.).
+ * Returns the numeric value only for plain integers. Percentages, "auto",
+ * and CSS units other than unitless px are rejected — we don't have a
+ * layout engine to interpret them. */
+function parseDim(v) {
+  if (!v) return 0;
+  const s = String(v).trim();
+  if (!/^\d+$/.test(s)) return 0;
+  const n = parseInt(s, 10);
+  if (n <= 0 || n > 4096) return 0;
+  return n;
+}
+
 export function htmlToText(html, baseUrl) {
   html = html.replace(/<script[\s\S]*?<\/script>/gi, '')
              .replace(/<style[\s\S]*?<\/style>/gi, '')
@@ -52,6 +60,7 @@ export function htmlToText(html, baseUrl) {
 
   const segments = [];
   const links = [];
+  const images = [];
   let linkN = 0;
 
   function pushPlain(raw) {
@@ -67,43 +76,58 @@ export function htmlToText(html, baseUrl) {
     segments.push({ text, linkN: null });
   }
 
-  const linkRe = /<a\s+[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  function pushImage(match) {
+    const attrRe = /(\w+)\s*=\s*["']([^"']*)["']/g;
+    const attrs = {};
+    let a;
+    while ((a = attrRe.exec(match)) !== null) attrs[a[1].toLowerCase()] = a[2];
+
+    if (!attrs.src) return;
+    const src = resolveUrl(baseUrl, decodeHtmlEntities(attrs.src));
+    if (!/^https?:\/\//i.test(src)) return;
+
+    const alt = decodeHtmlEntities(attrs.alt || '');
+    const width  = parseDim(attrs.width);
+    const height = parseDim(attrs.height);
+
+    images.push({ src, alt, width, height });
+    segments.push({ type: 'img', src, alt, width, height });
+  }
+
+  const tokenRe = /(<a\s+[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>)|(<img\b[^>]*>)/gi;
   let lastEnd = 0;
   let m;
-  while ((m = linkRe.exec(html)) !== null) {
+
+  while ((m = tokenRe.exec(html)) !== null) {
     pushPlain(html.slice(lastEnd, m.index));
 
-    const cleanHref = decodeHtmlEntities(m[1]);
-    const resolved = resolveUrl(baseUrl, cleanHref);
-
-    // Skip non-navigable schemes (mailto:, javascript:, tel:, ...)
-    if (!/^https?:\/\//i.test(resolved)) {
-      pushPlain(m[2]);
-      lastEnd = m.index + m[0].length;
-      continue;
+    if (m[1]) {
+      const href = decodeHtmlEntities(m[2]);
+      const resolved = resolveUrl(baseUrl, href);
+      if (!/^https?:\/\//i.test(resolved)) {
+        pushPlain(m[3]);
+      } else {
+        linkN++;
+        const label = cleanInlineText(m[3]) || resolved;
+        links.push({ n: linkN, href: resolved, text: label });
+        segments.push({ text: `[${linkN}]${label}`, linkN });
+      }
+    } else if (m[4]) {
+      pushImage(m[4]);
     }
-
-    linkN++;
-    const label = cleanInlineText(m[2]) || resolved;
-    links.push({ n: linkN, href: resolved, text: label });
-    segments.push({ text: `[${linkN}]${label}`, linkN });
 
     lastEnd = m.index + m[0].length;
   }
   pushPlain(html.slice(lastEnd));
 
-  // Bottom legend — full URLs, each row clickable
   if (links.length > 0) {
     segments.push({ text: '\n\n─── Links ───\n', linkN: null });
-    for (const l of links) {
-      segments.push({ text: `[${l.n}] ${l.href}\n`, linkN: l.n });
-    }
+    for (const l of links) segments.push({ text: `[${l.n}] ${l.href}\n`, linkN: l.n });
   }
 
-  // Plain-text version (for status bar / char count)
   let text = '';
-  for (const seg of segments) text += seg.text;
+  for (const seg of segments) if (!seg.type) text += seg.text;
   text = text.replace(/\n{3,}/g, '\n\n').trim();
 
-  return { segments, links, text };
+  return { segments, links, images, text };
 }

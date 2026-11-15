@@ -1,11 +1,11 @@
 import { createTab } from 'src/browser/tab.js';
 
-export function createTabManager(tui, theme) {
+export function createTabManager(tui, theme, imageView) {
   const tabs = [];
   let activeIndex = -1;
 
   function add(url = '') {
-    const tab = createTab(tui, theme);
+    const tab = createTab(tui, theme, imageView);
     if (url) tab.omnibox.setText(url);
     tabs.push(tab);
     activeIndex = tabs.length - 1;

@@ -13,4 +13,8 @@
 - Allow raw memory access
 - Allow view-source:
 - Add buttons, forms, etc visualy
-- 
+- Add basic js
+- Add dialogs (for example alert())
+- Add html5 dialogs/modals (cookies popups?)
+- Fix omnibox color goes black 
+- Add svg support with nanosvg.h

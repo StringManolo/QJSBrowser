@@ -72,7 +72,12 @@ while (controller.isRunning()) {
   let events;
   try { events = net.epoll_wait(epfd, 16, -1); }
   catch (e) {
-    console.log('[epoll_wait] ' + (e.message || String(e)));
+    const msg = e.message || String(e);
+    // EINTR is benign — SIGWINCH/SIGCONT/SIGTERM from the terminal manager.
+    // Just retry without spamming stderr (which would corrupt the TUI).
+    if (!/Interrupted system call|EINTR/i.test(msg)) {
+      console.log('[epoll_wait] ' + msg);
+    }
     continue;
   }
 

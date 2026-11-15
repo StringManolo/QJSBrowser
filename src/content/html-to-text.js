@@ -1,4 +1,8 @@
 import { resolveUrl } from 'src/base/url.js';
+import { parseStylesheet, parseInlineStyle } from 'src/css/parser.js';
+import { matches, specificity } from 'src/css/matcher.js';
+import { parseCssColor, snapToAnsi } from 'src/css/color.js';
+import { TAG_DEFAULTS } from 'src/css/defaults.js';
 
 const ENTITIES = {
   amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00A0',
@@ -59,8 +63,7 @@ function tokenize(html) {
     if (html.startsWith('<!--', lt)) {
       const end = html.indexOf('-->', lt + 4);
       if (end < 0) break;
-      i = end + 3;
-      continue;
+      i = end + 3; continue;
     }
 
     const gt = html.indexOf('>', lt);
@@ -70,7 +73,7 @@ function tokenize(html) {
     if (raw.startsWith('/')) {
       tokens.push({ type: 'close', tag: raw.slice(1).trim().toLowerCase() });
     } else if (raw.startsWith('!')) {
-      // <!DOCTYPE ...> etc — skip
+      // DOCTYPE, CDATA — skip
     } else {
       const selfClose = raw.endsWith('/');
       const tagText = selfClose ? raw.slice(0, -1).trim() : raw;
@@ -89,16 +92,44 @@ function parseDim(v) {
   const s = String(v).trim();
   if (!/^\d+$/.test(s)) return 0;
   const n = parseInt(s, 10);
-  if (n <= 0 || n > 4096) return 0;
-  return n;
+  return (n > 0 && n <= 4096) ? n : 0;
 }
 
 const BLOCK_TAGS = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
                     'blockquote', 'pre', 'ul', 'ol', 'table'];
 
-export function htmlToText(html, baseUrl) {
-  html = html.replace(/<script[\s\S]*?<\/script>/gi, '')
-             .replace(/<style[\s\S]*?<\/style>/gi, '');
+/* Tags that are "inline" by browser default — a background-color on these
+ * makes sense visually and is safe to render. For block-level backgrounds
+ * we defer to the terminal theme (avoids white boxes / invisible text). */
+const INLINE_BG_TAGS = new Set(['code', 'kbd', 'samp', 'mark', 'pre']);
+
+function fontSizeLevel(fs) {
+  if (!fs) return 0;
+  const m = String(fs).match(/^(\d+(?:\.\d+)?)\s*(px|pt|em|rem)?$/i);
+  if (!m) return 0;
+  let px = parseFloat(m[1]);
+  if (m[2] === 'em' || m[2] === 'rem') px *= 16;
+  else if (m[2] === 'pt') px *= 1.333;
+  if (px >= 32) return 1;
+  if (px >= 24) return 2;
+  if (px >= 20) return 3;
+  if (px >= 18) return 4;
+  if (px >= 16) return 5;
+  return 6;
+}
+
+export function htmlToText(html, baseUrl, theme) {
+  const styleCSS = [];
+  html = html.replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gi, (m, css) => {
+    styleCSS.push(css);
+    return '';
+  });
+  html = html.replace(/<script[\s\S]*?<\/script>/gi, '');
+
+  const rules = [];
+  for (const css of styleCSS) {
+    for (const rule of parseStylesheet(css)) rules.push(rule);
+  }
 
   const tokens = tokenize(html);
   const segments = [];
@@ -113,41 +144,89 @@ export function htmlToText(html, baseUrl) {
   }
 
   function currentStyle() {
-    const s = { bold: false, underline: false, pairName: 'page', pre: false, block: false, indent: 0 };
-    for (const e of stack) {
-      switch (e.tag) {
-        case 'b': case 'strong': s.bold = true; break;
-        case 'i': case 'em': case 'u': case 'ins': s.underline = true; break;
-        case 'del': case 's': case 'strike': s.underline = true; break;
-        case 'code': case 'kbd': case 'samp': s.pairName = 'code'; break;
-        case 'pre': s.pairName = 'code'; s.pre = true; s.block = true; break;
-        case 'h1': s.pairName = 'heading1'; s.bold = true; s.block = true; break;
-        case 'h2': s.pairName = 'heading2'; s.bold = true; s.block = true; break;
-        case 'h3': s.pairName = 'heading3'; s.bold = true; s.block = true; break;
-        case 'h4': s.pairName = 'heading4'; s.bold = true; s.block = true; break;
-        case 'h5': s.pairName = 'heading5'; s.bold = true; s.block = true; break;
-        case 'h6': s.pairName = 'heading6'; s.bold = true; s.block = true; break;
-        case 'blockquote': s.pairName = 'blockquote'; s.indent = 2; s.block = true; break;
-        case 'a':
-          if (e.href) { s.pairName = 'link'; s.underline = true; }
-          break;
+    const decls = {};
+
+    for (const el of stack) {
+      const d = TAG_DEFAULTS[el.tag];
+      if (d) Object.assign(decls, d);
+    }
+
+    const applicable = [];
+    for (const rule of rules) {
+      for (const sel of rule.selectors) {
+        for (let k = stack.length - 1; k >= 0; k--) {
+          if (matches(sel, stack[k])) {
+            applicable.push({
+              spec: specificity(sel),
+              order: rule.order,
+              declarations: rule.declarations,
+            });
+            break;
+          }
+        }
       }
     }
-    return s;
+    applicable.sort((a, b) =>
+      a.spec !== b.spec ? a.spec - b.spec : a.order - b.order);
+    for (const app of applicable) Object.assign(decls, app.declarations);
+
+    for (const el of stack) {
+      if (el.inlineStyle) Object.assign(decls, el.inlineStyle);
+    }
+
+    const fg = parseCssColor(decls['color']);
+    const fgAnsi = snapToAnsi(fg, -1);
+
+    /* Backgrounds: only apply for inline code-like elements. Block-level
+     * backgrounds would paint the whole content area white/black, breaking
+     * the terminal theme and often making text invisible. */
+    const innermost = stack[stack.length - 1];
+    const isInlineBg = innermost && INLINE_BG_TAGS.has(innermost.tag);
+    const bgAnsi = isInlineBg
+      ? snapToAnsi(parseCssColor(decls['background-color']), -1)
+      : -1;
+
+    const bold = decls['font-weight'] === 'bold' ||
+                 (parseInt(decls['font-weight'], 10) >= 600) ||
+                 (fgAnsi >= 8 && fgAnsi <= 15 && stack.some(e =>
+                    ['h1','h2','h3','h4','h5','h6','b','strong'].includes(e.tag)));
+
+    const deco = (decls['text-decoration'] || '').toLowerCase();
+    const italic = (decls['font-style'] || '').toLowerCase() === 'italic';
+    const underline = deco.includes('underline') || italic;
+
+    const pre = stack.some(e => e.tag === 'pre');
+    const indent = stack.some(e => e.tag === 'blockquote') ? 2 : 0;
+    const hidden = (decls['display'] || '') === 'none' ||
+                   (decls['visibility'] || '') === 'hidden';
+
+    let pairOverride = null;
+    if (!fg && decls['font-size']) {
+      const lvl = fontSizeLevel(decls['font-size']);
+      if (lvl >= 1 && lvl <= 3) pairOverride = theme.pairs['heading' + lvl];
+      else if (lvl === 4) pairOverride = theme.pairs.heading4;
+    }
+
+    return { fgAnsi, bgAnsi, bold, underline, indent, pre, hidden, pairOverride };
   }
 
   function emitBlockBreak() {
     if (segments.length === 0) return;
     const last = segments[segments.length - 1];
+    // Don't break right after a list bullet (the <li> handler already
+    // manages its own newlines and the following text belongs on the same line)
+    if (last.kind === 'bullet') return;
     const lastText = last.text || '';
     if (lastText.endsWith('\n\n')) return;
     if (lastText.endsWith('\n')) segments.push({ text: '\n', linkN: null });
     else                         segments.push({ text: '\n\n', linkN: null });
   }
 
-    function emitText(raw) {
+  function emitText(raw) {
     if (!raw) return;
     const s = currentStyle();
+    if (s.hidden) return;
+
     let text = s.pre ? decodeHtmlEntities(raw)
                      : decodeHtmlEntities(raw.replace(/[ \t]+/g, ' '));
     if (s.pre && text === '') return;
@@ -165,26 +244,34 @@ export function htmlToText(html, baseUrl) {
 
     if (s.indent > 0) {
       const pad = ' '.repeat(s.indent);
-      if (segments.length === 0) {
-        text = pad + text;
-      } else {
+      if (segments.length === 0) text = pad + text;
+      else {
         const last = segments[segments.length - 1];
-        // ★ Safe: if last segment is an image (no .text), insert a newline
         if (!last.text) segments.push({ text: '\n', linkN: null });
         else if (last.text.endsWith('\n')) text = pad + text;
       }
       text = text.replace(/\n/g, '\n' + pad);
     }
 
-    if (s.block && segments.length > 0) {
-      const last = segments[segments.length - 1];
-      if (last.text && !last.text.endsWith('\n')) emitBlockBreak();
+    /* Note: no emitBlockBreak here. Block breaks are triggered by tag open/
+     * close, not by text content. This prevents inline nested elements like
+     * `foo <b>bar</b> baz` from forcing spurious newlines. */
+
+    let pairId;
+    if (s.fgAnsi >= 0 || s.bgAnsi >= 0) {
+      pairId = theme.lookupPair(s.fgAnsi, s.bgAnsi);
+    } else if (s.pairOverride) {
+      pairId = s.pairOverride;
+    } else if (linkNForSeg !== null) {
+      pairId = theme.pairs.link;
+    } else {
+      pairId = theme.pairs.page;
     }
 
     segments.push({
       text,
       linkN: linkNForSeg,
-      pairName: s.pairName,
+      pair: pairId,
       bold: s.bold,
       underline: s.underline,
     });
@@ -204,39 +291,61 @@ export function htmlToText(html, baseUrl) {
   function handleOpen(tok) {
     const tag = tok.tag;
     const attrs = tok.attrs || {};
-
     if (tag === 'br') { segments.push({ text: '\n', linkN: null }); return; }
     if (tag === 'hr') { emitBlockBreak(); segments.push({ text: '────\n', linkN: null }); return; }
     if (tag === 'img') { pushImage(attrs); return; }
+
+    if (tag === 'li') {
+      const depth = stack.filter(e => e.tag === 'ul' || e.tag === 'ol').length;
+      const indent = '  '.repeat(depth);
+      const parent = [...stack].reverse().find(e => e.tag === 'ul' || e.tag === 'ol');
+
+      // Ensure newline before bullet (unless already at line start)
+      if (segments.length > 0) {
+        const last = segments[segments.length - 1];
+        if (!(last.text || '').endsWith('\n')) {
+          segments.push({ text: '\n', linkN: null });
+        }
+      }
+
+      let bullet;
+      if (parent && parent.tag === 'ol') {
+        parent.count = (parent.count || 0) + 1;
+        bullet = `${parent.count}. `;
+      } else {
+        bullet = '• ';
+      }
+
+      segments.push({
+        text: indent + bullet,
+        linkN: null,
+        pair: theme.pairs.warning,
+        kind: 'bullet',
+      });
+      stack.push({ tag: 'li' });
+      return;
+    }
+
+    if (BLOCK_TAGS.includes(tag)) emitBlockBreak();
+
+    const classes = new Set((attrs.class || '').split(/\s+/).filter(Boolean));
+    const id = attrs.id || null;
+    const inlineStyle = attrs.style ? parseInlineStyle(attrs.style) : null;
+
+    const el = { tag, id, classes, inlineStyle };
+    stack.push(el);
 
     if (tag === 'a') {
       const href = attrs.href ? resolveUrl(baseUrl, decodeHtmlEntities(attrs.href)) : null;
       if (href && /^https?:\/\//i.test(href)) {
         linkN++;
         links.push({ n: linkN, href, text: '' });
-        stack.push({ tag: 'a', href, n: linkN, prefixEmitted: false, accumulated: '' });
-      } else {
-        stack.push({ tag: 'a', href: null });
+        el.href = href;
+        el.n = linkN;
+        el.prefixEmitted = false;
+        el.accumulated = '';
       }
-      return;
     }
-
-    if (tag === 'li') {
-      const depth = stack.filter(e => e.tag === 'ul' || e.tag === 'ol').length;
-      const indent = '  '.repeat(depth);
-      const parent = [...stack].reverse().find(e => e.tag === 'ul' || e.tag === 'ol');
-      if (parent && parent.tag === 'ol') {
-        parent.count = (parent.count || 0) + 1;
-        segments.push({ text: `\n${indent}${parent.count}. `, linkN: null, pairName: 'listBullet' });
-      } else {
-        segments.push({ text: `\n${indent}• `, linkN: null, pairName: 'listBullet' });
-      }
-      stack.push({ tag: 'li' });
-      return;
-    }
-
-    if (BLOCK_TAGS.includes(tag)) emitBlockBreak();
-    stack.push({ tag, attrs });
   }
 
   function handleClose(tok) {

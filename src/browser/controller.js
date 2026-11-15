@@ -291,18 +291,22 @@ export function createController(deps) {
     if (tab === tabManager.active()) render();
   }
 
-  function handleResponse(tabId, url, resp, options) {
-    /* ★ Case A: image arriving for an already-rendered page */
-    if (options && options.binary && options.imageFor &&
-        resp.rawBytes && resp.imageWidth && resp.imageHeight) {
+
+
+
+    function handleResponse(tabId, url, resp, options) {
+    /* ★ Sub-resource image (fetched for a page in another tab).
+     * NEVER touches currentUrl / omnibox / mode. If decode failed (e.g. SVG),
+     * the page keeps its original placeholder — no navigation hijack. */
+    if (options && options.binary && options.imageFor) {
       const tab = tabManager.getById(options.imageFor);
       if (!tab) return;
+      if (!resp.rawBytes || !resp.imageWidth || !resp.imageHeight) return;
+
       const { rows, cols } = tui.size();
-      const maxCols = cols - 2;
-      const maxRows = Math.max(4, rows - 7);
       imageView.set(options.imageSrc, resp.rawBytes,
                     resp.imageWidth, resp.imageHeight,
-                    maxCols, maxRows,
+                    cols - 2, Math.max(4, rows - 7),
                     options.displayW || 0, options.displayH || 0);
       tab.pageView.invalidate();
       if (tab === tabManager.active()) render();
@@ -314,9 +318,8 @@ export function createController(deps) {
 
     const ct = (resp.headers['content-type'] || '').toLowerCase();
 
-    /* ★ Case B: direct navigation to an image URL */
-    if (ct.startsWith('image/') && resp.rawBytes &&
-        resp.imageWidth && resp.imageHeight) {
+    /* ★ Direct navigation to an image URL (user typed the .png/.svg directly) */
+    if (ct.startsWith('image/')) {
       tab.loading = false;
       tab.currentUrl = url;
       if (options && options.fromHistory) tab.history.replace(url);
@@ -324,18 +327,25 @@ export function createController(deps) {
       tab.omnibox.setText(url);
       tab.mode = 'page';
 
-      const { rows, cols } = tui.size();
-      const maxCols = cols - 2;
-      const maxRows = Math.max(4, rows - 7);
-      imageView.set(url, resp.rawBytes, resp.imageWidth, resp.imageHeight,
-                    maxCols, maxRows, 0, 0);
-      tab.pageView.setContent([{ type: 'img', src: url, alt: url }], []);
-      tab.statusText = `Image ${resp.imageWidth}×${resp.imageHeight} — ${url}`;
+      if (resp.rawBytes && resp.imageWidth && resp.imageHeight) {
+        const { rows, cols } = tui.size();
+        imageView.set(url, resp.rawBytes, resp.imageWidth, resp.imageHeight,
+                      cols - 2, Math.max(4, rows - 7), 0, 0);
+        tab.pageView.setContent([{ type: 'img', src: url, alt: url }], []);
+        tab.statusText = `Image ${resp.imageWidth}×${resp.imageHeight} — ${url}`;
+      } else {
+        const fmt = (ct.match(/^image\/([a-z0-9+.-]+)/) || [])[1] || 'unknown';
+        const bytes = resp.rawBytes ? resp.rawBytes.length : 0;
+        let msg = `Image: ${url}\n\nFormat: ${fmt}\nSize: ${bytes} bytes\n`;
+        if (fmt === 'svg+xml') msg += '\nSVG images are not rendered (vector format not supported).';
+        tab.pageView.setContent(msg, []);
+        tab.statusText = `Image (${fmt}) — not rendered`;
+      }
       if (tab === tabManager.active()) render();
       return;
     }
 
-    /* ★ Case C: normal HTML/text response */
+    /* ★ Normal HTML / text response */
     tab.loading = false;
     tab.currentUrl = url;
     if (options && options.fromHistory) tab.history.replace(url);
@@ -348,7 +358,7 @@ export function createController(deps) {
 
     let plainLen = 0, linksCount = 0, imagesCount = 0;
     if (looksHtml) {
-      const parsed = htmlToText(resp.body, url);
+      const parsed = htmlToText(resp.body, url, theme);
       tab.pageView.setContent(parsed.segments, parsed.links);
       plainLen = parsed.text.length;
       linksCount = parsed.links.length;
@@ -356,6 +366,8 @@ export function createController(deps) {
 
       for (const img of parsed.images) {
         if (imageView.has(img.src)) continue;
+        // Skip SVG — stb_image can't decode it, no point in the fetch
+        if (/\.svg(\?|#|$)/i.test(img.src)) continue;
         httpClient.fetch(img.src, {
           tabId: tab.id,
           binary: true,
@@ -374,6 +386,9 @@ export function createController(deps) {
     tab.statusText = `HTTP ${resp.status} ${resp.statusText} — ${plainLen} chars, ${linksCount} links, ${imagesCount} images`;
     if (tab === tabManager.active()) render();
   }
+
+
+
 
   const initial = tabManager.active();
   if (initial) {

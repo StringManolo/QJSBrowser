@@ -4,17 +4,20 @@ export function createTheme(tui) {
 
   if (!hasColor) {
     return {
-      hasColor: false,
-      numColors: 0,
+      hasColor: false, numColors: 0,
       pairs: new Proxy({}, { get: () => 0 }),
+      lookupPair: () => 0,
     };
   }
 
   const P = {};
-  let next = 1;
+  let nextPair = 1;
+  const MAX_PAIRS = 200;
+
   function pair(name, fg, bg) {
-    tui.definePair(next, fg, bg);
-    P[name] = next++;
+    if (nextPair >= MAX_PAIRS) return;
+    tui.definePair(nextPair, fg, bg);
+    P[name] = nextPair++;
   }
 
   const DEFAULT = -1;
@@ -36,6 +39,7 @@ export function createTheme(tui) {
   const TAB_INACTIVE_FG = has256 ? 250 : WHITE;
   const TAB_PLUS_BG     = has256 ? 236 : DIM;
 
+  // ---- UI chrome ----
   pair('window',            DEFAULT, DEFAULT);
   pair('windowBorder',      DIM,     DEFAULT);
   pair('windowBorderFocus', BLUE,    DEFAULT);
@@ -48,6 +52,12 @@ export function createTheme(tui) {
   pair('address',           WHITE,   DARK);
   pair('addressFocus',      0,       WHITE);
   pair('status',            WHITE,   NAVY);
+  pair('tabBarBg',          DIM,     TAB_BAR_BG);
+  pair('tabActive',         WHITE,   BLUE);
+  pair('tabInactive',       TAB_INACTIVE_FG, TAB_INACTIVE);
+  pair('tabPlus',           GREEN,   TAB_PLUS_BG);
+
+  // ---- Page content ----
   pair('page',              DEFAULT, DEFAULT);
   pair('link',              LINK,    DEFAULT);
   pair('visited',           MAGENTA, DEFAULT);
@@ -55,29 +65,46 @@ export function createTheme(tui) {
   pair('warning',           YELLOW,  DEFAULT);
   pair('success',           GREEN,   DEFAULT);
 
-  pair('tabBarBg',     DIM,             TAB_BAR_BG);
-  pair('tabActive',    WHITE,           BLUE);
-  pair('tabInactive',  TAB_INACTIVE_FG, TAB_INACTIVE);
-  pair('tabPlus',      GREEN,           TAB_PLUS_BG);
+  // ---- CSS color pairs: 16 foregrounds × 2 backgrounds (default + gray) ----
+  // fg on default background
+  for (let i = 0; i < 16; i++) pair('c' + i,     i, DEFAULT);
+  // fg on gray background (for inline code, etc.)
+  const CODE_BG = has256 ? 235 : DIM;
+  for (let i = 0; i < 16; i++) pair('cg' + i,    i, CODE_BG);
 
-  // ---- HTML semantics ----
-  // Headings: brightness gradient from h1 (brightest) to h6 (dimmest).
-  // The bold attribute is applied separately by the renderer.
-  pair('heading1', has256 ? 231 : WHITE, DEFAULT);
-  pair('heading2', has256 ? 253 : WHITE, DEFAULT);
-  pair('heading3', has256 ? 251 : WHITE, DEFAULT);
-  pair('heading4', has256 ? 249 : WHITE, DEFAULT);
-  pair('heading5', has256 ? 247 : WHITE, DEFAULT);
-  pair('heading6', has256 ? 245 : WHITE, DEFAULT);
+  // Lookup cache: "fg|bg" → pairId
+  const cache = new Map();
+  const cssFg = [-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1];
 
-  // Inline code and <pre> blocks: warm text on a dark gray background.
-  pair('code',       has256 ? 180 : WHITE, has256 ? 235 : DIM);
+  /* Resolve (fgAnsi, bgAnsi) → pairId. Extends the pre-allocated set as
+   * needed, capping at MAX_PAIRS. Falls back to 'page' if exhausted. */
+    /* Resolve (fgAnsi, bgAnsi) → pairId. Auto-contrasts when bg is set but fg
+   * is default: picks black on bright bg, white on dark bg. Prevents the
+   * classic "white text on white background" made invisible by CSS. */
+  function lookupPair(fgAnsi, bgAnsi) {
+    if (fgAnsi === undefined || fgAnsi === null) fgAnsi = -1;
+    if (bgAnsi === undefined || bgAnsi === null) bgAnsi = -1;
 
-  // Blockquote: dimmed, indented by the renderer.
-  pair('blockquote', has256 ? 244 : DIM, DEFAULT);
+    if (bgAnsi >= 0) {
+      if (fgAnsi === -1 || fgAnsi === bgAnsi) {
+        fgAnsi = bgAnsi >= 8 ? 0 : 15;
+      }
+    }
 
-  // List bullets / numbers.
-  pair('listBullet', has256 ? 220 : YELLOW, DEFAULT);
+    const key = fgAnsi + '|' + bgAnsi;
+    if (cache.has(key)) return cache.get(key);
 
-  return { hasColor: true, numColors, pairs: P };
+    if (fgAnsi >= 0 && fgAnsi < 16) {
+      if (bgAnsi === -1)      { cache.set(key, P['c' + fgAnsi]);  return P['c' + fgAnsi]; }
+      if (bgAnsi === CODE_BG) { cache.set(key, P['cg' + fgAnsi]); return P['cg' + fgAnsi]; }
+    }
+
+    if (nextPair >= MAX_PAIRS) return P.page;
+    tui.definePair(nextPair, fgAnsi, bgAnsi);
+    cache.set(key, nextPair);
+    return nextPair++;
+  }
+
+
+  return { hasColor: true, numColors, pairs: P, lookupPair };
 }

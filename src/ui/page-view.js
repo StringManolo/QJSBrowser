@@ -23,6 +23,7 @@ export function createPageView(tui, theme, imageView) {
   function invalidate() { cachedLines = null; }
 
   function pairIdFor(seg) {
+    if (seg.pair !== undefined && seg.pair !== null) return seg.pair;
     const P = theme.pairs;
     if (seg.pairName && P[seg.pairName] !== undefined) return P[seg.pairName];
     if (seg.linkN !== null && seg.linkN !== undefined) return P.link;

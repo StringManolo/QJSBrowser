@@ -3,17 +3,26 @@ import tui   from 'tui';
 import tls   from 'tls';
 import image from 'image';
 import zlib  from 'zlib';
+import fs    from 'fs';
 
 import { buildKeyMap }      from 'src/base/keys.js';
 import { createTheme }      from 'src/ui/theme.js';
 import { createImageView }  from 'src/ui/image-view.js';
 import { createHttpClient } from 'src/net/http-client.js';
 import { createCookieJar }  from 'src/net/cookies.js';
+import { createSettings }   from 'src/browser/settings.js';
 import { createTabManager } from 'src/browser/tab-manager.js';
 import { createController } from 'src/browser/controller.js';
 
 tui.init();
 tui.mouseEnable();
+
+/* Load persistent state before creating anything that reads it */
+const settings  = createSettings(fs);
+settings.load();
+
+const cookieJar = createCookieJar(fs);
+cookieJar.load();
 
 const theme      = createTheme(tui);
 const keys       = buildKeyMap(tui);
@@ -24,11 +33,11 @@ const imageView  = createImageView(tui, theme);
 const tabManager = createTabManager(tui, theme, imageView);
 tabManager.add();
 
-const cookieJar  = createCookieJar();
 const httpClient = createHttpClient(net, epfd, tls, cookieJar, zlib);
 
 const controller = createController({
   tui, net, keys, epfd, httpClient, theme, tabManager, imageView,
+  settings, cookieJar,
 });
 
 httpClient.setCallbacks({
@@ -73,14 +82,11 @@ while (controller.isRunning()) {
   try { events = net.epoll_wait(epfd, 16, -1); }
   catch (e) {
     const msg = e.message || String(e);
-    // EINTR is benign — SIGWINCH/SIGCONT/SIGTERM from the terminal manager.
-    // Just retry without spamming stderr (which would corrupt the TUI).
     if (!/Interrupted system call|EINTR/i.test(msg)) {
       console.log('[epoll_wait] ' + msg);
     }
     continue;
   }
-
   for (const ev of events) {
     try {
       if (ev.fd === 0) controller.handleInput();
@@ -90,6 +96,9 @@ while (controller.isRunning()) {
     }
   }
 }
+
+/* Persist cookies before shutting down */
+cookieJar.save();
 
 tui.mouseDisable();
 tui.end();

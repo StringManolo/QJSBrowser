@@ -384,7 +384,8 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
     }
   }
 
-  function processResponse(c) {
+
+    function processResponse(c) {
     let sep = -1;
     for (let i = 0; i < c.recvBytes.length - 3; i++) {
       if (c.recvBytes[i]   === 0x0D && c.recvBytes[i+1] === 0x0A &&
@@ -432,6 +433,41 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
       for (const sc of resp.setCookies) cookieJar.store(sc, c.url);
     }
 
+    /* ★ Meta-refresh redirect: legacy sites (SMF, phpBB, Drupal, JSP)
+     * return 200 + <meta http-equiv="refresh" content="0;url=/x">. */
+    if (!isBinary && bodyBytes.length > 0) {
+      const preview = decodeUtf8(bodyBytes.subarray(0, Math.min(bodyBytes.length, 4096)));
+      const metaTag = preview.match(/<meta\b[^>]*\bhttp-equiv\s*=\s*["']?\s*refresh\s*["']?[^>]*>/i);
+      if (metaTag) {
+        const contentMatch = metaTag[0].match(/\bcontent\s*=\s*["']([^"']*)["']/i)
+                          || metaTag[0].match(/\bcontent\s*=\s*([^\s>]+)/i);
+        if (contentMatch) {
+          const content = contentMatch[1];
+          const urlMatch = content.match(/url\s*=\s*([^"'\s;,]+)/i);
+          const target = urlMatch
+            ? resolveUrl(c.url, urlMatch[1].trim())
+            : c.url;
+
+          if (c.redirects < 10) {
+            callbacks.onStatus(c.url, `Meta refresh → ${target}`, c.options);
+
+            /* Meta refresh after a POST behaves like 303: convert to GET. */
+            const nextOpts = {
+              ...c.options,
+              redirectCount: c.redirects + 1,
+              method: 'GET',
+              body:   null,
+            };
+            fetch(target, nextOpts);
+            return;
+          } else {
+            callbacks.onError(c.url, 'Too many redirects (limit 10)', c.options);
+            return;
+          }
+        }
+      }
+    }
+
     if (isRedirect(resp.status) && resp.headers.location) {
       if (c.redirects >= 10) {
         callbacks.onError(c.url, 'Too many redirects (limit 10)', c.options);
@@ -444,10 +480,6 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
       }
       callbacks.onStatus(c.url, `Redirect ${resp.status} → ${target}`, c.options);
 
-      /* RFC 7231 + browser convention:
-       *   - 303 See Other         → GET, drop body
-       *   - 301/302 with POST     → GET, drop body (browser behaviour)
-       *   - 307/308                → preserve method and body */
       let nextMethod = c.method;
       let nextBody   = c.body;
       if (resp.status === 303) {
@@ -470,6 +502,9 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
     if (c.truncated) callbacks.onStatus(c.url, 'Response truncated at 20MB', c.options);
     callbacks.onResponse(c.url, resp, c.options);
   }
+
+
+
 
   return { fetch, onEvent, setCallbacks };
 }

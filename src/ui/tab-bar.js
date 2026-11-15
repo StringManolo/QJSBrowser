@@ -1,6 +1,7 @@
 export function createTabBar(tui, theme) {
   let tabRects = [];
   let plusRect = null;
+  let menuRect = null;
   let lastRow = -1;
 
   function tabTitle(url) {
@@ -21,13 +22,15 @@ export function createTabBar(tui, theme) {
     const P = theme.pairs;
     tabRects = [];
     plusRect = null;
+    menuRect = null;
     lastRow = y;
 
     tui.fillPair(y, x, 1, w, P.tabBarBg);
     if (tabs.length === 0) return;
 
     const plusW = 3;
-    const available = w - plusW;
+    const menuW = 3;
+    const available = w - plusW - menuW;
     const idealTabW = Math.floor(available / tabs.length);
     const tabW = Math.max(8, Math.min(26, idealTabW));
 
@@ -55,18 +58,29 @@ export function createTabBar(tui, theme) {
       cx += tabW;
     }
 
-    if (cx + plusW <= x + w) {
+    if (cx + plusW <= x + w - menuW) {
       tui.fillPair(y, cx, 1, plusW, P.tabPlus);
       tui.printPair(y, cx, ' + ', P.tabPlus);
       plusRect = { x: cx, y, w: plusW };
       cx += plusW;
     }
 
-    if (cx < x + w) tui.fillPair(y, cx, 1, x + w - cx, P.tabBarBg);
+    if (cx < x + w - menuW) tui.fillPair(y, cx, 1, x + w - menuW - cx, P.tabBarBg);
+
+    /* ★ Menu button (⋮) pinned to the right edge */
+    const mx = x + w - menuW;
+    tui.fillPair(y, mx, 1, menuW, P.tabBarBg);
+    tui.printPair(y, mx, ' ⋮ ', P.tabActive);
+    menuRect = { x: mx, y, w: menuW };
   }
 
   function hitTest(mx, my) {
     if (my !== lastRow) return null;
+
+    if (menuRect && mx >= menuRect.x && mx < menuRect.x + menuRect.w) {
+      return { type: 'menu' };
+    }
+
     for (const r of tabRects) {
       if (mx >= r.x && mx < r.x + r.w) {
         if (mx === r.closeX || mx === r.closeX + 1)

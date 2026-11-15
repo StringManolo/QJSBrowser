@@ -18,3 +18,5 @@
 - Add html5 dialogs/modals (cookies popups?)
 - Fix omnibox color goes black 
 - Add svg support with nanosvg.h
+- Search from omnibox
+- Add cache

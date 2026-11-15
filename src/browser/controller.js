@@ -1,8 +1,9 @@
-import { parseUrl }      from 'src/base/url.js';
-import { htmlToText }    from 'src/content/html-to-text.js';
-import { drawWindow }    from 'src/ui/window.js';
-import { createToolbar } from 'src/ui/toolbar.js';
-import { createTabBar }  from 'src/ui/tab-bar.js';
+import { parseUrl }       from 'src/base/url.js';
+import { htmlToText }     from 'src/content/html-to-text.js';
+import { drawWindow }     from 'src/ui/window.js';
+import { createToolbar }  from 'src/ui/toolbar.js';
+import { createTabBar }   from 'src/ui/tab-bar.js';
+import { createSettingsDialog } from 'src/ui/settings-dialog.js';
 
 const WELCOME =
   'Welcome to QJSBrowser!\n\n' +
@@ -15,13 +16,22 @@ const WELCOME =
   '  Tab            next form field (then omnibox)\n' +
   '  Enter          submit form / press focused button\n' +
   '  Esc            blur focused field\n' +
-  '  q              quit\n';
+  '  q              quit\n\n' +
+  'Click ⋮ in the top-right for Settings.';
 
 export function createController(deps) {
-  const { tui, net, keys, epfd, httpClient, theme, tabManager, imageView } = deps;
+  const { tui, net, keys, epfd, httpClient, theme, tabManager, imageView, settings, cookieJar } = deps;
   const P = theme.pairs;
   const toolbar = createToolbar(tui, theme);
   const tabBar  = createTabBar(tui, theme);
+
+  const dialog = createSettingsDialog(
+    tui, theme, settings, cookieJar, tabManager,
+    () => {
+      /* Clear history in every open tab */
+      for (const t of tabManager.list()) t.history.clear();
+    }
+  );
 
   let running = true;
 
@@ -84,8 +94,11 @@ export function createController(deps) {
       tui.printPair(stY, 1, line, P.status);
     }
 
+    /* Settings dialog overlay */
+    dialog.render(rows, cols);
+
     let cursorY = rows - 1, cursorX = 0;
-    if (tab.mode === 'omnibox' && tab.cursorPos) {
+    if (!dialog.isOpen() && tab.mode === 'omnibox' && tab.cursorPos) {
       tui.setCursor(1);
       cursorY = tab.cursorPos.y;
       cursorX = Math.min(tab.cursorPos.x, cols - 2);
@@ -104,7 +117,14 @@ export function createController(deps) {
     while ((ch = tui.getch()) !== keys.ERR) {
       if (ch === keys.CTRL_C) { running = false; return; }
       if (ch === keys.KEY_MOUSE) { handleMouse(); continue; }
-      if (ch === keys.CTRL_T)    { newTab(); continue; }
+
+      /* Settings dialog captures ALL keys while open */
+      if (dialog.isOpen()) {
+        dialog.handleKey(ch, keys);
+        continue;
+      }
+
+      if (ch === keys.CTRL_T) { newTab(); continue; }
 
       const tab = tabManager.active();
       if (!tab) continue;
@@ -113,14 +133,9 @@ export function createController(deps) {
         if (tab.mode === 'omnibox') {
           tab.mode = 'page';
         } else {
-          /* In page mode, Tab cycles form fields; when no more, go to omnibox */
           const nextId = tab.formState.tabNext(1);
-          if (nextId) {
-            tab.formState.focus(nextId);
-            tab.pageView.invalidate();
-          } else {
-            tab.mode = 'omnibox';
-          }
+          if (nextId) { tab.formState.focus(nextId); tab.pageView.invalidate(); }
+          else tab.mode = 'omnibox';
         }
         continue;
       }
@@ -139,7 +154,20 @@ export function createController(deps) {
     const res = tab.omnibox.handleKey(ch, keys);
     if (res && res.submitted) {
       const url = res.submitted;
-      if (url.length) { tab.mode = 'page'; navigate(tab, url); }
+      if (url.length) {
+        /* If it's not a URL but a search query, use the default search engine */
+        if (!/^(https?:\/\/|localhost|\d+\.\d+\.\d+\.\d+)/i.test(url) &&
+            !/^[\w-]+\.[\w.-]+/.test(url)) {
+          const engine = settings.SEARCH_ENGINES[settings.get('searchEngine')]
+                       || settings.SEARCH_ENGINES.duckduckgo;
+          const target = engine.url.replace('%s', encodeURIComponent(url));
+          tab.mode = 'page';
+          navigate(tab, target);
+          return;
+        }
+        tab.mode = 'page';
+        navigate(tab, url);
+      }
     }
   }
 
@@ -150,11 +178,8 @@ export function createController(deps) {
     const focusedId = fs.focusedIdOf();
     const focused = focusedId ? fs.get(focusedId) : null;
 
-    /* If a text input/textarea is focused, typing goes into it */
-    if (focused && focused.kind === 'text' || focused && focused.kind === 'password') {
-      if (ch === keys.ESC) {
-        fs.blur(); tab.pageView.invalidate(); return;
-      }
+    if (focused && (focused.kind === 'text' || focused.kind === 'password')) {
+      if (ch === keys.ESC) { fs.blur(); tab.pageView.invalidate(); return; }
       if (ch === keys.ARROW_LEFT)  { fs.moveCursor(-1); tab.pageView.invalidate(); return; }
       if (ch === keys.ARROW_RIGHT) { fs.moveCursor(1);  tab.pageView.invalidate(); return; }
       if (ch === keys.HOME)        { fs.moveCursorTo(0); tab.pageView.invalidate(); return; }
@@ -202,6 +227,14 @@ export function createController(deps) {
     const pageH = rows - 7;
     const tab = tabManager.active();
 
+    /* Dialog captures all clicks while open */
+    if (dialog.isOpen()) {
+      if (bstate & (tui.BUTTON1_CLICKED | tui.BUTTON1_PRESSED)) {
+        dialog.handleMouseClick(x, y);
+      }
+      return;
+    }
+
     if (bstate & tui.BUTTON4_PRESSED) { if (tab) tab.pageView.scroll(-3, cols - 2, pageH); return; }
     if (bstate & tui.BUTTON5_PRESSED) { if (tab) tab.pageView.scroll(3,  cols - 2, pageH); return; }
     if (!(bstate & (tui.BUTTON1_CLICKED | tui.BUTTON1_PRESSED))) return;
@@ -211,6 +244,7 @@ export function createController(deps) {
       if (tabHit.type === 'activate') { tabManager.activate(tabHit.index); render(); }
       else if (tabHit.type === 'close') { closeTab(tabHit.index); }
       else if (tabHit.type === 'new') { newTab(); }
+      else if (tabHit.type === 'menu') { dialog.open(); render(); }
       return;
     }
     if (!tab) return;
@@ -226,7 +260,7 @@ export function createController(deps) {
           case 'back':    goBack(tab);    break;
           case 'forward': goForward(tab); break;
           case 'reload':  if (tab.currentUrl) navigate(tab, tab.currentUrl, { fromHistory: true }); break;
-          case 'home':    tab.mode = 'omnibox'; tab.omnibox.clear(); break;
+          case 'home':    openHome(tab); break;
         }
         return;
       }
@@ -248,24 +282,17 @@ export function createController(deps) {
       if (seg.kind === 'img') { cx += seg.cols; continue; }
       const w = (seg.text || '').length;
       if (w > 0 && relX >= cx && relX < cx + w) {
-        /* Form element click */
         if (seg.elementId) {
           const el = tab.formState.get(seg.elementId);
           if (!el) break;
-          if (el.kind === 'checkbox' || el.kind === 'radio') {
-            tab.formState.toggle(seg.elementId);
-          } else if (el.kind === 'submit' || el.kind === 'button') {
+          if (el.kind === 'checkbox' || el.kind === 'radio') tab.formState.toggle(seg.elementId);
+          else if (el.kind === 'submit' || el.kind === 'button') {
             if (el.kind === 'submit') submitForm(tab, el);
-          } else if (el.kind === 'reset') {
-            /* Reset form values (simple: reset all text in form to empty) */
-            resetForm(tab, el);
-          } else {
-            tab.formState.focus(seg.elementId);
-          }
+          } else if (el.kind === 'reset') resetForm(tab, el);
+          else tab.formState.focus(seg.elementId);
           tab.pageView.invalidate();
           return;
         }
-        /* Link click */
         if (seg.linkN !== null) {
           const link = tab.pageView.links.find(l => l.n === seg.linkN);
           if (link) { navigate(tab, link.href); return; }
@@ -284,10 +311,7 @@ export function createController(deps) {
     const focusedId = fs.focusedIdOf() || (buttonEl && buttonEl.id);
     if (!focusedId) return;
     const form = fs.findForm(focusedId);
-    if (!form) {
-      tab.statusText = 'No form to submit';
-      return;
-    }
+    if (!form) { tab.statusText = 'No form to submit'; return; }
     const collected = fs.collect(form.id);
     if (!collected) return;
 
@@ -303,17 +327,35 @@ export function createController(deps) {
   function resetForm(tab, el) {
     const form = tab.formState.findForm(el.id);
     if (!form) return;
-    for (const [id, fe] of tab.formState.elements) {
-      if (fe.formId === form.id && fe.kind === 'text') fe.value = '';
-      if (fe.formId === form.id && (fe.kind === 'checkbox' || fe.kind === 'radio')) fe.checked = false;
+    for (const fe of tab.formState.elements.values()) {
+      if (fe.formId !== form.id) continue;
+      if (fe.kind === 'text' || fe.kind === 'password' || fe.kind === 'textarea') fe.value = '';
+      if (fe.kind === 'checkbox' || fe.kind === 'radio') fe.checked = false;
     }
     tab.pageView.invalidate();
   }
 
+  function openHome(tab) {
+    const home = settings.get('homepage');
+    if (home) navigate(tab, home);
+    else {
+      tab.currentUrl = '';
+      tab.pageView.setContent(WELCOME, []);
+      tab.omnibox.clear();
+      tab.mode = 'omnibox';
+      tab.statusText = 'New Tab';
+    }
+  }
+
   function newTab() {
     const tab = tabManager.add();
-    tab.pageView.setContent('New Tab — type a URL above and press Enter.', []);
-    render();
+    const home = settings.get('homepage');
+    if (home) {
+      navigate(tab, home);
+    } else {
+      tab.pageView.setContent('New Tab — type a URL above and press Enter.', []);
+      render();
+    }
   }
 
   function closeTab(index) {
@@ -437,14 +479,17 @@ export function createController(deps) {
       plainLen = parsed.text.length;
       linksCount = parsed.links.length;
       imagesCount = parsed.images.length;
-      for (const img of parsed.images) {
-        if (imageView.has(img.src)) continue;
-        if (/\.svg(\?|#|$)/i.test(img.src)) continue;
-        httpClient.fetch(img.src, {
-          tabId: tab.id, binary: true, imageFor: tab.id,
-          imageSrc: img.src, displayW: img.width || 0, displayH: img.height || 0,
-          redirectCount: 0,
-        });
+
+      if (settings.get('showImages')) {
+        for (const img of parsed.images) {
+          if (imageView.has(img.src)) continue;
+          if (/\.svg(\?|#|$)/i.test(img.src)) continue;
+          httpClient.fetch(img.src, {
+            tabId: tab.id, binary: true, imageFor: tab.id,
+            imageSrc: img.src, displayW: img.width || 0, displayH: img.height || 0,
+            redirectCount: 0,
+          });
+        }
       }
     } else {
       tab.pageView.setContent(resp.body, []);
@@ -455,10 +500,15 @@ export function createController(deps) {
     if (tab === tabManager.active()) render();
   }
 
+  /* Initial tab follows homepage setting */
   const initial = tabManager.active();
   if (initial) {
-    initial.pageView.setContent(WELCOME, []);
-    initial.statusText = 'ready';
+    const home = settings.get('homepage');
+    if (home) navigate(initial, home);
+    else {
+      initial.pageView.setContent(WELCOME, []);
+      initial.statusText = 'ready';
+    }
   }
 
   return {

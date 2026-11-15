@@ -84,15 +84,22 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
 
   function setCallbacks(cb) { callbacks = { ...callbacks, ...cb }; }
 
-  function buildRequest(p, cookieHeader) {
+  /* Build the raw HTTP/1.0 request bytes (as a JS string).
+   * Content-Type/Length are only added when a body is present. */
+  function buildRequest(p, cookieHeader, method, body) {
     let req =
-      `GET ${p.path} HTTP/1.0\r\n` +
+      `${method} ${p.path} HTTP/1.0\r\n` +
       `Host: ${p.host}\r\n` +
       `User-Agent: QJSBrowser/0.1\r\n` +
       `Accept-Encoding: identity\r\n` +
       `Connection: close\r\n`;
     if (cookieHeader) req += `Cookie: ${cookieHeader}\r\n`;
+    if (body !== null && body !== undefined) {
+      req += `Content-Type: application/x-www-form-urlencoded\r\n`;
+      req += `Content-Length: ${body.length}\r\n`;
+    }
     req += '\r\n';
+    if (body !== null && body !== undefined) req += body;
     return req;
   }
 
@@ -131,6 +138,7 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
       return false;
     }
     const drained = flushTlsOut(fd, c);
+
     if (res === 1) {
       try { tls.write(c.tlsConn, c.request); }
       catch (e) {
@@ -144,6 +152,7 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
     }
     if (res === 2) { setEpoll(fd, drained ? net.EPOLLIN : (net.EPOLLIN | net.EPOLLOUT)); return true; }
     if (res === 3) { setEpoll(fd, net.EPOLLIN | net.EPOLLOUT); return true; }
+
     closeConnection(fd);
     callbacks.onError(c.url, 'TLS handshake error code ' + res, c.options);
     return false;
@@ -200,14 +209,19 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
     net.setnonblocking(fd);
     net.connect(fd, ip, p.port);
 
+    const method = (options.method || 'GET').toUpperCase();
+    const body   = (options.body !== undefined && options.body !== null)
+                   ? String(options.body) : null;
     const cookieHeader = cookieJar ? cookieJar.getCookieHeader(url) : '';
-    const request = buildRequest(p, cookieHeader);
+    const request = buildRequest(p, cookieHeader, method, body);
 
     const conn = {
       state:        'connecting',
       url,
       parsed:       p,
       options,
+      method,
+      body,
       request,
       requestBytes: null,
       sent:         0,
@@ -246,6 +260,7 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
     const c = connections[fd];
     if (!c) return;
 
+    /* connecting */
     if (c.state === 'connecting' && (ev.events & net.EPOLLOUT)) {
       if (!net.is_connected(fd)) {
         closeConnection(fd);
@@ -264,11 +279,16 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
       return;
     }
 
+    /* tls_handshake */
     if (c.state === 'tls_handshake') {
       if (ev.events & net.EPOLLIN) {
         let chunk;
         try { chunk = tls.recvBytes(fd, 8192); }
-        catch (e) { closeConnection(fd); callbacks.onError(c.url, 'TLS recv: ' + (e.message || e), c.options); return; }
+        catch (e) {
+          closeConnection(fd);
+          callbacks.onError(c.url, 'TLS recv: ' + (e.message || e), c.options);
+          return;
+        }
         if (chunk === null) {
           closeConnection(fd);
           callbacks.onError(c.url, 'Connection closed during TLS handshake', c.options);
@@ -276,13 +296,18 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
         }
         if (chunk.length > 0) {
           try { tls.feedIncoming(c.tlsConn, chunk); }
-          catch (e) { closeConnection(fd); callbacks.onError(c.url, 'TLS feed: ' + (e.message || e), c.options); return; }
+          catch (e) {
+            closeConnection(fd);
+            callbacks.onError(c.url, 'TLS feed: ' + (e.message || e), c.options);
+            return;
+          }
         }
       }
       stepTls(fd, c);
       return;
     }
 
+    /* sending */
     if (c.state === 'sending') {
       if (c.tlsConn) {
         if (ev.events & net.EPOLLIN) {
@@ -310,12 +335,18 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
       return;
     }
 
+    /* receiving */
     if (c.state === 'receiving' && (ev.events & net.EPOLLIN)) {
       let chunk;
       try { chunk = tls.recvBytes(fd, 8192); }
-      catch (e) { closeConnection(fd); callbacks.onError(c.url, 'recv: ' + (e.message || e), c.options); return; }
+      catch (e) {
+        closeConnection(fd);
+        callbacks.onError(c.url, 'recv: ' + (e.message || e), c.options);
+        return;
+      }
 
       if (chunk === null) {
+        /* EOF — for TLS, drain any remaining plaintext before finalizing */
         if (c.tlsConn) {
           try {
             for (;;) {
@@ -353,8 +384,7 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
     }
   }
 
-
-    function processResponse(c) {
+  function processResponse(c) {
     let sep = -1;
     for (let i = 0; i < c.recvBytes.length - 3; i++) {
       if (c.recvBytes[i]   === 0x0D && c.recvBytes[i+1] === 0x0A &&
@@ -365,42 +395,30 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
     if (sep < 0) { callbacks.onError(c.url, 'Malformed HTTP response', c.options); return; }
 
     const head = decodeUtf8(c.recvBytes.subarray(0, sep));
-    const contentType = (head.match(/^content-type:\s*(.+)$/im) || [])[1] || '';
+    const contentType     = (head.match(/^content-type:\s*(.+)$/im)     || [])[1] || '';
     const contentEncoding = (head.match(/^content-encoding:\s*(.+)$/im) || [])[1] || '';
     let bodyBytes = c.recvBytes.subarray(sep + 4);
 
-    /* ★ Decompress if server ignored Accept-Encoding: identity */
+    /* Decompress if server ignored Accept-Encoding: identity */
     const enc = contentEncoding.trim().toLowerCase();
     if (enc && enc !== 'identity' && bodyBytes.length > 0) {
-      let decompressed = null;
       if (enc === 'gzip' || enc === 'x-gzip') {
-        if (!zlib) {
-          callbacks.onError(c.url, 'Received gzip but zlib module is missing', c.options);
-          return;
-        }
-        decompressed = zlib.inflate(bodyBytes, 'gzip');
-        if (!decompressed) {
-          callbacks.onError(c.url, 'gzip decompression failed', c.options);
-          return;
-        }
+        if (!zlib) { callbacks.onError(c.url, 'gzip received but zlib module missing', c.options); return; }
+        const out = zlib.inflate(bodyBytes, 'gzip');
+        if (!out) { callbacks.onError(c.url, 'gzip decompression failed', c.options); return; }
+        bodyBytes = out;
       } else if (enc === 'deflate') {
-        if (!zlib) {
-          callbacks.onError(c.url, 'Received deflate but zlib module is missing', c.options);
-          return;
-        }
-        decompressed = zlib.inflate(bodyBytes, 'deflate');
-        if (!decompressed) {
-          callbacks.onError(c.url, 'deflate decompression failed', c.options);
-          return;
-        }
+        if (!zlib) { callbacks.onError(c.url, 'deflate received but zlib module missing', c.options); return; }
+        const out = zlib.inflate(bodyBytes, 'deflate');
+        if (!out) { callbacks.onError(c.url, 'deflate decompression failed', c.options); return; }
+        bodyBytes = out;
       } else {
         callbacks.onError(c.url, 'Unsupported Content-Encoding: ' + enc, c.options);
         return;
       }
-      bodyBytes = decompressed;
     }
 
-    const isImage = contentType.toLowerCase().startsWith('image/');
+    const isImage  = contentType.toLowerCase().startsWith('image/');
     const isBinary = !!(c.options && c.options.binary) || isImage;
     const body = isBinary ? '' : decodeBody(bodyBytes, contentType);
 
@@ -425,10 +443,30 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
         return;
       }
       callbacks.onStatus(c.url, `Redirect ${resp.status} → ${target}`, c.options);
-      const nextOpts = { ...c.options, redirectCount: c.redirects + 1 };
+
+      /* RFC 7231 + browser convention:
+       *   - 303 See Other         → GET, drop body
+       *   - 301/302 with POST     → GET, drop body (browser behaviour)
+       *   - 307/308                → preserve method and body */
+      let nextMethod = c.method;
+      let nextBody   = c.body;
+      if (resp.status === 303) {
+        nextMethod = 'GET'; nextBody = null;
+      } else if ((resp.status === 301 || resp.status === 302) &&
+                 c.method !== 'GET' && c.method !== 'HEAD') {
+        nextMethod = 'GET'; nextBody = null;
+      }
+
+      const nextOpts = {
+        ...c.options,
+        redirectCount: c.redirects + 1,
+        method: nextMethod,
+        body:   nextBody,
+      };
       fetch(target, nextOpts);
       return;
     }
+
     if (c.truncated) callbacks.onStatus(c.url, 'Response truncated at 20MB', c.options);
     callbacks.onResponse(c.url, resp, c.options);
   }

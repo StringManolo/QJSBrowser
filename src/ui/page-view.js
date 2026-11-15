@@ -1,4 +1,6 @@
-export function createPageView(tui, theme, imageView) {
+import { renderFormElement } from 'src/ui/form-render.js';
+
+export function createPageView(tui, theme, imageView, formState) {
   let segments = [{ text: '' }];
   let links = [];
   let scrollY = 0;
@@ -7,13 +9,9 @@ export function createPageView(tui, theme, imageView) {
 
   function setContent(segmentsOrText, newLinks) {
     if (typeof segmentsOrText === 'string') {
-      segments = segmentsOrText.length > 0
-        ? [{ text: segmentsOrText }]
-        : [{ text: '' }];
+      segments = segmentsOrText.length > 0 ? [{ text: segmentsOrText }] : [{ text: '' }];
     } else {
-      segments = (segmentsOrText && segmentsOrText.length > 0)
-        ? segmentsOrText
-        : [{ text: '' }];
+      segments = (segmentsOrText && segmentsOrText.length > 0) ? segmentsOrText : [{ text: '' }];
     }
     links = newLinks || [];
     scrollY = 0;
@@ -25,14 +23,13 @@ export function createPageView(tui, theme, imageView) {
   function pairIdFor(seg) {
     if (seg.pair !== undefined && seg.pair !== null) return seg.pair;
     const P = theme.pairs;
-    if (seg.pairName && P[seg.pairName] !== undefined) return P[seg.pairName];
     if (seg.linkN !== null && seg.linkN !== undefined) return P.link;
     return P.page;
   }
 
   function flagsFor(seg) {
     let f = 0;
-    if (seg.bold)      f |= tui.A_BOLD;
+    if (seg.bold) f |= tui.A_BOLD;
     if (seg.underline) f |= tui.A_UNDERLINE;
     return f;
   }
@@ -44,7 +41,10 @@ export function createPageView(tui, theme, imageView) {
     const lines = [[]];
     let col = 0;
 
+    const focusedId = formState ? formState.focusedIdOf() : null;
+
     for (const seg of segments) {
+      /* Image */
       if (seg.type === 'img') {
         if (col > 0) { lines.push([]); col = 0; }
         if (imageView && imageView.has(seg.src)) {
@@ -54,15 +54,44 @@ export function createPageView(tui, theme, imageView) {
             lines.push([]);
           }
         } else {
-          const alt = seg.alt || seg.src;
-          const pair = P.page;
-          lines[lines.length - 1].push({ kind: 'text', text: `[IMG: ${alt}]`, linkN: null, pair, flags: 0 });
+          lines[lines.length - 1].push({ kind: 'text', text: `[IMG: ${seg.alt || seg.src}]`, pair: P.page, flags: 0, linkN: null });
           lines.push([]);
         }
         col = 0;
         continue;
       }
 
+      /* Form element */
+      if (seg.type === 'form') {
+        const el = formState ? formState.get(seg.elementId) : null;
+        const focused = focusedId === seg.elementId;
+        const el2 = el ? { ...el, _cursor: focused ? formState.cursorPos() : -1 } : null;
+        const rendered = renderFormElement(seg, el2, theme, focused);
+
+        if (rendered.multiline) {
+          if (col > 0) { lines.push([]); col = 0; }
+          for (const row of rendered.text.split('\n')) {
+            lines[lines.length - 1].push({
+              kind: 'text', text: row, pair: rendered.pair, flags: rendered.flags,
+              linkN: null, elementId: seg.elementId,
+            });
+            lines.push([]);
+          }
+          col = 0;
+          continue;
+        }
+
+        /* Inline element */
+        if (col + rendered.width > cols) { lines.push([]); col = 0; }
+        lines[lines.length - 1].push({
+          kind: 'text', text: rendered.text, pair: rendered.pair, flags: rendered.flags,
+          linkN: null, elementId: seg.elementId,
+        });
+        col += rendered.width;
+        continue;
+      }
+
+      /* Plain text */
       const pair = pairIdFor(seg);
       const flags = flagsFor(seg);
       const text = seg.text || '';
@@ -71,18 +100,15 @@ export function createPageView(tui, theme, imageView) {
         const nl = text.indexOf('\n', i);
         const end = nl < 0 ? text.length : nl;
         let chunk = text.slice(i, end);
-
         while (chunk.length > 0) {
           const remaining = cols - col;
           if (remaining <= 0) { lines.push([]); col = 0; continue; }
           if (chunk.length <= remaining) {
             lines[lines.length - 1].push({ kind: 'text', text: chunk, linkN: seg.linkN, pair, flags });
-            col += chunk.length;
-            chunk = '';
+            col += chunk.length; chunk = '';
           } else {
             lines[lines.length - 1].push({ kind: 'text', text: chunk.slice(0, remaining), linkN: seg.linkN, pair, flags });
-            chunk = chunk.slice(remaining);
-            lines.push([]); col = 0;
+            chunk = chunk.slice(remaining); lines.push([]); col = 0;
           }
         }
         if (nl < 0) break;
@@ -122,7 +148,6 @@ export function createPageView(tui, theme, imageView) {
         cx += seg.text.length;
       }
     }
-
     return { scrollY, maxScroll: ms };
   }
 
@@ -135,8 +160,8 @@ export function createPageView(tui, theme, imageView) {
 
   return {
     setContent, render, scroll, maxScroll, lineAt, invalidate,
-    get links()    { return links; },
-    get scrollY()  { return scrollY; },
+    get links() { return links; },
+    get scrollY() { return scrollY; },
     get segments() { return segments; },
   };
 }

@@ -65,6 +65,12 @@ export function createTheme(tui) {
   pair('warning',           YELLOW,  DEFAULT);
   pair('success',           GREEN,   DEFAULT);
 
+  // ---- Form elements ----
+  pair('input',            WHITE,   has256 ? 237 : DIM);
+  pair('inputFocus',       WHITE,   BLUE);
+  pair('inputPlaceholder', DIM,     has256 ? 237 : DIM);
+  pair('disabled',         DIM,     DEFAULT);
+
   // ---- CSS color pairs: 16 foregrounds × 2 backgrounds (default + gray) ----
   // fg on default background
   for (let i = 0; i < 16; i++) pair('c' + i,     i, DEFAULT);

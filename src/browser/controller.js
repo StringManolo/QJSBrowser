@@ -8,16 +8,14 @@ const WELCOME =
   'Welcome to QJSBrowser!\n\n' +
   'Type a URL above and press Enter.\n\n' +
   'Keyboard — page mode:\n' +
-  '  j / ↓  k / ↑  Space  b   scroll\n' +
-  '  1-9        follow link N\n' +
-  '  [  / ]     back / forward\n' +
-  '  r          reload\n' +
-  '  g / :      edit URL\n' +
-  '  Tab        toggle address/page\n' +
-  '  Ctrl+T     new tab\n' +
-  '  Ctrl+W     close tab\n' +
-  '  q          quit\n\n' +
-  'Images render as colored blocks (truecolor).\n';
+  '  j/k/Space/b    scroll\n' +
+  '  1-9            follow link\n' +
+  '  [ / ]          back/forward\n' +
+  '  r              reload\n' +
+  '  Tab            next form field (then omnibox)\n' +
+  '  Enter          submit form / press focused button\n' +
+  '  Esc            blur focused field\n' +
+  '  q              quit\n';
 
 export function createController(deps) {
   const { tui, net, keys, epfd, httpClient, theme, tabManager, imageView } = deps;
@@ -59,11 +57,6 @@ export function createController(deps) {
 
     tab.cursorPos = null;
     tui.erase();
-
-    /* ★ If previous frame had any pixels on screen, force ncurses to
-     * fully redraw. This is the only way to make ncurses overwrite cells
-     * that were written via raw ANSI (images), because ncurses doesn't
-     * know they changed. */
     tui.maybeClearok();
 
     drawWindow(tui, theme, { x: 0, y: 0, w: cols, h: rows, title: 'QJSBrowser', focused: true, style: 0 });
@@ -116,7 +109,21 @@ export function createController(deps) {
       const tab = tabManager.active();
       if (!tab) continue;
 
-      if (ch === keys.TAB) { tab.mode = (tab.mode === 'omnibox') ? 'page' : 'omnibox'; continue; }
+      if (ch === keys.TAB) {
+        if (tab.mode === 'omnibox') {
+          tab.mode = 'page';
+        } else {
+          /* In page mode, Tab cycles form fields; when no more, go to omnibox */
+          const nextId = tab.formState.tabNext(1);
+          if (nextId) {
+            tab.formState.focus(nextId);
+            tab.pageView.invalidate();
+          } else {
+            tab.mode = 'omnibox';
+          }
+        }
+        continue;
+      }
 
       if (tab.mode === 'omnibox') handleOmniboxKey(tab, ch);
       else {
@@ -139,12 +146,39 @@ export function createController(deps) {
   function handlePageKey(tab, ch) {
     const { rows, cols } = tui.size();
     const pageH = rows - 7;
+    const fs = tab.formState;
+    const focusedId = fs.focusedIdOf();
+    const focused = focusedId ? fs.get(focusedId) : null;
+
+    /* If a text input/textarea is focused, typing goes into it */
+    if (focused && focused.kind === 'text' || focused && focused.kind === 'password') {
+      if (ch === keys.ESC) {
+        fs.blur(); tab.pageView.invalidate(); return;
+      }
+      if (ch === keys.ARROW_LEFT)  { fs.moveCursor(-1); tab.pageView.invalidate(); return; }
+      if (ch === keys.ARROW_RIGHT) { fs.moveCursor(1);  tab.pageView.invalidate(); return; }
+      if (ch === keys.HOME)        { fs.moveCursorTo(0); tab.pageView.invalidate(); return; }
+      if (ch === keys.END)         { fs.moveCursorTo(9999); tab.pageView.invalidate(); return; }
+      if (ch === keys.BACKSPACE || ch === keys.NC_BACKSP || ch === keys.BACKSPACE2) {
+        if (fs.backspace()) tab.pageView.invalidate();
+        return;
+      }
+      if (ch === keys.DELETE) { if (fs.del()) tab.pageView.invalidate(); return; }
+      if (ch === keys.ENTER || ch === keys.ENTER2 || ch === keys.NC_ENTER) {
+        submitForm(tab); return;
+      }
+      if (ch >= 32 && ch < 127) {
+        if (fs.type(String.fromCharCode(ch))) tab.pageView.invalidate();
+        return;
+      }
+    }
 
     if (ch === 'g'.charCodeAt(0) || ch === ':'.charCodeAt(0)) { tab.mode = 'omnibox'; return; }
     if (ch === 'q'.charCodeAt(0)) { running = false; return; }
     if (ch === 'r'.charCodeAt(0)) { if (tab.currentUrl) navigate(tab, tab.currentUrl, { fromHistory: true }); return; }
     if (ch === '['.charCodeAt(0)) { goBack(tab);    return; }
     if (ch === ']'.charCodeAt(0)) { goForward(tab); return; }
+    if (ch === keys.ESC) { if (focusedId) { fs.blur(); tab.pageView.invalidate(); } return; }
 
     if (ch === 'j'.charCodeAt(0) || ch === keys.ARROW_DOWN) { tab.pageView.scroll(1, cols - 2, pageH); return; }
     if (ch === 'k'.charCodeAt(0) || ch === keys.ARROW_UP)   { tab.pageView.scroll(-1, cols - 2, pageH); return; }
@@ -155,7 +189,7 @@ export function createController(deps) {
       const n = ch - '0'.charCodeAt(0);
       const link = tab.pageView.links.find(l => l.n === n);
       if (link) navigate(tab, link.href);
-      else      tab.statusText = `No link [${n}]`;
+      else tab.statusText = `No link [${n}]`;
       return;
     }
   }
@@ -179,7 +213,6 @@ export function createController(deps) {
       else if (tabHit.type === 'new') { newTab(); }
       return;
     }
-
     if (!tab) return;
 
     const tbHit = toolbar.hitTest(x, y);
@@ -208,13 +241,31 @@ export function createController(deps) {
 
   function handlePageClick(tab, relX, relY, pageW) {
     const line = tab.pageView.lineAt(relY, pageW);
-    if (!line) { tab.mode = 'page'; return; }
+    if (!line) { tab.mode = 'page'; tab.formState.blur(); tab.pageView.invalidate(); return; }
 
     let cx = 0;
     for (const seg of line) {
       if (seg.kind === 'img') { cx += seg.cols; continue; }
-      const w = seg.text.length;
+      const w = (seg.text || '').length;
       if (w > 0 && relX >= cx && relX < cx + w) {
+        /* Form element click */
+        if (seg.elementId) {
+          const el = tab.formState.get(seg.elementId);
+          if (!el) break;
+          if (el.kind === 'checkbox' || el.kind === 'radio') {
+            tab.formState.toggle(seg.elementId);
+          } else if (el.kind === 'submit' || el.kind === 'button') {
+            if (el.kind === 'submit') submitForm(tab, el);
+          } else if (el.kind === 'reset') {
+            /* Reset form values (simple: reset all text in form to empty) */
+            resetForm(tab, el);
+          } else {
+            tab.formState.focus(seg.elementId);
+          }
+          tab.pageView.invalidate();
+          return;
+        }
+        /* Link click */
         if (seg.linkN !== null) {
           const link = tab.pageView.links.find(l => l.n === seg.linkN);
           if (link) { navigate(tab, link.href); return; }
@@ -223,7 +274,40 @@ export function createController(deps) {
       }
       cx += w;
     }
+    tab.formState.blur();
+    tab.pageView.invalidate();
     tab.mode = 'page';
+  }
+
+  function submitForm(tab, buttonEl) {
+    const fs = tab.formState;
+    const focusedId = fs.focusedIdOf() || (buttonEl && buttonEl.id);
+    if (!focusedId) return;
+    const form = fs.findForm(focusedId);
+    if (!form) {
+      tab.statusText = 'No form to submit';
+      return;
+    }
+    const collected = fs.collect(form.id);
+    if (!collected) return;
+
+    if (collected.method === 'GET') {
+      const target = collected.action +
+        (collected.action.includes('?') ? '&' : '?') + collected.data;
+      navigate(tab, target);
+    } else {
+      navigate(tab, collected.action, { method: 'POST', body: collected.data });
+    }
+  }
+
+  function resetForm(tab, el) {
+    const form = tab.formState.findForm(el.id);
+    if (!form) return;
+    for (const [id, fe] of tab.formState.elements) {
+      if (fe.formId === form.id && fe.kind === 'text') fe.value = '';
+      if (fe.formId === form.id && (fe.kind === 'checkbox' || fe.kind === 'radio')) fe.checked = false;
+    }
+    tab.pageView.invalidate();
   }
 
   function newTab() {
@@ -248,6 +332,8 @@ export function createController(deps) {
     }
     tab.currentUrl = url;
     tab.loading = true;
+    tab.formState.blur();
+    tab.formState.reset();
     tab.omnibox.setText(url);
     tab.pageView.setContent('Loading ' + url + ' …', []);
     httpClient.fetch(url, { ...options, tabId: tab.id });
@@ -259,7 +345,6 @@ export function createController(deps) {
     tab.omnibox.setText(url);
     navigate(tab, url, { fromHistory: true });
   }
-
   function goForward(tab) {
     const url = tab.history.forward();
     if (!url) { tab.statusText = 'No history forward'; render(); return; }
@@ -291,18 +376,11 @@ export function createController(deps) {
     if (tab === tabManager.active()) render();
   }
 
-
-
-
-    function handleResponse(tabId, url, resp, options) {
-    /* ★ Sub-resource image (fetched for a page in another tab).
-     * NEVER touches currentUrl / omnibox / mode. If decode failed (e.g. SVG),
-     * the page keeps its original placeholder — no navigation hijack. */
+  function handleResponse(tabId, url, resp, options) {
     if (options && options.binary && options.imageFor) {
       const tab = tabManager.getById(options.imageFor);
       if (!tab) return;
       if (!resp.rawBytes || !resp.imageWidth || !resp.imageHeight) return;
-
       const { rows, cols } = tui.size();
       imageView.set(options.imageSrc, resp.rawBytes,
                     resp.imageWidth, resp.imageHeight,
@@ -318,15 +396,13 @@ export function createController(deps) {
 
     const ct = (resp.headers['content-type'] || '').toLowerCase();
 
-    /* ★ Direct navigation to an image URL (user typed the .png/.svg directly) */
     if (ct.startsWith('image/')) {
       tab.loading = false;
       tab.currentUrl = url;
       if (options && options.fromHistory) tab.history.replace(url);
-      else                                tab.history.push(url);
+      else tab.history.push(url);
       tab.omnibox.setText(url);
       tab.mode = 'page';
-
       if (resp.rawBytes && resp.imageWidth && resp.imageHeight) {
         const { rows, cols } = tui.size();
         imageView.set(url, resp.rawBytes, resp.imageWidth, resp.imageHeight,
@@ -335,9 +411,8 @@ export function createController(deps) {
         tab.statusText = `Image ${resp.imageWidth}×${resp.imageHeight} — ${url}`;
       } else {
         const fmt = (ct.match(/^image\/([a-z0-9+.-]+)/) || [])[1] || 'unknown';
-        const bytes = resp.rawBytes ? resp.rawBytes.length : 0;
-        let msg = `Image: ${url}\n\nFormat: ${fmt}\nSize: ${bytes} bytes\n`;
-        if (fmt === 'svg+xml') msg += '\nSVG images are not rendered (vector format not supported).';
+        let msg = `Image: ${url}\n\nFormat: ${fmt}\nSize: ${resp.rawBytes ? resp.rawBytes.length : 0} bytes\n`;
+        if (fmt === 'svg+xml') msg += '\nSVG images are not rendered.';
         tab.pageView.setContent(msg, []);
         tab.statusText = `Image (${fmt}) — not rendered`;
       }
@@ -345,36 +420,29 @@ export function createController(deps) {
       return;
     }
 
-    /* ★ Normal HTML / text response */
     tab.loading = false;
     tab.currentUrl = url;
     if (options && options.fromHistory) tab.history.replace(url);
-    else                                tab.history.push(url);
-
+    else tab.history.push(url);
     tab.omnibox.setText(url);
     tab.mode = 'page';
 
     const looksHtml = ct.includes('html') || /^\s*</.test(resp.body);
-
     let plainLen = 0, linksCount = 0, imagesCount = 0;
+
     if (looksHtml) {
-      const parsed = htmlToText(resp.body, url, theme);
+      tab.formState.reset();
+      const parsed = htmlToText(resp.body, url, theme, tab.formState);
       tab.pageView.setContent(parsed.segments, parsed.links);
       plainLen = parsed.text.length;
       linksCount = parsed.links.length;
       imagesCount = parsed.images.length;
-
       for (const img of parsed.images) {
         if (imageView.has(img.src)) continue;
-        // Skip SVG — stb_image can't decode it, no point in the fetch
         if (/\.svg(\?|#|$)/i.test(img.src)) continue;
         httpClient.fetch(img.src, {
-          tabId: tab.id,
-          binary: true,
-          imageFor: tab.id,
-          imageSrc: img.src,
-          displayW: img.width || 0,
-          displayH: img.height || 0,
+          tabId: tab.id, binary: true, imageFor: tab.id,
+          imageSrc: img.src, displayW: img.width || 0, displayH: img.height || 0,
           redirectCount: 0,
         });
       }
@@ -386,9 +454,6 @@ export function createController(deps) {
     tab.statusText = `HTTP ${resp.status} ${resp.statusText} — ${plainLen} chars, ${linksCount} links, ${imagesCount} images`;
     if (tab === tabManager.active()) render();
   }
-
-
-
 
   const initial = tabManager.active();
   if (initial) {

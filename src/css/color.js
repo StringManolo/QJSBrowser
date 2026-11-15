@@ -23,7 +23,7 @@ export function parseCssColor(value) {
   const s = String(value).trim().toLowerCase();
   if (!s) return null;
 
-  // #RGB
+  /* #RGB */
   if (/^#[0-9a-f]{3}$/i.test(s)) {
     return {
       r: parseInt(s[1] + s[1], 16),
@@ -32,7 +32,7 @@ export function parseCssColor(value) {
     };
   }
 
-  // #RRGGBB
+  /* #RRGGBB */
   if (/^#[0-9a-f]{6}$/i.test(s)) {
     return {
       r: parseInt(s.slice(1, 3), 16),
@@ -41,7 +41,7 @@ export function parseCssColor(value) {
     };
   }
 
-  // rgb(...) / rgba(...)
+  /* rgb(...) / rgba(...) */
   const rgb = s.match(/^rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
   if (rgb) {
     return {
@@ -53,14 +53,13 @@ export function parseCssColor(value) {
 
   if (NAMED[s]) return { r: NAMED[s][0], g: NAMED[s][1], b: NAMED[s][2] };
 
-  // CSS system colors — treat as default (return null → inherit)
+  /* CSS keywords that mean "don't override" */
   if (['inherit', 'initial', 'unset', 'currentcolor', 'transparent'].includes(s)) return null;
 
   return null;
 }
 
-/* 16 basic ANSI colors in RGB, used to snap arbitrary CSS colors to the
- * closest terminal-compatible value. */
+/* 16 basic ANSI colors in RGB */
 const ANSI_RGB = [
   [0,   0,   0  ], [128, 0,   0  ], [0,   128, 0  ], [128, 128, 0  ],
   [0,   0,   128], [128, 0,   128], [0,   128, 128], [192, 192, 192],
@@ -68,9 +67,19 @@ const ANSI_RGB = [
   [0,   0,   255], [255, 0,   255], [0,   255, 255], [255, 255, 255],
 ];
 
-/* Returns ANSI color index 0-15 (or -1 for "default"). */
+/* Colors darker than this are assumed to be intended for light-background
+ * sites (Google's #202124 body text, Bootstrap's #212529, etc). On dark
+ * terminals they'd become invisible → fall back to the terminal default. */
+const DARK_LUMINANCE_THRESHOLD = 50;
+
+/* Returns ANSI color index 0-15 (or fallback for "default").
+ * Skips near-black colors so dark text on dark terminals stays visible. */
 export function snapToAnsi(rgb, fallback = -1) {
   if (!rgb) return fallback;
+
+  const lum = 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+  if (lum < DARK_LUMINANCE_THRESHOLD) return fallback;
+
   let bestIdx = 0;
   let bestDist = Infinity;
   for (let i = 0; i < ANSI_RGB.length; i++) {

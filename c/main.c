@@ -13,6 +13,7 @@ typedef struct {
     init_module_fn tui;
     init_module_fn tls;
     init_module_fn image;
+    init_module_fn zlib;
 } Registry;
 
 static const char *ensure_utf8_locale(void) {
@@ -42,7 +43,6 @@ static char *read_file(const char *p, size_t *len) {
     return b;
 }
 
-/* console.log(...) → stderr. Used for debug output that doesn't corrupt ncurses. */
 static JSValue js_console_log(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv) {
     (void)this_val;
@@ -69,6 +69,7 @@ static JSModuleDef *browser_module_loader(JSContext *ctx,
     if (!strcmp(module_name, "tui")             && r->tui)   return r->tui(ctx, module_name);
     if (!strcmp(module_name, "tls")             && r->tls)   return r->tls(ctx, module_name);
     if (!strcmp(module_name, "image")           && r->image) return r->image(ctx, module_name);
+    if (!strcmp(module_name, "zlib")            && r->zlib)  return r->zlib(ctx, module_name);
 
     size_t len;
     char *src = read_file(module_name, &len);
@@ -108,13 +109,13 @@ int main(int argc, char **argv) {
     const char *tui_path   = argc > 2 ? argv[2] : "./lib/tui.so";
     const char *tls_path   = argc > 3 ? argv[3] : "./lib/tls.so";
     const char *image_path = argc > 4 ? argv[4] : "./lib/image.so";
-    const char *js_path    = argc > 5 ? argv[5] : "./main.js";
+    const char *zlib_path  = argc > 5 ? argv[5] : "./lib/zlib.so";
+    const char *js_path    = argc > 6 ? argv[6] : "./main.js";
 
     JSRuntime *rt = JS_NewRuntime();
     JSContext *ctx = JS_NewContext(rt);
     if (!rt || !ctx) { fprintf(stderr, "quickjs init failed\n"); return 1; }
 
-    /* Install console.log → stderr */
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue console = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, console, "log",
@@ -129,7 +130,8 @@ int main(int argc, char **argv) {
     void *h_tui   = dlopen(tui_path,   RTLD_NOW);
     void *h_tls   = dlopen(tls_path,   RTLD_NOW);
     void *h_image = dlopen(image_path, RTLD_NOW);
-    if (!h_net || !h_tui || !h_tls || !h_image) {
+    void *h_zlib  = dlopen(zlib_path,  RTLD_NOW);
+    if (!h_net || !h_tui || !h_tls || !h_image || !h_zlib) {
         fprintf(stderr, "dlopen: %s\n", dlerror());
         return 1;
     }
@@ -137,7 +139,8 @@ int main(int argc, char **argv) {
     reg.tui   = (init_module_fn)dlsym(h_tui,   "js_init_module");
     reg.tls   = (init_module_fn)dlsym(h_tls,   "js_init_module");
     reg.image = (init_module_fn)dlsym(h_image, "js_init_module");
-    if (!reg.net || !reg.tui || !reg.tls || !reg.image) {
+    reg.zlib  = (init_module_fn)dlsym(h_zlib,  "js_init_module");
+    if (!reg.net || !reg.tui || !reg.tls || !reg.image || !reg.zlib) {
         fprintf(stderr, "dlsym failed\n"); return 1;
     }
 
@@ -165,6 +168,6 @@ int main(int argc, char **argv) {
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     free(src);
-    dlclose(h_net); dlclose(h_tui); dlclose(h_tls); dlclose(h_image);
+    dlclose(h_net); dlclose(h_tui); dlclose(h_tls); dlclose(h_image); dlclose(h_zlib);
     return rc;
 }

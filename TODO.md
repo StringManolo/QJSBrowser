@@ -3,7 +3,6 @@
 - Persist Cookies on disk
 - Http Only / Same Site are usless (need js parsing)
 - Allow block of cookies and third party cookies
-- Add gzip/deflate support
 - Add Tls1.3 support
 - Add Settings button to click on UI 
 - Añadir scroll bar oara saber el tamaño de la web (feedback visual)

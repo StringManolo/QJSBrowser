@@ -2,6 +2,7 @@ import net   from 'network_sockets';
 import tui   from 'tui';
 import tls   from 'tls';
 import image from 'image';
+import zlib  from 'zlib';
 
 import { buildKeyMap }      from 'src/base/keys.js';
 import { createTheme }      from 'src/ui/theme.js';
@@ -24,7 +25,7 @@ const tabManager = createTabManager(tui, theme, imageView);
 tabManager.add();
 
 const cookieJar  = createCookieJar();
-const httpClient = createHttpClient(net, epfd, tls, cookieJar);
+const httpClient = createHttpClient(net, epfd, tls, cookieJar, zlib);
 
 const controller = createController({
   tui, net, keys, epfd, httpClient, theme, tabManager, imageView,
@@ -81,7 +82,6 @@ while (controller.isRunning()) {
       else httpClient.onEvent(ev);
     } catch (e) {
       console.log('[event loop] ' + (e.message || String(e)));
-      /* don't kill the browser — one bad page shouldn't lose your tabs */
     }
   }
 }

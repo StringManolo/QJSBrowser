@@ -78,7 +78,7 @@ function decodeBody(bytes, contentType) {
   return utf8;
 }
 
-export function createHttpClient(net, epfd, tls, cookieJar) {
+export function createHttpClient(net, epfd, tls, cookieJar, zlib) {
   const connections = {};
   let callbacks = { onStatus(){}, onResponse(){}, onError(){} };
 
@@ -353,6 +353,7 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
     }
   }
 
+
     function processResponse(c) {
     let sep = -1;
     for (let i = 0; i < c.recvBytes.length - 3; i++) {
@@ -368,17 +369,35 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
     const contentEncoding = (head.match(/^content-encoding:\s*(.+)$/im) || [])[1] || '';
     let bodyBytes = c.recvBytes.subarray(sep + 4);
 
-    /* ★ Gzip detection — if server ignored Accept-Encoding: identity.
-     * We can't decompress without zlib, so fail fast with a clear message
-     * instead of feeding gzip bytes to the HTML parser as garbage. */
-    if (/gzip|deflate/i.test(contentEncoding)) {
-      callbacks.onError(
-        c.url,
-        'Server sent ' + contentEncoding.trim() + '-encoded response. ' +
-        'gzip support not available yet.',
-        c.options
-      );
-      return;
+    /* ★ Decompress if server ignored Accept-Encoding: identity */
+    const enc = contentEncoding.trim().toLowerCase();
+    if (enc && enc !== 'identity' && bodyBytes.length > 0) {
+      let decompressed = null;
+      if (enc === 'gzip' || enc === 'x-gzip') {
+        if (!zlib) {
+          callbacks.onError(c.url, 'Received gzip but zlib module is missing', c.options);
+          return;
+        }
+        decompressed = zlib.inflate(bodyBytes, 'gzip');
+        if (!decompressed) {
+          callbacks.onError(c.url, 'gzip decompression failed', c.options);
+          return;
+        }
+      } else if (enc === 'deflate') {
+        if (!zlib) {
+          callbacks.onError(c.url, 'Received deflate but zlib module is missing', c.options);
+          return;
+        }
+        decompressed = zlib.inflate(bodyBytes, 'deflate');
+        if (!decompressed) {
+          callbacks.onError(c.url, 'deflate decompression failed', c.options);
+          return;
+        }
+      } else {
+        callbacks.onError(c.url, 'Unsupported Content-Encoding: ' + enc, c.options);
+        return;
+      }
+      bodyBytes = decompressed;
     }
 
     const isImage = contentType.toLowerCase().startsWith('image/');

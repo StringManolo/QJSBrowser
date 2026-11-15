@@ -14,13 +14,12 @@ import { createController } from 'src/browser/controller.js';
 tui.init();
 tui.mouseEnable();
 
-const theme = createTheme(tui);
-const keys  = buildKeyMap(tui);
-const epfd  = net.epoll_create1(0);
+const theme      = createTheme(tui);
+const keys       = buildKeyMap(tui);
+const epfd       = net.epoll_create1(0);
 net.epoll_ctl(epfd, net.EPOLL_CTL_ADD, 0, net.EPOLLIN);
 
-// ★ imageView BEFORE tabManager — tabs need it
-const imageView = createImageView(tui, theme);
+const imageView  = createImageView(tui, theme);
 const tabManager = createTabManager(tui, theme, imageView);
 tabManager.add();
 
@@ -32,25 +31,38 @@ const controller = createController({
 });
 
 httpClient.setCallbacks({
-  onStatus:   (url, msg, opts)  => controller.handleStatus(opts && opts.tabId, msg),
-  onResponse: (url, resp, opts) => {
-    // Decode image bytes — either explicit binary fetch OR image/* content-type
-    const ct = (resp.contentType || resp.headers['content-type'] || '').toLowerCase();
-    const isImageResponse = ct.startsWith('image/') ||
-                            (opts && opts.binary && opts.imageFor);
-    if (isImageResponse && resp.rawBytes) {
-      try {
-        const decoded = image.decode(resp.rawBytes);
-        if (decoded) {
-          resp.rawBytes = decoded.rgba;
-          resp.imageWidth  = decoded.width;
-          resp.imageHeight = decoded.height;
-        }
-      } catch (e) { /* decode error — leave rawBytes untouched */ }
-    }
-    controller.handleResponse(opts && opts.tabId, url, resp, opts || {});
+  onStatus:   (url, msg, opts)  => {
+    try { controller.handleStatus(opts && opts.tabId, msg); }
+    catch (e) { console.log('[onStatus] ' + (e.message || String(e))); }
   },
-  onError:    (url, msg, opts)  => controller.handleError(opts && opts.tabId, url, msg),
+  onResponse: (url, resp, opts) => {
+    try {
+      const ct = (resp.contentType || resp.headers['content-type'] || '').toLowerCase();
+      const isImageResponse = ct.startsWith('image/') ||
+                              (opts && opts.binary && opts.imageFor);
+      if (isImageResponse && resp.rawBytes) {
+        try {
+          const decoded = image.decode(resp.rawBytes);
+          if (decoded) {
+            resp.rawBytes    = decoded.rgba;
+            resp.imageWidth  = decoded.width;
+            resp.imageHeight = decoded.height;
+          }
+        } catch (e) {
+          console.log('[image.decode] ' + (e.message || String(e)));
+        }
+      }
+      controller.handleResponse(opts && opts.tabId, url, resp, opts || {});
+    } catch (e) {
+      console.log('[onResponse] ' + (e.message || String(e)));
+      try { controller.handleError(opts && opts.tabId, url, e.message || String(e)); }
+      catch (_) {}
+    }
+  },
+  onError: (url, msg, opts) => {
+    try { controller.handleError(opts && opts.tabId, url, msg); }
+    catch (e) { console.log('[onError] ' + (e.message || String(e))); }
+  },
 });
 
 controller.render();
@@ -58,10 +70,19 @@ controller.render();
 while (controller.isRunning()) {
   let events;
   try { events = net.epoll_wait(epfd, 16, -1); }
-  catch (e) { continue; }
+  catch (e) {
+    console.log('[epoll_wait] ' + (e.message || String(e)));
+    continue;
+  }
+
   for (const ev of events) {
-    if (ev.fd === 0) controller.handleInput();
-    else httpClient.onEvent(ev);
+    try {
+      if (ev.fd === 0) controller.handleInput();
+      else httpClient.onEvent(ev);
+    } catch (e) {
+      console.log('[event loop] ' + (e.message || String(e)));
+      /* don't kill the browser — one bad page shouldn't lose your tabs */
+    }
   }
 }
 

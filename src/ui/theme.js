@@ -22,21 +22,19 @@ export function createTheme(tui) {
   const WHITE   = 15;
   const NAVY    = 4;
   const BLUE    = 12;
-  const LINK    = 39;   // deep sky blue — brighter than BLUE
+  const LINK    = 39;
   const CYAN    = 14;
   const RED     = 9;
   const YELLOW  = 11;
   const GREEN   = 2;
   const MAGENTA = 13;
 
-  // Gray scale (requires 256-color terminal)
-  const DARK    = numColors >= 256 ? 236 : 8;
-
-  // Tab bar: three distinct levels
-  const TAB_BAR_BG    = numColors >= 256 ? 236 : DIM;
-  const TAB_INACTIVE  = numColors >= 256 ? 238 : DIM;
-  const TAB_INACTIVE_FG = numColors >= 256 ? 250 : WHITE;
-  const TAB_PLUS_BG   = numColors >= 256 ? 236 : DIM;
+  const has256 = numColors >= 256;
+  const DARK    = has256 ? 236 : DIM;
+  const TAB_BAR_BG      = has256 ? 236 : DIM;
+  const TAB_INACTIVE    = has256 ? 238 : DIM;
+  const TAB_INACTIVE_FG = has256 ? 250 : WHITE;
+  const TAB_PLUS_BG     = has256 ? 236 : DIM;
 
   pair('window',            DEFAULT, DEFAULT);
   pair('windowBorder',      DIM,     DEFAULT);
@@ -57,11 +55,29 @@ export function createTheme(tui) {
   pair('warning',           YELLOW,  DEFAULT);
   pair('success',           GREEN,   DEFAULT);
 
-  // ---- tab bar ----
   pair('tabBarBg',     DIM,             TAB_BAR_BG);
   pair('tabActive',    WHITE,           BLUE);
   pair('tabInactive',  TAB_INACTIVE_FG, TAB_INACTIVE);
   pair('tabPlus',      GREEN,           TAB_PLUS_BG);
+
+  // ---- HTML semantics ----
+  // Headings: brightness gradient from h1 (brightest) to h6 (dimmest).
+  // The bold attribute is applied separately by the renderer.
+  pair('heading1', has256 ? 231 : WHITE, DEFAULT);
+  pair('heading2', has256 ? 253 : WHITE, DEFAULT);
+  pair('heading3', has256 ? 251 : WHITE, DEFAULT);
+  pair('heading4', has256 ? 249 : WHITE, DEFAULT);
+  pair('heading5', has256 ? 247 : WHITE, DEFAULT);
+  pair('heading6', has256 ? 245 : WHITE, DEFAULT);
+
+  // Inline code and <pre> blocks: warm text on a dark gray background.
+  pair('code',       has256 ? 180 : WHITE, has256 ? 235 : DIM);
+
+  // Blockquote: dimmed, indented by the renderer.
+  pair('blockquote', has256 ? 244 : DIM, DEFAULT);
+
+  // List bullets / numbers.
+  pair('listBullet', has256 ? 220 : YELLOW, DEFAULT);
 
   return { hasColor: true, numColors, pairs: P };
 }

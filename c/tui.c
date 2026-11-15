@@ -97,15 +97,21 @@ static JSValue t_define_pair(JSContext *c, JSValueConst v, int ac, JSValueConst 
   return JS_UNDEFINED;
 }
 
+/* printPair(y, x, text, pairId [, flags])
+ * Optional 5th arg: A_BOLD | A_UNDERLINE | A_REVERSE | A_DIM */
 static JSValue t_print_pair(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
-  (void)v; (void)ac;
-  int y, x, pairId;
+  (void)v;
+  int y, x, pairId, flags = 0;
   if (JS_ToInt32(c, &y, av[0])) return JS_EXCEPTION;
   if (JS_ToInt32(c, &x, av[1])) return JS_EXCEPTION;
   const char *s = JS_ToCString(c, av[2]);
   if (!s) return JS_EXCEPTION;
   if (JS_ToInt32(c, &pairId, av[3])) { JS_FreeCString(c, s); return JS_EXCEPTION; }
-  attrset(COLOR_PAIR(pairId));
+  if (ac >= 5 && !JS_IsUndefined(av[4]) && !JS_IsNull(av[4])) {
+    if (JS_ToInt32(c, &flags, av[4])) { JS_FreeCString(c, s); return JS_EXCEPTION; }
+  }
+  int safe = flags & (A_BOLD | A_UNDERLINE | A_REVERSE | A_DIM);
+  attrset(COLOR_PAIR(pairId) | safe);
   mvaddstr(y, x, s);
   attrset(A_NORMAL);
   JS_FreeCString(c, s);
@@ -206,25 +212,19 @@ static JSValue t_set_cursor(JSContext *c, JSValueConst v, int ac, JSValueConst *
   return JS_UNDEFINED;
 }
 
-/* ---------- MOUSE ---------- */
-
 static JSValue t_mouse_enable(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
   (void)c; (void)v; (void)ac; (void)av;
   mmask_t supported = mousemask(
     BUTTON1_CLICKED | BUTTON1_PRESSED | BUTTON1_RELEASED |
-    BUTTON4_PRESSED | BUTTON5_PRESSED,
-    NULL
-  );
+    BUTTON4_PRESSED | BUTTON5_PRESSED, NULL);
   mouseinterval(100);
   return JS_NewBool(c, supported != 0);
 }
-
 static JSValue t_mouse_disable(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
   (void)c; (void)v; (void)ac; (void)av;
   mousemask(0, NULL);
   return JS_UNDEFINED;
 }
-
 static JSValue t_get_mouse(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
   (void)v; (void)ac; (void)av;
   MEVENT event;
@@ -237,22 +237,14 @@ static JSValue t_get_mouse(JSContext *c, JSValueConst v, int ac, JSValueConst *a
   return o;
 }
 
-/* ---------- TRUECOLOR CELLS ---------- */
+/* ---------- truecolor cells ---------- */
 
-typedef struct {
-    int y, x;
-    int fg, bg;
-    char ch[8];
-} RgbCell;
+typedef struct { int y, x; int fg, bg; char ch[8]; } RgbCell;
 
 static RgbCell *g_pending = NULL;
-static int g_pending_n   = 0;
-static int g_pending_cap = 0;
-
-/* Previous frame's pixel cells — used to detect when pixels need clearing */
-static RgbCell *g_prev = NULL;
-static int g_prev_n   = 0;
-static int g_prev_cap = 0;
+static int g_pending_n = 0, g_pending_cap = 0;
+static RgbCell *g_prev    = NULL;
+static int g_prev_n = 0, g_prev_cap = 0;
 
 static JSValue t_print_rgb(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
   (void)v; (void)ac;
@@ -263,23 +255,17 @@ static JSValue t_print_rgb(JSContext *c, JSValueConst v, int ac, JSValueConst *a
   if (JS_ToInt32(c, &bg, av[3])) return JS_EXCEPTION;
   const char *ch = JS_ToCString(c, av[4]);
   if (!ch) return JS_EXCEPTION;
-
   if (g_pending_n >= g_pending_cap) {
     g_pending_cap = g_pending_cap ? g_pending_cap * 2 : 256;
     g_pending = realloc(g_pending, g_pending_cap * sizeof(RgbCell));
   }
   RgbCell *cell = &g_pending[g_pending_n++];
   cell->y = y; cell->x = x; cell->fg = fg; cell->bg = bg;
-  strncpy(cell->ch, ch, 7);
-  cell->ch[7] = 0;
-
+  strncpy(cell->ch, ch, 7); cell->ch[7] = 0;
   JS_FreeCString(c, ch);
   return JS_UNDEFINED;
 }
 
-/* Called by render() right after erase(). If prev frame had pixels, forces
- * ncurses to fully redraw everything on next refresh() — this is the only
- * reliable way to erase raw ANSI cells written outside ncurses' model. */
 static JSValue t_maybe_clearok(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
   (void)c; (void)v; (void)ac; (void)av;
   if (g_prev_n > 0) clearok(stdscr, TRUE);
@@ -293,39 +279,26 @@ static JSValue t_flush_images(JSContext *c, JSValueConst v, int ac, JSValueConst
   if (ac >= 2) JS_ToInt32(c, &cursor_x, av[1]);
 
   fflush(stdout);
-
   for (int i = 0; i < g_pending_n; i++) {
     RgbCell *cell = &g_pending[i];
-    int r   = (cell->fg >> 16) & 0xFF;
-    int g   = (cell->fg >>  8) & 0xFF;
-    int b   =  cell->fg        & 0xFF;
-    int br  = (cell->bg >> 16) & 0xFF;
-    int bg_ = (cell->bg >>  8) & 0xFF;
-    int bb  =  cell->bg        & 0xFF;
+    int r   = (cell->fg >> 16) & 0xFF, g   = (cell->fg >> 8) & 0xFF, b   = cell->fg & 0xFF;
+    int br  = (cell->bg >> 16) & 0xFF, bg_ = (cell->bg >> 8) & 0xFF, bb  = cell->bg & 0xFF;
     printf("\033[%d;%dH\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm%s\033[0m",
-           cell->y + 1, cell->x + 1,
-           r, g, b, br, bg_, bb,
-           cell->ch);
+           cell->y + 1, cell->x + 1, r, g, b, br, bg_, bb, cell->ch);
   }
-
   printf("\033[%d;%dH", cursor_y + 1, cursor_x + 1);
   fflush(stdout);
 
-  /* Save current as prev for next frame */
   if (g_pending_n > g_prev_cap) {
     g_prev_cap = g_pending_n;
     g_prev = realloc(g_prev, g_prev_cap * sizeof(RgbCell));
   }
-  if (g_prev && g_pending_n > 0) {
+  if (g_prev && g_pending_n > 0)
     memcpy(g_prev, g_pending, g_pending_n * sizeof(RgbCell));
-  }
   g_prev_n = g_pending_n;
-
   g_pending_n = 0;
   return JS_UNDEFINED;
 }
-
-/* ---------- registration ---------- */
 
 static const JSCFunctionListEntry tui_funcs[] = {
   JS_CFUNC_DEF("init", 0, t_init),

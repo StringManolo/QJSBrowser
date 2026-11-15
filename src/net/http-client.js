@@ -365,9 +365,22 @@ export function createHttpClient(net, epfd, tls, cookieJar) {
 
     const head = decodeUtf8(c.recvBytes.subarray(0, sep));
     const contentType = (head.match(/^content-type:\s*(.+)$/im) || [])[1] || '';
-    const bodyBytes = c.recvBytes.subarray(sep + 4);
+    const contentEncoding = (head.match(/^content-encoding:\s*(.+)$/im) || [])[1] || '';
+    let bodyBytes = c.recvBytes.subarray(sep + 4);
 
-    // Force binary mode for image content-types — no point decoding garbage
+    /* ★ Gzip detection — if server ignored Accept-Encoding: identity.
+     * We can't decompress without zlib, so fail fast with a clear message
+     * instead of feeding gzip bytes to the HTML parser as garbage. */
+    if (/gzip|deflate/i.test(contentEncoding)) {
+      callbacks.onError(
+        c.url,
+        'Server sent ' + contentEncoding.trim() + '-encoded response. ' +
+        'gzip support not available yet.',
+        c.options
+      );
+      return;
+    }
+
     const isImage = contentType.toLowerCase().startsWith('image/');
     const isBinary = !!(c.options && c.options.binary) || isImage;
     const body = isBinary ? '' : decodeBody(bodyBytes, contentType);

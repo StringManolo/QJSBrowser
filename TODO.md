@@ -10,3 +10,8 @@
 - Add home webpage for HOME button
 - Add CSS
 - Load .png .joeg, webp, raw files properly (as images not text)
+- Add edit of all network traffic, http headers, cookies, etc
+- Allow raw memory access
+- Allow view-source:
+- Add buttons, forms, etc visualy
+- 

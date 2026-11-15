@@ -36,14 +36,54 @@ function decodeHtmlEntities(s) {
   });
 }
 
-function cleanInlineText(s) {
-  return decodeHtmlEntities(s.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ')).trim();
+function parseAttrs(str) {
+  const attrs = {};
+  const re = /([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g;
+  let m;
+  while ((m = re.exec(str)) !== null) {
+    attrs[m[1].toLowerCase()] = m[2] !== undefined ? m[2]
+                              : m[3] !== undefined ? m[3]
+                              : m[4];
+  }
+  return attrs;
 }
 
-/* Parse an HTML dimension attribute ("100", "100px", "100%", "auto", etc.).
- * Returns the numeric value only for plain integers. Percentages, "auto",
- * and CSS units other than unitless px are rejected — we don't have a
- * layout engine to interpret them. */
+function tokenize(html) {
+  const tokens = [];
+  let i = 0;
+  while (i < html.length) {
+    const lt = html.indexOf('<', i);
+    if (lt < 0) { tokens.push({ type: 'text', value: html.slice(i) }); break; }
+    if (lt > i) tokens.push({ type: 'text', value: html.slice(i, lt) });
+
+    if (html.startsWith('<!--', lt)) {
+      const end = html.indexOf('-->', lt + 4);
+      if (end < 0) break;
+      i = end + 3;
+      continue;
+    }
+
+    const gt = html.indexOf('>', lt);
+    if (gt < 0) { tokens.push({ type: 'text', value: html.slice(lt) }); break; }
+
+    const raw = html.slice(lt + 1, gt).trim();
+    if (raw.startsWith('/')) {
+      tokens.push({ type: 'close', tag: raw.slice(1).trim().toLowerCase() });
+    } else if (raw.startsWith('!')) {
+      // <!DOCTYPE ...> etc — skip
+    } else {
+      const selfClose = raw.endsWith('/');
+      const tagText = selfClose ? raw.slice(0, -1).trim() : raw;
+      const spaceIdx = tagText.search(/\s/);
+      const name = (spaceIdx < 0 ? tagText : tagText.slice(0, spaceIdx)).toLowerCase();
+      const attrsStr = spaceIdx < 0 ? '' : tagText.slice(spaceIdx);
+      tokens.push({ type: 'open', tag: name, attrs: parseAttrs(attrsStr), selfClose });
+    }
+    i = gt + 1;
+  }
+  return tokens;
+}
+
 function parseDim(v) {
   if (!v) return 0;
   const s = String(v).trim();
@@ -53,72 +93,171 @@ function parseDim(v) {
   return n;
 }
 
+const BLOCK_TAGS = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+                    'blockquote', 'pre', 'ul', 'ol', 'table'];
+
 export function htmlToText(html, baseUrl) {
   html = html.replace(/<script[\s\S]*?<\/script>/gi, '')
-             .replace(/<style[\s\S]*?<\/style>/gi, '')
-             .replace(/<!--[\s\S]*?-->/g, '');
+             .replace(/<style[\s\S]*?<\/style>/gi, '');
 
+  const tokens = tokenize(html);
   const segments = [];
   const links = [];
   const images = [];
   let linkN = 0;
+  const stack = [];
 
-  function pushPlain(raw) {
-    if (!raw) return;
-    let text = raw
-      .replace(/<\/(p|div|h[1-6]|li|tr|td|blockquote|pre|section|article|header|footer|nav|aside)>/gi, '\n\n')
-      .replace(/<(p|div|h[1-6]|li|tr|td|blockquote|pre|section|article|header|footer|nav|aside)\b[^>]*>/gi, '\n')
-      .replace(/<br\s*\/?>/gi, '\n')
-      .replace(/<hr\s*\/?>/gi, '\n────\n')
-      .replace(/<[^>]+>/g, '');
-    text = decodeHtmlEntities(text).replace(/[ \t]+/g, ' ');
-    if (text.length === 0) return;
-    segments.push({ text, linkN: null });
+  function topLink() {
+    for (let k = stack.length - 1; k >= 0; k--) if (stack[k].tag === 'a') return stack[k];
+    return null;
   }
 
-  function pushImage(match) {
-    const attrRe = /(\w+)\s*=\s*["']([^"']*)["']/g;
-    const attrs = {};
-    let a;
-    while ((a = attrRe.exec(match)) !== null) attrs[a[1].toLowerCase()] = a[2];
+  function currentStyle() {
+    const s = { bold: false, underline: false, pairName: 'page', pre: false, block: false, indent: 0 };
+    for (const e of stack) {
+      switch (e.tag) {
+        case 'b': case 'strong': s.bold = true; break;
+        case 'i': case 'em': case 'u': case 'ins': s.underline = true; break;
+        case 'del': case 's': case 'strike': s.underline = true; break;
+        case 'code': case 'kbd': case 'samp': s.pairName = 'code'; break;
+        case 'pre': s.pairName = 'code'; s.pre = true; s.block = true; break;
+        case 'h1': s.pairName = 'heading1'; s.bold = true; s.block = true; break;
+        case 'h2': s.pairName = 'heading2'; s.bold = true; s.block = true; break;
+        case 'h3': s.pairName = 'heading3'; s.bold = true; s.block = true; break;
+        case 'h4': s.pairName = 'heading4'; s.bold = true; s.block = true; break;
+        case 'h5': s.pairName = 'heading5'; s.bold = true; s.block = true; break;
+        case 'h6': s.pairName = 'heading6'; s.bold = true; s.block = true; break;
+        case 'blockquote': s.pairName = 'blockquote'; s.indent = 2; s.block = true; break;
+        case 'a':
+          if (e.href) { s.pairName = 'link'; s.underline = true; }
+          break;
+      }
+    }
+    return s;
+  }
 
+  function emitBlockBreak() {
+    if (segments.length === 0) return;
+    const last = segments[segments.length - 1];
+    const lastText = last.text || '';
+    if (lastText.endsWith('\n\n')) return;
+    if (lastText.endsWith('\n')) segments.push({ text: '\n', linkN: null });
+    else                         segments.push({ text: '\n\n', linkN: null });
+  }
+
+    function emitText(raw) {
+    if (!raw) return;
+    const s = currentStyle();
+    let text = s.pre ? decodeHtmlEntities(raw)
+                     : decodeHtmlEntities(raw.replace(/[ \t]+/g, ' '));
+    if (s.pre && text === '') return;
+
+    const a = topLink();
+    let linkNForSeg = null;
+    if (a && a.href) {
+      linkNForSeg = a.n;
+      a.accumulated += text;
+      if (!a.prefixEmitted) {
+        text = `[${a.n}]` + text;
+        a.prefixEmitted = true;
+      }
+    }
+
+    if (s.indent > 0) {
+      const pad = ' '.repeat(s.indent);
+      if (segments.length === 0) {
+        text = pad + text;
+      } else {
+        const last = segments[segments.length - 1];
+        // ★ Safe: if last segment is an image (no .text), insert a newline
+        if (!last.text) segments.push({ text: '\n', linkN: null });
+        else if (last.text.endsWith('\n')) text = pad + text;
+      }
+      text = text.replace(/\n/g, '\n' + pad);
+    }
+
+    if (s.block && segments.length > 0) {
+      const last = segments[segments.length - 1];
+      if (last.text && !last.text.endsWith('\n')) emitBlockBreak();
+    }
+
+    segments.push({
+      text,
+      linkN: linkNForSeg,
+      pairName: s.pairName,
+      bold: s.bold,
+      underline: s.underline,
+    });
+  }
+
+  function pushImage(attrs) {
     if (!attrs.src) return;
     const src = resolveUrl(baseUrl, decodeHtmlEntities(attrs.src));
     if (!/^https?:\/\//i.test(src)) return;
-
     const alt = decodeHtmlEntities(attrs.alt || '');
-    const width  = parseDim(attrs.width);
+    const width = parseDim(attrs.width);
     const height = parseDim(attrs.height);
-
     images.push({ src, alt, width, height });
     segments.push({ type: 'img', src, alt, width, height });
   }
 
-  const tokenRe = /(<a\s+[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>)|(<img\b[^>]*>)/gi;
-  let lastEnd = 0;
-  let m;
+  function handleOpen(tok) {
+    const tag = tok.tag;
+    const attrs = tok.attrs || {};
 
-  while ((m = tokenRe.exec(html)) !== null) {
-    pushPlain(html.slice(lastEnd, m.index));
+    if (tag === 'br') { segments.push({ text: '\n', linkN: null }); return; }
+    if (tag === 'hr') { emitBlockBreak(); segments.push({ text: '────\n', linkN: null }); return; }
+    if (tag === 'img') { pushImage(attrs); return; }
 
-    if (m[1]) {
-      const href = decodeHtmlEntities(m[2]);
-      const resolved = resolveUrl(baseUrl, href);
-      if (!/^https?:\/\//i.test(resolved)) {
-        pushPlain(m[3]);
-      } else {
+    if (tag === 'a') {
+      const href = attrs.href ? resolveUrl(baseUrl, decodeHtmlEntities(attrs.href)) : null;
+      if (href && /^https?:\/\//i.test(href)) {
         linkN++;
-        const label = cleanInlineText(m[3]) || resolved;
-        links.push({ n: linkN, href: resolved, text: label });
-        segments.push({ text: `[${linkN}]${label}`, linkN });
+        links.push({ n: linkN, href, text: '' });
+        stack.push({ tag: 'a', href, n: linkN, prefixEmitted: false, accumulated: '' });
+      } else {
+        stack.push({ tag: 'a', href: null });
       }
-    } else if (m[4]) {
-      pushImage(m[4]);
+      return;
     }
 
-    lastEnd = m.index + m[0].length;
+    if (tag === 'li') {
+      const depth = stack.filter(e => e.tag === 'ul' || e.tag === 'ol').length;
+      const indent = '  '.repeat(depth);
+      const parent = [...stack].reverse().find(e => e.tag === 'ul' || e.tag === 'ol');
+      if (parent && parent.tag === 'ol') {
+        parent.count = (parent.count || 0) + 1;
+        segments.push({ text: `\n${indent}${parent.count}. `, linkN: null, pairName: 'listBullet' });
+      } else {
+        segments.push({ text: `\n${indent}• `, linkN: null, pairName: 'listBullet' });
+      }
+      stack.push({ tag: 'li' });
+      return;
+    }
+
+    if (BLOCK_TAGS.includes(tag)) emitBlockBreak();
+    stack.push({ tag, attrs });
   }
-  pushPlain(html.slice(lastEnd));
+
+  function handleClose(tok) {
+    const tag = tok.tag;
+    let popped = null;
+    for (let k = stack.length - 1; k >= 0; k--) {
+      if (stack[k].tag === tag) { popped = stack[k]; stack.length = k; break; }
+    }
+
+    if (tag === 'a' && popped && popped.n)
+      links[popped.n - 1].text = popped.accumulated.trim();
+
+    if (tag === 'li') { segments.push({ text: '\n', linkN: null }); return; }
+    if (BLOCK_TAGS.includes(tag)) emitBlockBreak();
+  }
+
+  for (const tok of tokens) {
+    if (tok.type === 'text') emitText(tok.value);
+    else if (tok.type === 'open') { handleOpen(tok); if (tok.selfClose) handleClose(tok); }
+    else if (tok.type === 'close') handleClose(tok);
+  }
 
   if (links.length > 0) {
     segments.push({ text: '\n\n─── Links ───\n', linkN: null });

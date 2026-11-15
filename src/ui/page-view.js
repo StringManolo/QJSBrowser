@@ -22,6 +22,20 @@ export function createPageView(tui, theme, imageView) {
 
   function invalidate() { cachedLines = null; }
 
+  function pairIdFor(seg) {
+    const P = theme.pairs;
+    if (seg.pairName && P[seg.pairName] !== undefined) return P[seg.pairName];
+    if (seg.linkN !== null && seg.linkN !== undefined) return P.link;
+    return P.page;
+  }
+
+  function flagsFor(seg) {
+    let f = 0;
+    if (seg.bold)      f |= tui.A_BOLD;
+    if (seg.underline) f |= tui.A_UNDERLINE;
+    return f;
+  }
+
   function layout(cols) {
     if (cachedLines && cachedCols === cols) return cachedLines;
 
@@ -30,35 +44,27 @@ export function createPageView(tui, theme, imageView) {
     let col = 0;
 
     for (const seg of segments) {
-      // ---- image segment ----
       if (seg.type === 'img') {
-        // Ensure we're at column 0
         if (col > 0) { lines.push([]); col = 0; }
-
         if (imageView && imageView.has(seg.src)) {
           const cells = imageView.get(seg.src);
-          // Reserve cells.rows lines, each with one img item
           for (let r = 0; r < cells.rows; r++) {
-            lines[lines.length - 1].push({
-              kind: 'img', src: seg.src, rowIdx: r, cols: cells.cols
-            });
+            lines[lines.length - 1].push({ kind: 'img', src: seg.src, rowIdx: r, cols: cells.cols });
             lines.push([]);
           }
         } else {
           const alt = seg.alt || seg.src;
-          const ph = `[IMG: ${alt}]`;
-          lines[lines.length - 1].push({
-            kind: 'text', text: ph, linkN: null, pair: P.page
-          });
+          const pair = P.page;
+          lines[lines.length - 1].push({ kind: 'text', text: `[IMG: ${alt}]`, linkN: null, pair, flags: 0 });
           lines.push([]);
         }
         col = 0;
         continue;
       }
 
-      // ---- text segment ----
-      const pair = seg.linkN !== null ? P.link : P.page;
-      const text = seg.text;
+      const pair = pairIdFor(seg);
+      const flags = flagsFor(seg);
+      const text = seg.text || '';
       let i = 0;
       while (i < text.length) {
         const nl = text.indexOf('\n', i);
@@ -69,11 +75,11 @@ export function createPageView(tui, theme, imageView) {
           const remaining = cols - col;
           if (remaining <= 0) { lines.push([]); col = 0; continue; }
           if (chunk.length <= remaining) {
-            lines[lines.length - 1].push({ kind: 'text', text: chunk, linkN: seg.linkN, pair });
+            lines[lines.length - 1].push({ kind: 'text', text: chunk, linkN: seg.linkN, pair, flags });
             col += chunk.length;
             chunk = '';
           } else {
-            lines[lines.length - 1].push({ kind: 'text', text: chunk.slice(0, remaining), linkN: seg.linkN, pair });
+            lines[lines.length - 1].push({ kind: 'text', text: chunk.slice(0, remaining), linkN: seg.linkN, pair, flags });
             chunk = chunk.slice(remaining);
             lines.push([]); col = 0;
           }
@@ -110,8 +116,8 @@ export function createPageView(tui, theme, imageView) {
           cx += seg.cols;
           break;
         }
-        if (seg.text.length === 0) continue;
-        tui.printPair(y + i, cx, seg.text, seg.pair);
+        if (!seg.text || seg.text.length === 0) continue;
+        tui.printPair(y + i, cx, seg.text, seg.pair, seg.flags || 0);
         cx += seg.text.length;
       }
     }

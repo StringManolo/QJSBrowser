@@ -12,6 +12,9 @@
  *     can be re-serialized on the next frame (dom-live-render).
  *   - isConnected gates notification so building a detached tree or a
  *     DocumentFragment doesn't spam the hook.
+ *   - document.write is a no-op with a warning (matches post-parse write
+ *     semantics loosely; legacy pages using it during parse will lose
+ *     content — acceptable for modern pages).
  */
 
 import { EventTarget, Event } from 'src/dom/events.js';
@@ -21,8 +24,6 @@ const ELEMENT_NODE = 1;
 const TEXT_NODE    = 3;
 const DOCUMENT_NODE = 9;
 const DOCUMENT_FRAGMENT_NODE = 11;
-
-/* ---------- selector helpers (module-scope, shared) ---------- */
 
 function kebabCase(s) {
   return s.replace(/[A-Z]/g, m => '-' + m.toLowerCase());
@@ -97,8 +98,6 @@ function queryFrom(root, selector) {
   return results;
 }
 
-/* ---------- Node ---------- */
-
 export class Node extends EventTarget {
   constructor() {
     super();
@@ -122,7 +121,6 @@ export class Node extends EventTarget {
     return i > 0 ? s[i - 1] : null;
   }
 
-  /* Connected to the document? Gates mutation notification. */
   get isConnected() {
     let n = this;
     while (n) {
@@ -239,8 +237,6 @@ export class Node extends EventTarget {
   }
 }
 
-/* ---------- Text ---------- */
-
 export class Text extends Node {
   constructor(data) {
     super();
@@ -257,13 +253,9 @@ export class Text extends Node {
   get length() { return this._data.length; }
 }
 
-/* ---------- classList ---------- */
-
 class ClassList {
   constructor(element) { this._el = element; }
-  _parts() {
-    return (this._el.getAttribute('class') || '').split(/\s+/).filter(Boolean);
-  }
+  _parts() { return (this._el.getAttribute('class') || '').split(/\s+/).filter(Boolean); }
   _write(parts) { this._el.setAttribute('class', parts.join(' ')); }
   add(...names) {
     const set = new Set(this._parts());
@@ -298,8 +290,6 @@ class ClassList {
   forEach(fn, thisArg) { this._parts().forEach(fn, thisArg); }
   [Symbol.iterator]() { return this._parts()[Symbol.iterator](); }
 }
-
-/* ---------- style (Proxy) ---------- */
 
 class Style {
   constructor(element) {
@@ -358,8 +348,6 @@ class Style {
   }
 }
 
-/* ---------- Element ---------- */
-
 export class Element extends Node {
   constructor(tagName, namespaceURI) {
     super();
@@ -412,9 +400,7 @@ export class Element extends Node {
   }
 
   get innerHTML() { return this.childNodes.map(serialize).join(''); }
-  set innerHTML(html) {
-    this.textContent = String(html == null ? '' : html);
-  }
+  set innerHTML(html) { this.textContent = String(html == null ? '' : html); }
   get outerHTML() { return serialize(this); }
 
   querySelector(sel)    { return this._query(sel, true); }
@@ -441,15 +427,11 @@ export class Element extends Node {
 
 export const HTMLElement = Element;
 
-/* ---------- DocumentFragment ---------- */
-
 export class DocumentFragment extends Node {
   constructor() { super(); }
   get nodeType() { return DOCUMENT_FRAGMENT_NODE; }
   get nodeName() { return '#document-fragment'; }
 }
-
-/* ---------- Document ---------- */
 
 export class Document extends Node {
   constructor() {
@@ -470,6 +452,17 @@ export class Document extends Node {
   createTextNode(data)         { return new Text(data); }
   createDocumentFragment()     { return new DocumentFragment(); }
   createEvent(type)            { return new Event(String(type)); }
+
+  /* document.write is a no-op: legacy pages that use it during parse
+   * will miss content, but modern (React/Vite/webpack) pages never call
+   * it. Post-parse write would wipe the entire document per spec, which
+   * we'd rather not emulate — silently ignoring is less destructive. */
+  write(..._args) {
+    console.warn('[document.write] not supported — ignored');
+  }
+  writeln(..._args) {
+    console.warn('[document.writeln] not supported — ignored');
+  }
 
   getElementById(id) {
     const want = String(id);
@@ -503,8 +496,6 @@ export class Document extends Node {
   get URL()      { return (globalThis.location && globalThis.location.href) || 'about:blank'; }
   get location() { return globalThis.location; }
 }
-
-/* ---------- serialize (used by innerHTML/outerHTML) ---------- */
 
 function serialize(node) {
   if (node.nodeType === TEXT_NODE) {

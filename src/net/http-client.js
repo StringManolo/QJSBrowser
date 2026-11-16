@@ -3,10 +3,9 @@ import { parseHttpResponse, isRedirect } from 'src/net/http-parser.js';
 
 const MAX_RESPONSE_BYTES = 20 * 1024 * 1024;
 
-/* Async-networking tunables */
-const MAX_BACKGROUND      = 6;        /* concurrent image fetches (documents are never queued) */
-const CONNECT_TIMEOUT_MS  = 20000;    /* DNS + connect + TLS handshake */
-const IDLE_TIMEOUT_MS     = 30000;    /* no bytes moved while sending/receiving */
+const MAX_BACKGROUND      = 6;
+const CONNECT_TIMEOUT_MS  = 20000;
+const IDLE_TIMEOUT_MS     = 30000;
 const DNS_TTL_MS          = 60000;
 const IPV4_RE             = /^\d{1,3}(\.\d{1,3}){3}$/;
 
@@ -85,34 +84,54 @@ function decodeBody(bytes, contentType) {
   return utf8;
 }
 
+function decodeChunked(bytes) {
+  /* RFC 7230 §4.1 happy path: hex size [;extensions] CRLF data CRLF …
+   * until size == 0. Some CDNs (Fastly behind jsdelivr, notably) ignore
+   * `Connection: close` and reply chunked even to HTTP/1.0 requests. */
+  const parts = [];
+  let i = 0;
+  while (i < bytes.length) {
+    let j = i;
+    while (j < bytes.length - 1 && !(bytes[j] === 0x0D && bytes[j + 1] === 0x0A)) j++;
+    if (j >= bytes.length - 1) break;
+    const sizeLine = String.fromCharCode.apply(null, bytes.subarray(i, j));
+    const size = parseInt(sizeLine.split(';')[0].trim(), 16);
+    if (!(size > 0)) break;
+    i = j + 2;
+    parts.push(bytes.subarray(i, i + size));
+    i += size;
+    if (i < bytes.length - 1 && bytes[i] === 0x0D && bytes[i + 1] === 0x0A) i += 2;
+  }
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+
 export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
-  const connections = {};            /* fd  -> job that owns a socket          */
-  const jobs        = new Set();     /* every live job: queued/resolving/open  */
-  let   bgQueue     = [];            /* image jobs waiting for a free slot     */
+  const connections = {};
+  const jobs        = new Set();
+  let   bgQueue     = [];
   let   activeBg    = 0;
-  const closing     = [];            /* fds removed from epoll, closed in tick() */
+  const closing     = [];
   let callbacks = { onStatus(){}, onResponse(){}, onError(){} };
 
   function setCallbacks(cb) { callbacks = { ...callbacks, ...cb }; }
 
-  /* ------------------------------------------------------------------ *
-   * Async DNS. dns.resolve() runs getaddrinfo() in a worker thread and  *
-   * wakes the event loop through dns.fd(), so nothing here ever blocks. *
-   * ------------------------------------------------------------------ */
   const dnsFd = dns.fd();
   net.epoll_ctl(epfd, net.EPOLL_CTL_ADD, dnsFd, net.EPOLLIN);
 
-  const dnsCache   = new Map();      /* host -> { ip, expires }                */
-  const dnsPending = new Map();      /* host -> { id, cbs: [] }  (coalesced)   */
-  const dnsById    = new Map();      /* id   -> host                           */
+  const dnsCache   = new Map();
+  const dnsPending = new Map();
+  const dnsById    = new Map();
 
   function resolveHost(host, cb) {
     if (IPV4_RE.test(host)) { cb(null, host); return; }
     const key = host.toLowerCase();
-
     const hit = dnsCache.get(key);
     if (hit && hit.expires > Date.now()) { cb(null, hit.ip); return; }
-
     let p = dnsPending.get(key);
     if (!p) {
       let id;
@@ -145,18 +164,12 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
     }
   }
 
-  /* ------------------------------------------------------------------ *
-   * Job bookkeeping                                                     *
-   * ------------------------------------------------------------------ */
-
-  /* Build the raw HTTP/1.0 request bytes (as a JS string).
-   * Content-Type/Length are only added when a body is present. */
   function buildRequest(p, cookieHeader, method, body) {
     let req =
       `${method} ${p.path} HTTP/1.0\r\n` +
       `Host: ${p.host}\r\n` +
       `User-Agent: QJSBrowser/0.1\r\n` +
-      `Accept-Encoding: identity\r\n` +
+      `Accept-Encoding: gzip, deflate\r\n` +
       `Connection: close\r\n`;
     if (cookieHeader) req += `Cookie: ${cookieHeader}\r\n`;
     if (body !== null && body !== undefined) {
@@ -168,8 +181,6 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
     return req;
   }
 
-  /* A job leaves the system exactly once: frees its slot, starts the next
-   * queued image. Safe to call repeatedly. */
   function release(job) {
     if (!jobs.delete(job)) return;
     if (job.counted) { job.counted = false; if (job.background) activeBg--; }
@@ -179,14 +190,10 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
   function pump() {
     while (activeBg < MAX_BACKGROUND && bgQueue.length > 0) {
       const job = bgQueue.shift();
-      if (jobs.has(job)) startJob(job);          /* skip jobs aborted while queued */
+      if (jobs.has(job)) startJob(job);
     }
   }
 
-  /* The fd is removed from epoll immediately (no more events) but only
-   * close()d in tick(), after the current batch of events has been handled.
-   * Otherwise a new socket could reuse the same fd number and receive a
-   * stale event that was already returned by epoll_wait for the old one. */
   function closeConnection(fd) {
     const c = connections[fd];
     if (c && c.tlsConn) { try { tls.free(c.tlsConn); } catch (_) {} c.tlsConn = null; }
@@ -206,17 +213,19 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
     try { net.epoll_ctl(epfd, net.EPOLL_CTL_MOD, fd, events); } catch (_) {}
   }
 
-  /* Cancel every request (queued, resolving or open) that belongs to a tab.
-   * No callbacks fire for aborted jobs. */
+  /* Abort everything belonging to a tab. Any pending _promise is rejected
+   * so caller-side chains (e.g. script-runner) can stop quietly. */
   function abortTab(tabId) {
     for (const job of [...jobs]) {
       if (!job.options || job.options.tabId !== tabId) continue;
+      if (job.options._promise) {
+        try { job.options._promise.reject(new Error('aborted')); } catch (_) {}
+      }
       if (job.fd >= 0) closeConnection(job.fd); else release(job);
     }
     bgQueue = bgQueue.filter(j => jobs.has(j));
   }
 
-  /* Called once per event-loop iteration, AFTER the events were handled. */
   function tick() {
     const now = Date.now();
     for (const job of [...jobs]) {
@@ -230,9 +239,6 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
 
   function hasJobs() { return jobs.size > 0; }
 
-  /* ------------------------------------------------------------------ *
-   * Receive buffer: collect chunks, join once (was O(n²) concat)        *
-   * ------------------------------------------------------------------ */
   function appendRecv(c, bytes) {
     c.chunks.push(bytes);
     c.recvLen += bytes.length;
@@ -253,7 +259,6 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
     c.recvLen = c.recvBytes.length;
   }
 
-  /* true when the cap was hit (buffer already trimmed) */
   function capRecv(c) {
     if (c.recvLen <= MAX_RESPONSE_BYTES) return false;
     joinRecv(c);
@@ -263,9 +268,6 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
     return true;
   }
 
-  /* ------------------------------------------------------------------ *
-   * TLS plumbing (unchanged logic)                                      *
-   * ------------------------------------------------------------------ */
   function flushTlsOut(fd, c) {
     for (;;) {
       const chunk = tls.getOutgoing(c.tlsConn);
@@ -340,9 +342,6 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
     }
   }
 
-  /* ------------------------------------------------------------------ *
-   * fetch(): never blocks. queued -> resolving -> connecting -> ...     *
-   * ------------------------------------------------------------------ */
   function fetch(url, options = {}) {
     const p = parseUrl(url);
     if (!p) { callbacks.onError(url, 'Invalid URL', options); return; }
@@ -385,6 +384,14 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
     startJob(job);
   }
 
+  /* Promise wrapper — used by script-runner and (later) window.fetch. */
+  function fetchPromise(url, options) {
+    return new Promise((resolve, reject) => {
+      const opts = { ...(options || {}), _promise: { resolve, reject } };
+      fetch(url, opts);
+    });
+  }
+
   function startJob(job) {
     job.state = 'resolving';
     job.counted = true;
@@ -393,7 +400,7 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
     callbacks.onStatus(job.url, 'Resolving ' + job.parsed.host + '…', job.options);
 
     resolveHost(job.parsed.host, (err, ip) => {
-      if (!jobs.has(job)) return;                 /* aborted or timed out meanwhile */
+      if (!jobs.has(job)) return;
       if (err) { failJob(job, 'DNS failed: ' + job.parsed.host); return; }
       connectJob(job, ip);
     });
@@ -436,9 +443,6 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
     catch (e) { failJob(job, 'epoll_ctl: ' + (e.message || e)); }
   }
 
-  /* ------------------------------------------------------------------ *
-   * Socket events                                                       *
-   * ------------------------------------------------------------------ */
   function onEvent(ev) {
     const fd = ev.fd;
     if (fd === dnsFd) { onDnsReadable(); return; }
@@ -447,7 +451,6 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
     if (!c) return;
     c.lastActivity = Date.now();
 
-    /* connecting */
     if (c.state === 'connecting' && (ev.events & net.EPOLLOUT)) {
       if (!net.is_connected(fd)) {
         closeConnection(fd);
@@ -466,7 +469,6 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
       return;
     }
 
-    /* tls_handshake */
     if (c.state === 'tls_handshake') {
       if (ev.events & net.EPOLLIN) {
         let chunk;
@@ -494,7 +496,6 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
       return;
     }
 
-    /* sending */
     if (c.state === 'sending') {
       if (c.tlsConn) {
         if (ev.events & net.EPOLLIN) {
@@ -522,7 +523,6 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
       return;
     }
 
-    /* receiving */
     if (c.state === 'receiving' && (ev.events & net.EPOLLIN)) {
       let chunk;
       try { chunk = tls.recvBytes(fd, 8192); }
@@ -533,7 +533,6 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
       }
 
       if (chunk === null) {
-        /* EOF — for TLS, drain any remaining plaintext before finalizing */
         if (c.tlsConn) {
           try {
             for (;;) {
@@ -569,7 +568,6 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
     }
   }
 
-
   function processResponse(c) {
     joinRecv(c);
     let sep = -1;
@@ -586,7 +584,13 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
     const contentEncoding = (head.match(/^content-encoding:\s*(.+)$/im) || [])[1] || '';
     let bodyBytes = c.recvBytes.subarray(sep + 4);
 
-    /* Decompress if server ignored Accept-Encoding: identity */
+    /* Un-chunk before content-encoding decompression: content-encoding
+     * is applied *on top of* transfer-encoding. */
+    const transferEncoding = (head.match(/^transfer-encoding:\s*(.+)$/im) || [])[1] || '';
+    if (/\bchunked\b/i.test(transferEncoding) && bodyBytes.length > 0) {
+      bodyBytes = decodeChunked(bodyBytes);
+    }
+
     const enc = contentEncoding.trim().toLowerCase();
     if (enc && enc !== 'identity' && bodyBytes.length > 0) {
       if (enc === 'gzip' || enc === 'x-gzip') {
@@ -619,8 +623,6 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
       for (const sc of resp.setCookies) cookieJar.store(sc, c.url);
     }
 
-    /* ★ Meta-refresh redirect: legacy sites (SMF, phpBB, Drupal, JSP)
-     * return 200 + <meta http-equiv="refresh" content="0;url=/x">. */
     if (!isBinary && bodyBytes.length > 0) {
       const preview = decodeUtf8(bodyBytes.subarray(0, Math.min(bodyBytes.length, 4096)));
       const metaTag = preview.match(/<meta\b[^>]*\bhttp-equiv\s*=\s*["']?\s*refresh\s*["']?[^>]*>/i);
@@ -636,8 +638,6 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
 
           if (c.redirects < 10) {
             callbacks.onStatus(c.url, `Meta refresh → ${target}`, c.options);
-
-            /* Meta refresh after a POST behaves like 303: convert to GET. */
             const nextOpts = {
               ...c.options,
               redirectCount: c.redirects + 1,
@@ -689,6 +689,5 @@ export function createHttpClient(net, epfd, tls, cookieJar, zlib, dns) {
     callbacks.onResponse(c.url, resp, c.options);
   }
 
-
-  return { fetch, onEvent, setCallbacks, abortTab, tick, hasJobs };
+  return { fetch, fetchPromise, onEvent, setCallbacks, abortTab, tick, hasJobs };
 }

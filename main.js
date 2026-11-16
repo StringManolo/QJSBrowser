@@ -123,17 +123,12 @@ function closeConsoleAndRedraw() {
 }
 
 function routeInput() {
-  /* Console owns the keyboard while visible. */
   if (devConsole.isVisible()) {
     let ch;
     while ((ch = tui.getch()) !== tui.ERR) {
       devConsole.handleKey(ch);
       if (!devConsole.isVisible()) { redrawAfterConsoleClosed(); return; }
     }
-    /* End of stdin batch. If Enter was pressed mid-batch and no further
-     * bytes arrived, this is a typed submission → run it. If bytes did
-     * arrive, handleKey already reinserted the suppressed newline and
-     * cleared pendingRun, so this is a no-op for pastes. */
     devConsole.flushPending();
     return;
   }
@@ -201,7 +196,7 @@ httpClient.setCallbacks({
         controller.handleResponse(opts && opts.tabId, url, resp, opts || {});
       } catch (e) {
         console.log('[onResponse] ' + (e.message || String(e)));
-        try { controller.handleError(opts && opts.tabId, url, e.message || String(e)); }
+        try { controller.handleError(opts && opts.tabId, url, e.message || String(e), opts); }
         catch (_) {}
       }
     };
@@ -211,7 +206,7 @@ httpClient.setCallbacks({
   },
   onError: (url, msg, opts) => {
     if (opts && opts.imageFor) return;
-    try { controller.handleError(opts && opts.tabId, url, msg); }
+    try { controller.handleError(opts && opts.tabId, url, msg, opts); }
     catch (e) { console.log('[onError] ' + (e.message || String(e))); }
   },
 });

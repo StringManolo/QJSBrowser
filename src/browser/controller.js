@@ -1,7 +1,8 @@
 import { parseUrl }       from 'src/base/url.js';
 import { htmlToDom }      from 'src/content/html-to-dom.js';
 import { domToText }      from 'src/content/dom-to-text.js';
-import { resetDocument }  from 'src/browser/dom-globals.js';
+import { runScripts }     from 'src/content/script-runner.js';
+import { resetDocument, setReadyState } from 'src/browser/dom-globals.js';
 import { setMutationHook, beginMutationBatch, endMutationBatch } from 'src/dom/mutation-hook.js';
 import { drawWindow }     from 'src/ui/window.js';
 import { createToolbar }  from 'src/ui/toolbar.js';
@@ -31,23 +32,13 @@ export function createController(deps) {
 
   const dialog = createSettingsDialog(
     tui, theme, settings, cookieJar, tabManager,
-    () => {
-      for (const t of tabManager.list()) t.history.clear();
-    },
+    () => { for (const t of tabManager.list()) t.history.clear(); },
     deps.onToggleConsole || null
   );
 
   let running = true;
-
-  /* Which tab owns the current DOM tree. Only the active tab in this
-   * state is allowed to re-serialize the DOM — prevents a background tab
-   * from rendering someone else's page into its own pageView. */
   let domOwner = { tabId: null, navId: 0 };
 
-  /* Mutation hook: DOM changed → mark the owning tab dirty, schedule a
-   * render. If the active tab doesn't own the DOM, ignore — the mutation
-   * is happening for a background page whose pageView will be rebuilt the
-   * next time it navigates. */
   setMutationHook(() => {
     const tab = tabManager.active();
     if (!tab) return;
@@ -66,10 +57,6 @@ export function createController(deps) {
   }
   function flushRender() {
     if (!(dirty && Date.now() - lastRender >= MIN_RENDER_MS)) return;
-
-    /* If the active tab owns the DOM and has pending mutations,
-     * re-serialize before painting. Cheap: only runs on frames where a
-     * mutation actually happened. */
     const tab = tabManager.active();
     if (tab && tab.domDirty && domOwner.tabId === tab.id && domOwner.navId === tab.navId) {
       refreshTabFromDom(tab);
@@ -79,15 +66,9 @@ export function createController(deps) {
     render();
   }
 
-  /* Re-serialize document.body into the tab's pageView.
-   *
-   * Preserves: form values (by name+kind), cursor position, focused field.
-   * Loses: anything set via .value that isn't mirrored in the DOM tree
-   * (RARE — controlled inputs will be re-synced by the app). */
   function refreshTabFromDom(tab) {
     tab.domDirty = false;
 
-    /* Snapshot form values + focus by (name, kind). */
     const formSnapshot = new Map();
     for (const el of tab.formState.elements.values()) {
       if (el.name && (el.kind === 'text' || el.kind === 'password' || el.kind === 'textarea')) {
@@ -105,7 +86,6 @@ export function createController(deps) {
     );
     tab.pageView.updateContent(parsed.segments, parsed.links);
 
-    /* Restore form values by name+kind. */
     for (const el of tab.formState.elements.values()) {
       if (el.name && (el.kind === 'text' || el.kind === 'password' || el.kind === 'textarea')) {
         const key = el.name + '|' + el.kind;
@@ -113,7 +93,6 @@ export function createController(deps) {
       }
     }
 
-    /* Restore focus + cursor. */
     if (focusName) {
       for (const [id, el] of tab.formState.elements) {
         if (el.name === focusName && el.kind === focusKind) {
@@ -521,7 +500,11 @@ export function createController(deps) {
     if (tab === tabManager.active()) requestRender();
   }
 
-  function handleError(tabId, url, msg) {
+  function handleError(tabId, url, msg, opts) {
+    if (opts && opts._promise) {
+      try { opts._promise.reject(new Error(msg)); } catch (_) {}
+      return;
+    }
     const tab = resolveTab(tabId);
     if (!tab) return;
     tab.loading = false;
@@ -530,7 +513,42 @@ export function createController(deps) {
     if (tab === tabManager.active()) render();
   }
 
+  /* Run scripts + fire DOMContentLoaded + load. Bails out silently on
+   * navigation (navId changes while scripts are still executing). */
+  function executePageScripts(tab, scripts, url) {
+    const startNavId = tab.navId;
+    const isStale = () => tab.navId !== startNavId;
+
+    setReadyState('interactive');
+
+    runScripts(scripts, { tab, url, httpClient })
+      .then(() => {
+        if (isStale()) return;
+        try {
+          globalThis.document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
+        } catch (e) { console.error('[DOMContentLoaded] ' + e); }
+        return new Promise(r => setTimeout(r, 0));
+      })
+      .then(() => {
+        if (isStale()) return;
+        setReadyState('complete');
+        try {
+          globalThis.dispatchEvent(new Event('load'));
+        } catch (e) { console.error('[load] ' + e); }
+      })
+      .catch((e) => {
+        if (!isStale()) console.error('[execute-page-scripts] ' + (e && e.stack || String(e)));
+      });
+  }
+
   function handleResponse(tabId, url, resp, options) {
+    /* Promise wrapper intercept: script-runner and future window.fetch
+     * resolve here instead of going through the page-render path. */
+    if (options && options._promise) {
+      try { options._promise.resolve({ url, resp, options }); } catch (_) {}
+      return;
+    }
+
     if (options && options.binary && options.imageFor) {
       const tab = tabManager.getById(options.imageFor);
       if (!tab) return;
@@ -587,13 +605,14 @@ export function createController(deps) {
     if (looksHtml) {
       tab.formState.reset();
 
-      /* Batch: the parse does thousands of mutations; notify once at the end. */
       let css = [];
+      let scripts = [];
       beginMutationBatch();
       try {
         resetDocument();
         const result = htmlToDom(resp.body, url, globalThis.document);
         css = result.css;
+        scripts = result.scripts;
         domOwner = { tabId: tab.id, navId: tab.navId };
       } finally {
         endMutationBatch();
@@ -621,10 +640,22 @@ export function createController(deps) {
           });
         }
       }
+
+      /* Kick off script execution. Async — this function returns while
+       * scripts still run. DOMContentLoaded and load fire from inside. */
+      if (scripts.length > 0) executePageScripts(tab, scripts, url);
+      else {
+        setReadyState('interactive');
+        setTimeout(() => {
+          if (tab.navId !== domOwner.navId) return;
+          try { globalThis.document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true })); } catch (_) {}
+          setReadyState('complete');
+          try { globalThis.dispatchEvent(new Event('load')); } catch (_) {}
+        }, 0);
+      }
     } else {
       tab.pageView.setContent(resp.body, []);
       plainLen = resp.body.length;
-      /* Non-HTML content doesn't own the DOM tree. */
       domOwner = { tabId: null, navId: 0 };
     }
 

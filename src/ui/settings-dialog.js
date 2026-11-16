@@ -2,7 +2,7 @@ import { drawWindow } from 'src/ui/window.js';
 
 export function createSettingsDialog(
   tui, theme, settings, cookieJar, tabManager,
-  onClearHistory, onToggleConsole
+  onClearHistory, onToggleConsole, onStatus
 ) {
   let open = false;
   let cursor = 0;
@@ -34,15 +34,29 @@ export function createSettingsDialog(
         get: () => settings.get('acceptCookies'),
         set: (v) => settings.set('acceptCookies', v),
       },
+
       {
-        id: 'clearCookies', label: 'Clear cookies', type: 'action',
-        action: () => { cookieJar.clear(); },
-        suffix: () => `(${cookieJar.size})`,
-      },
-      {
-        id: 'clearHistory', label: 'Clear history', type: 'action',
-        action: () => { if (onClearHistory) onClearHistory(); },
-      },
+  id: 'clearCookies', label: 'Clear cookies', type: 'action',
+  action: () => {
+    const n = cookieJar.size;
+    cookieJar.clear();
+    if (onStatus) onStatus(n > 0
+      ? `Cookies cleared (${n})`
+      : 'No cookies to clear');
+  },
+  suffix: () => `(${cookieJar.size})`,
+},
+{
+  id: 'clearHistory', label: 'Clear history', type: 'action',
+  action: () => {
+    const n = onClearHistory ? onClearHistory() : 0;
+    if (onStatus) onStatus(n > 0
+      ? `History cleared (${n} entries)`
+      : 'History was empty');
+  },
+},
+
+
       {
         id: 'console', label: 'Developer Console', type: 'action',
         action: () => {

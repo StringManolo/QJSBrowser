@@ -32,10 +32,24 @@ export function createController(deps) {
   const tabBar  = createTabBar(tui, theme);
 
   const dialog = createSettingsDialog(
-    tui, theme, settings, cookieJar, tabManager,
-    () => { for (const t of tabManager.list()) t.history.clear(); },
-    deps.onToggleConsole || null
-  );
+  tui, theme, settings, cookieJar, tabManager,
+  () => {
+    let total = 0;
+    for (const t of tabManager.list()) {
+      total += t.history.length;
+      t.history.clear();
+    }
+    return total;
+  },
+  deps.onToggleConsole || null,
+  (msg) => {
+    const tab = tabManager.active();
+    if (!tab) return;
+    tab.statusText = msg;
+    requestRender();
+  }
+);
+
 
   if (!globalThis.fetch) {
     globalThis.fetch = (input, init) => {

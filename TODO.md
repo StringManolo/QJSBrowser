@@ -20,3 +20,5 @@
 - Add svg support with nanosvg.h
 - Search from omnibox
 - Add cache
+- Add mouse support to the console
+- Improve console UI

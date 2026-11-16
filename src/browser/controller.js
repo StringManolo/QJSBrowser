@@ -2,6 +2,7 @@ import { parseUrl }       from 'src/base/url.js';
 import { htmlToDom }      from 'src/content/html-to-dom.js';
 import { domToText }      from 'src/content/dom-to-text.js';
 import { resetDocument }  from 'src/browser/dom-globals.js';
+import { setMutationHook, beginMutationBatch, endMutationBatch } from 'src/dom/mutation-hook.js';
 import { drawWindow }     from 'src/ui/window.js';
 import { createToolbar }  from 'src/ui/toolbar.js';
 import { createTabBar }   from 'src/ui/tab-bar.js';
@@ -31,7 +32,6 @@ export function createController(deps) {
   const dialog = createSettingsDialog(
     tui, theme, settings, cookieJar, tabManager,
     () => {
-      /* Clear history in every open tab */
       for (const t of tabManager.list()) t.history.clear();
     },
     deps.onToggleConsole || null
@@ -39,11 +39,23 @@ export function createController(deps) {
 
   let running = true;
 
-  /* Throttled rendering. Network progress (status text, finished images) only
-   * marks the screen dirty; the main loop repaints at most every
-   * MIN_RENDER_MS. Without this, every 8 KB chunk of every connection forced
-   * a full-screen redraw and starved keyboard input. Direct user input still
-   * renders immediately. */
+  /* Which tab owns the current DOM tree. Only the active tab in this
+   * state is allowed to re-serialize the DOM — prevents a background tab
+   * from rendering someone else's page into its own pageView. */
+  let domOwner = { tabId: null, navId: 0 };
+
+  /* Mutation hook: DOM changed → mark the owning tab dirty, schedule a
+   * render. If the active tab doesn't own the DOM, ignore — the mutation
+   * is happening for a background page whose pageView will be rebuilt the
+   * next time it navigates. */
+  setMutationHook(() => {
+    const tab = tabManager.active();
+    if (!tab) return;
+    if (domOwner.tabId !== tab.id || domOwner.navId !== tab.navId) return;
+    tab.domDirty = true;
+    requestRender();
+  });
+
   const MIN_RENDER_MS = 60;
   let dirty = false;
   let lastRender = 0;
@@ -53,10 +65,66 @@ export function createController(deps) {
     return Math.max(0, lastRender + MIN_RENDER_MS - Date.now());
   }
   function flushRender() {
-    if (dirty && Date.now() - lastRender >= MIN_RENDER_MS) render();
+    if (!(dirty && Date.now() - lastRender >= MIN_RENDER_MS)) return;
+
+    /* If the active tab owns the DOM and has pending mutations,
+     * re-serialize before painting. Cheap: only runs on frames where a
+     * mutation actually happened. */
+    const tab = tabManager.active();
+    if (tab && tab.domDirty && domOwner.tabId === tab.id && domOwner.navId === tab.navId) {
+      refreshTabFromDom(tab);
+    } else if (tab) {
+      tab.domDirty = false;
+    }
+    render();
   }
 
-  /* A result is stale if its tab was closed or navigated elsewhere meanwhile */
+  /* Re-serialize document.body into the tab's pageView.
+   *
+   * Preserves: form values (by name+kind), cursor position, focused field.
+   * Loses: anything set via .value that isn't mirrored in the DOM tree
+   * (RARE — controlled inputs will be re-synced by the app). */
+  function refreshTabFromDom(tab) {
+    tab.domDirty = false;
+
+    /* Snapshot form values + focus by (name, kind). */
+    const formSnapshot = new Map();
+    for (const el of tab.formState.elements.values()) {
+      if (el.name && (el.kind === 'text' || el.kind === 'password' || el.kind === 'textarea')) {
+        formSnapshot.set(el.name + '|' + el.kind, el.value);
+      }
+    }
+    const focused = tab.formState.getFocused();
+    const focusName    = focused ? focused.name : null;
+    const focusKind    = focused ? focused.kind : null;
+    const focusCursor  = focused ? tab.formState.cursorPos() : 0;
+
+    tab.formState.reset();
+    const parsed = domToText(
+      globalThis.document.body, tab.currentUrl, theme, tab.formState, tab._css || []
+    );
+    tab.pageView.updateContent(parsed.segments, parsed.links);
+
+    /* Restore form values by name+kind. */
+    for (const el of tab.formState.elements.values()) {
+      if (el.name && (el.kind === 'text' || el.kind === 'password' || el.kind === 'textarea')) {
+        const key = el.name + '|' + el.kind;
+        if (formSnapshot.has(key)) el.value = formSnapshot.get(key);
+      }
+    }
+
+    /* Restore focus + cursor. */
+    if (focusName) {
+      for (const [id, el] of tab.formState.elements) {
+        if (el.name === focusName && el.kind === focusKind) {
+          tab.formState.focus(id);
+          tab.formState.moveCursorTo(focusCursor);
+          break;
+        }
+      }
+    }
+  }
+
   function isStale(options) {
     if (!options || options.navId === undefined) return false;
     const t = tabManager.getById(options.tabId);
@@ -124,7 +192,6 @@ export function createController(deps) {
       tui.printPair(stY, 1, line, P.status);
     }
 
-    /* Settings dialog overlay */
     dialog.render(rows, cols);
 
     let cursorY = rows - 1, cursorX = 0;
@@ -148,7 +215,6 @@ export function createController(deps) {
       if (ch === keys.CTRL_C) { running = false; return; }
       if (ch === keys.KEY_MOUSE) { handleMouse(); continue; }
 
-      /* Settings dialog captures ALL keys while open */
       if (dialog.isOpen()) {
         dialog.handleKey(ch, keys);
         continue;
@@ -185,7 +251,6 @@ export function createController(deps) {
     if (res && res.submitted) {
       const url = res.submitted;
       if (url.length) {
-        /* If it's not a URL but a search query, use the default search engine */
         if (!/^(https?:\/\/|localhost|\d+\.\d+\.\d+\.\d+)/i.test(url) &&
             !/^[\w-]+\.[\w.-]+/.test(url)) {
           const engine = settings.SEARCH_ENGINES[settings.get('searchEngine')]
@@ -258,7 +323,6 @@ export function createController(deps) {
     const pageH = rows - 7;
     const tab = tabManager.active();
 
-    /* Dialog captures all clicks while open */
     if (dialog.isOpen()) {
       if (bstate & (tui.BUTTON1_CLICKED | tui.BUTTON1_PRESSED)) {
         dialog.handleMouseClick(x, y);
@@ -405,7 +469,6 @@ export function createController(deps) {
       tab.statusText = 'Unsupported scheme: ' + p.scheme + '://';
       render(); return;
     }
-    /* Whatever this tab was still loading (old page, its images) is obsolete */
     httpClient.abortTab(tab.id);
     tab.navId++;
 
@@ -413,6 +476,7 @@ export function createController(deps) {
     tab.loading = true;
     tab.formState.blur();
     tab.formState.reset();
+    tab.domDirty = false;
     tab.omnibox.setText(url);
     tab.pageView.setContent('Loading ' + url + ' …', []);
     httpClient.fetch(url, { ...options, tabId: tab.id, navId: tab.navId });
@@ -522,9 +586,22 @@ export function createController(deps) {
 
     if (looksHtml) {
       tab.formState.reset();
-      resetDocument();
-      const { css } = htmlToDom(resp.body, url, globalThis.document);
+
+      /* Batch: the parse does thousands of mutations; notify once at the end. */
+      let css = [];
+      beginMutationBatch();
+      try {
+        resetDocument();
+        const result = htmlToDom(resp.body, url, globalThis.document);
+        css = result.css;
+        domOwner = { tabId: tab.id, navId: tab.navId };
+      } finally {
+        endMutationBatch();
+      }
+
+      tab._css = css;
       const parsed = domToText(globalThis.document.body, url, theme, tab.formState, css);
+      tab.domDirty = false;
       tab.pageView.setContent(parsed.segments, parsed.links);
       plainLen = parsed.text.length;
       linksCount = parsed.links.length;
@@ -534,7 +611,7 @@ export function createController(deps) {
         const requested = new Set();
         for (const img of parsed.images) {
           if (imageView.has(img.src)) continue;
-          if (requested.has(img.src)) continue;       /* same image used twice */
+          if (requested.has(img.src)) continue;
           if (/\.svg(\?|#|$)/i.test(img.src)) continue;
           requested.add(img.src);
           httpClient.fetch(img.src, {
@@ -547,13 +624,14 @@ export function createController(deps) {
     } else {
       tab.pageView.setContent(resp.body, []);
       plainLen = resp.body.length;
+      /* Non-HTML content doesn't own the DOM tree. */
+      domOwner = { tabId: null, navId: 0 };
     }
 
     tab.statusText = `HTTP ${resp.status} ${resp.statusText} — ${plainLen} chars, ${linksCount} links, ${imagesCount} images`;
     if (tab === tabManager.active()) render();
   }
 
-  /* Initial tab follows homepage setting */
   const initial = tabManager.active();
   if (initial) {
     const home = settings.get('homepage');

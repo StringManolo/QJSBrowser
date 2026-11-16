@@ -18,6 +18,19 @@ export function createPageView(tui, theme, imageView, formState) {
     cachedLines = null;
   }
 
+  /* Same as setContent but keeps scrollY (clamped to the new maxScroll on
+   * the next render). Used by dom-live-render: mutating the DOM must not
+   * yank the user back to the top. */
+  function updateContent(segmentsOrText, newLinks) {
+    if (typeof segmentsOrText === 'string') {
+      segments = segmentsOrText.length > 0 ? [{ text: segmentsOrText }] : [{ text: '' }];
+    } else {
+      segments = (segmentsOrText && segmentsOrText.length > 0) ? segmentsOrText : [{ text: '' }];
+    }
+    links = newLinks || [];
+    cachedLines = null;
+  }
+
   function invalidate() { cachedLines = null; }
 
   function pairIdFor(seg) {
@@ -42,7 +55,6 @@ export function createPageView(tui, theme, imageView, formState) {
     let col = 0;
 
     const focusedId = formState ? formState.focusedIdOf() : null;
-
     for (const seg of segments) {
       /* Image */
       if (seg.type === 'img') {
@@ -159,7 +171,7 @@ export function createPageView(tui, theme, imageView, formState) {
   }
 
   return {
-    setContent, render, scroll, maxScroll, lineAt, invalidate,
+    setContent, updateContent, render, scroll, maxScroll, lineAt, invalidate,
     get links() { return links; },
     get scrollY() { return scrollY; },
     get segments() { return segments; },

@@ -28,3 +28,4 @@
 - Arreglar los select
 - Save TUI state when terminal on the background
 - control + C should also close the console
+- PRIORITY 1: Check why webs like wikipedia or blog.elhacker.net take so long to load (high CPU usage)

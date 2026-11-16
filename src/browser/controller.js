@@ -1,5 +1,7 @@
 import { parseUrl }       from 'src/base/url.js';
-import { htmlToText }     from 'src/content/html-to-text.js';
+import { htmlToDom }      from 'src/content/html-to-dom.js';
+import { domToText }      from 'src/content/dom-to-text.js';
+import { resetDocument }  from 'src/browser/dom-globals.js';
 import { drawWindow }     from 'src/ui/window.js';
 import { createToolbar }  from 'src/ui/toolbar.js';
 import { createTabBar }   from 'src/ui/tab-bar.js';
@@ -520,7 +522,9 @@ export function createController(deps) {
 
     if (looksHtml) {
       tab.formState.reset();
-      const parsed = htmlToText(resp.body, url, theme, tab.formState);
+      resetDocument();
+      const { css } = htmlToDom(resp.body, url, globalThis.document);
+      const parsed = domToText(globalThis.document.body, url, theme, tab.formState, css);
       tab.pageView.setContent(parsed.segments, parsed.links);
       plainLen = parsed.text.length;
       linksCount = parsed.links.length;

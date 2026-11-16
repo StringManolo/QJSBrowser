@@ -4,30 +4,39 @@
  *
  * 1. Whitespace-only text nodes with newlines are skipped. Pretty-printed
  *    HTML inserts '\n    ' between tags. Browsers collapse those to
- *    nothing between blocks. Our naive replace(/[ \t]+/, ' ') did not
- *    touch '\n', so each became a line break — the ~20 blank lines
- *    above the navbar on stringmanolo.qzz.io.
+ *    nothing between blocks. Without this, each becomes a line break —
+ *    the ~20 blank lines above the navbar on stringmanolo.qzz.io.
  *
  * 2. position:fixed subtrees skipped entirely.
  *
- * 3. display:flex/grid on the parent suppresses block-break for its
- *    direct children (so e.g. the theme toggle stays on the nav line).
+ * 3. Flex/grid row containers: only <div> becomes inline. This keeps
+ *    the stringmanolo nav (div.links + button.theme) on one line, but
+ *    leaves <h1>/<h2>/<p> as blocks even when their parent is flex —
+ *    without that, Google consent's button + heading + paragraph
+ *    glued together into one line. flex-direction: column disables
+ *    even the div exception (children stack vertically).
  *
- * 4. Horizontal rules only for EXPLICIT border-top / border-bottom.
- *    The `border` shorthand is a box border (buttons, inputs, cards)
- *    and must NOT emit an HR — before this fix, every bordered box
- *    emitted TWO bars (one on enter, one on exit), turning Google's
- *    consent page into a wall of ─────.
+ * 4. Table layout. <tr> block-breaks before/after (one row per line).
+ *    <td>/<th> emit " │ " separator between cells (first cell of a row
+ *    emits nothing). Without this, "Nombre del foroTemasMensajesÚltimo
+ *    mensaje" glued together — table headers rendered as one text run.
  *
- * 5. HR width comes from opts.width (the page column width). On resize,
+ * 5. Horizontal rules only for EXPLICIT border-top / border-bottom. The
+ *    `border` shorthand is a box border (buttons, inputs, cards) and
+ *    must NOT emit an HR — earlier, every bordered box emitted TWO
+ *    bars, turning Google's consent page into a wall of ─────.
+ *
+ * 6. HR width comes from opts.width (page column width). On resize,
  *    the controller re-serializes so bars match the new width.
- *
- * 6. Duplicate HRs are collapsed: if between the previous bar and the
- *    current exit there's only whitespace, skip. Nested bordered divs
- *    or sibling empty bordered divs produce one bar, not N.
  *
  * 7. ANSI-color blacklist: dark CSS colors replaced by theme page color
  *    so #333 text on black terminal is readable; blue links survive.
+ *
+ * Click-through: pageView.lineAt() rebuilds segments and drops custom
+ * properties (elementId, _node). Only linkN survives. For text inside
+ * an ancestor with React onClick we register a synthetic link
+ * ({n, href:null, node}) and set linkN — the click handler dispatches
+ * a real DOM click on `node`, which bubbles to the React onClick.
  */
 
 import { resolveUrl } from 'src/base/url.js';
@@ -41,13 +50,13 @@ const BLOCK_TAGS = ['p','div','h1','h2','h3','h4','h5','h6',
                     'blockquote','pre','ul','ol','table','form',
                     'article','section','header','footer','main',
                     'nav','aside','figure','figcaption','details',
-                    'summary','fieldset','address'];
+                    'summary','fieldset','address',
+                    'table','thead','tbody','tfoot','caption'];
 const INLINE_BG_TAGS = new Set(['code','kbd','samp','mark','pre']);
 const TEXT_INPUT_TYPES = new Set(['text','email','tel','url','number','search','password']);
 const CLICKABLE_KINDS = new Set(['submit', 'reset', 'button']);
-const SKIP_SUBTREE_TAGS = new Set(['style','script','title','noscript','template']);
+const SKIP_SUBTREE_TAGS = new Set(['style','script','title','noscript','template','colgroup','col']);
 const REACT_CLICK_MAX_DEPTH = 6;
-const FLEX_GRID_DISPLAYS = new Set(['flex','inline-flex','grid','inline-grid']);
 const MIN_HR_WIDTH = 20;
 
 function parseDim(v) {
@@ -94,11 +103,6 @@ function isInvisibleOnBlack(idx) {
   return false;
 }
 
-/* Explicit border-top / border-bottom ONLY. The `border` shorthand is a
- * box (button, input, card) — not a separator. Before dropping the
- * fallback, every bordered button emitted two bars (one on enter for
- * border-top, one on exit for border-bottom) — that was the wall of
- * ───── on Google's consent page. */
 function hasVisibleBorder(decls, side) {
   const val = decls['border-' + side];
   if (!val) return false;
@@ -218,6 +222,7 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap, op
     }
 
     if (tag === 'ol') entry.count = 0;
+    if (tag === 'tr') entry.cellCount = 0;
 
     if (tag === 'button' || tag === 'select') {
       entry.classes = new Set();
@@ -275,19 +280,12 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap, op
   }
 
   function emitHorizontalRule() {
-    /* Dedupe: walk back through whitespace-only segments. If we hit
-     * another bar before hitting real content, skip. Collapses:
-     *   - nested bordered divs (child + parent both emit on exit)
-     *   - sibling empty bordered divs (two separators, one gap)
-     *   - bar followed by a block-break followed by another bar
-     * into a single visible line. */
     for (let i = segments.length - 1; i >= 0; i--) {
       const s = segments[i];
       if (s._isHr) return;
       const t = s.text || '';
       if (t && /[^\s]/.test(t)) break;
     }
-
     while (segments.length > 0) {
       const last = segments[segments.length - 1];
       if (last.text && last.text.endsWith('\n\n') && !last.linkN) {
@@ -580,14 +578,23 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap, op
       return;
     }
 
-    /* Flex/grid item → no block-break (theme toggle stays inline). */
-    let inFlexGrid = false;
+    /* Flex/grid row container: only <div> becomes inline. This keeps the
+     * stringmanolo nav (div + button) on one line, but leaves <h1>/<p>
+     * as blocks even when their parent is flex — without that, Google
+     * consent's button + heading + paragraph glued together on one line.
+     * flex-direction: column disables even the div exception. */
+    let inHorizontalFlow = false;
     if (_stack.length > 0) {
       const parentDecls = computeDecls();
       const parentDisplay = String(parentDecls['display'] || '').toLowerCase();
-      if (FLEX_GRID_DISPLAYS.has(parentDisplay)) inFlexGrid = true;
+      const parentDir = String(parentDecls['flex-direction'] || '').toLowerCase();
+      const isFlex = parentDisplay === 'flex' || parentDisplay === 'inline-flex';
+      const isGrid = parentDisplay === 'grid' || parentDisplay === 'inline-grid';
+      const rowDir = !parentDir || parentDir === 'row' || parentDir === 'row-reverse';
+      if ((isFlex && rowDir) || isGrid) inHorizontalFlow = true;
     }
-    const shouldBlock = BLOCK_TAGS.includes(tag) && !inFlexGrid;
+    const shouldBlock = BLOCK_TAGS.includes(tag) &&
+                        !(inHorizontalFlow && tag === 'div');
 
     if (shouldBlock) emitBlockBreak(tag);
     const entry = makeEntry(node);
@@ -643,6 +650,38 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap, op
     if (tag === 'img') { pushImage(node); return; }
     if (tag === 'input') { enterInput(node); return; }
     if (tag === 'svg') { pushSvg(node); return; }
+
+    /* Table row: one line per row. Cells inside emit " │ " separators
+     * via the special-case below. This fixes the "Nombre del
+     * foroTemasMensajesÚltimo mensaje" gluing on forums. */
+    if (tag === 'tr') {
+      emitBlockBreak('tr');
+      const entry = makeEntry(node);
+      entry.cellCount = 0;
+      _stack.push(entry);
+      for (const c of node.childNodes) walk(c);
+      _stack.pop();
+      emitBlockBreak('tr');
+      return;
+    }
+
+    /* Table cell: emit " │ " separator before (except the first cell of
+     * the row), then walk children normally. If the cell contains block
+     * content (e.g. an <img> + text), the block children will break
+     * naturally — the cell separator is inserted before all of it. */
+    if (tag === 'td' || tag === 'th') {
+      const parent = _stack[_stack.length - 1];
+      if (parent && parent.tag === 'tr') {
+        if (parent.cellCount > 0) {
+          segments.push({ text: ' │ ', linkN: null });
+        }
+        parent.cellCount++;
+      }
+      _stack.push(makeEntry(node));
+      for (const c of node.childNodes) walk(c);
+      _stack.pop();
+      return;
+    }
 
     if (tag === 'option') {
       enterOption(node);

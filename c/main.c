@@ -65,6 +65,59 @@ static JSValue js_console_log(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* Drain QuickJS microtasks (promise callbacks) from the event loop.
+ * Without this, any `await` or `.then()` scheduled by page JS never runs.
+ * Capped at `max` jobs so a runaway promise chain cannot starve the TUI. */
+static JSValue js_pump_jobs(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv) {
+    (void)this_val;
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    int max = 1000;
+    if (argc > 0) {
+        int32_t n;
+        if (JS_ToInt32(ctx, &n, argv[0]) == 0 && n > 0) max = n;
+    }
+    JSContext *c;
+    int n = 0;
+    while (n < max) {
+        int ret = JS_ExecutePendingJob(rt, &c);
+        if (ret == 0) break;
+        if (ret < 0) {
+            /* Never fprintf to stderr here: ncurses owns the terminal and
+             * raw bytes desync its model of the physical screen. Accumulate
+             * the message in a global the JS side drains after each pump. */
+            JSValue exc = JS_GetException(ctx);
+            const char *s = JS_ToCString(ctx, exc);
+            JSValue global = JS_GetGlobalObject(ctx);
+            JSValue prev = JS_GetPropertyStr(ctx, global, "_lastPumpError");
+            const char *prevS = NULL;
+            if (!JS_IsUndefined(prev) && !JS_IsNull(prev))
+                prevS = JS_ToCString(ctx, prev);
+            const char *msg = s ? s : "(exception)";
+            if (prevS && prevS[0]) {
+                size_t len = strlen(prevS) + strlen(msg) + 2;
+                char *buf = malloc(len);
+                if (buf) {
+                    snprintf(buf, len, "%s\n%s", prevS, msg);
+                    JS_SetPropertyStr(ctx, global, "_lastPumpError",
+                                      JS_NewString(ctx, buf));
+                    free(buf);
+                }
+            } else {
+                JS_SetPropertyStr(ctx, global, "_lastPumpError",
+                                  JS_NewString(ctx, msg));
+            }
+            if (prevS) JS_FreeCString(ctx, prevS);
+            if (s) JS_FreeCString(ctx, s);
+            JS_FreeValue(ctx, prev);
+            JS_FreeValue(ctx, global);
+            JS_FreeValue(ctx, exc);
+        }
+        n++;
+    }
+    return JS_NewInt32(ctx, n);
+}
+
 static JSModuleDef *browser_module_loader(JSContext *ctx,
                                           const char *module_name,
                                           void *opaque) {
@@ -132,6 +185,8 @@ int main(int argc, char **argv) {
     JS_SetPropertyStr(ctx, console, "error",
         JS_NewCFunction(ctx, js_console_log, "error", 1));
     JS_SetPropertyStr(ctx, global, "console", console);
+    JS_SetPropertyStr(ctx, global, "pumpJobs",
+        JS_NewCFunction(ctx, js_pump_jobs, "pumpJobs", 1));
     JS_FreeValue(ctx, global);
 
     Registry reg = {0};

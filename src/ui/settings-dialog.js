@@ -1,6 +1,9 @@
 import { drawWindow } from 'src/ui/window.js';
 
-export function createSettingsDialog(tui, theme, settings, cookieJar, tabManager, onClearHistory) {
+export function createSettingsDialog(
+  tui, theme, settings, cookieJar, tabManager,
+  onClearHistory, onToggleConsole
+) {
   let open = false;
   let cursor = 0;
   let view = 'settings';   /* 'settings' | 'about' */
@@ -39,6 +42,14 @@ export function createSettingsDialog(tui, theme, settings, cookieJar, tabManager
       {
         id: 'clearHistory', label: 'Clear history', type: 'action',
         action: () => { if (onClearHistory) onClearHistory(); },
+      },
+      {
+        id: 'console', label: 'Developer Console', type: 'action',
+        action: () => {
+          /* Close the dialog first so the console opens onto a clean screen. */
+          open = false;
+          if (onToggleConsole) onToggleConsole();
+        },
       },
       {
         id: 'about', label: 'About QJSBrowser', type: 'action',
@@ -126,7 +137,7 @@ export function createSettingsDialog(tui, theme, settings, cookieJar, tabManager
     const hit = hitTest(mx, my);
     if (!hit) return { action: 'noop' };
     cursor = hit.index;
-    return handleKey(10, {});   /* simulate Enter */
+    return handleKey(10, {});
   }
 
   function render(rows, cols) {
@@ -193,7 +204,6 @@ export function createSettingsDialog(tui, theme, settings, cookieJar, tabManager
       itemRects.push({ x: x + 1, y: rowY, w: w - 2 });
     }
 
-    /* Hint at bottom */
     const hint = ' ↑/↓ move · Enter select · Esc close ';
     if (h >= 3) {
       const hy = y + h - 1;

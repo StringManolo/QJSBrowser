@@ -21,7 +21,7 @@ OPENSSL_LIBS   := $(shell pkg-config --libs   openssl 2>/dev/null || echo -lssl 
 
 APP_CFLAGS := -Wall -Wextra -Wno-unused-parameter -O2 -fPIC -I$(QJS) -I.
 
-all: qjsbrowser lib/tui.so lib/network_sockets.so lib/tls.so lib/image.so lib/zlib.so lib/fs.so
+all: qjsbrowser lib/tui.so lib/network_sockets.so lib/tls.so lib/image.so lib/zlib.so lib/fs.so lib/dns.so
 
 # ---------------- QuickJS ----------------
 $(QJS)/quickjs.c:
@@ -75,9 +75,13 @@ lib/fs.so: c/fs.c $(QJS)/quickjs.c
 	@mkdir -p lib
 	$(CC) $(APP_CFLAGS) -shared -o $@ c/fs.c
 
+lib/dns.so: c/dns.c $(QJS)/quickjs.c
+	@mkdir -p lib
+	$(CC) $(APP_CFLAGS) -shared -o $@ c/dns.c -lpthread
+
 # ---------------- limpieza ----------------
 clean:
-	rm -f qjsbrowser lib/tui.so lib/network_sockets.so lib/tls.so lib/image.so lib/zlib.so lib/fs.so
+	rm -f qjsbrowser lib/tui.so lib/network_sockets.so lib/tls.so lib/image.so lib/zlib.so lib/fs.so lib/dns.so
 	-$(MAKE) -C $(QJS) clean >/dev/null 2>&1 || true
 	-rm -f $(QJS)/*.o $(QJS)/libquickjs.a
 

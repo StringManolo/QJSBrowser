@@ -13,6 +13,7 @@ const WELCOME =
   '  1-9            follow link\n' +
   '  [ / ]          back/forward\n' +
   '  r              reload\n' +
+  '  x              stop loading\n' +
   '  Tab            next form field (then omnibox)\n' +
   '  Enter          submit form / press focused button\n' +
   '  Esc            blur focused field\n' +
@@ -34,6 +35,30 @@ export function createController(deps) {
   );
 
   let running = true;
+
+  /* Throttled rendering. Network progress (status text, finished images) only
+   * marks the screen dirty; the main loop repaints at most every
+   * MIN_RENDER_MS. Without this, every 8 KB chunk of every connection forced
+   * a full-screen redraw and starved keyboard input. Direct user input still
+   * renders immediately. */
+  const MIN_RENDER_MS = 60;
+  let dirty = false;
+  let lastRender = 0;
+  function requestRender() { dirty = true; }
+  function msUntilRender() {
+    if (!dirty) return -1;
+    return Math.max(0, lastRender + MIN_RENDER_MS - Date.now());
+  }
+  function flushRender() {
+    if (dirty && Date.now() - lastRender >= MIN_RENDER_MS) render();
+  }
+
+  /* A result is stale if its tab was closed or navigated elsewhere meanwhile */
+  function isStale(options) {
+    if (!options || options.navId === undefined) return false;
+    const t = tabManager.getById(options.tabId);
+    return !t || t.navId !== options.navId;
+  }
 
   function renderAddressBar(tab, x, y, w, focused) {
     const bg = focused ? P.addressFocus : P.address;
@@ -61,6 +86,8 @@ export function createController(deps) {
   }
 
   function render() {
+    dirty = false;
+    lastRender = Date.now();
     const { rows, cols } = tui.size();
     const tab = tabManager.active();
     if (!tab) return;
@@ -201,6 +228,7 @@ export function createController(deps) {
     if (ch === 'g'.charCodeAt(0) || ch === ':'.charCodeAt(0)) { tab.mode = 'omnibox'; return; }
     if (ch === 'q'.charCodeAt(0)) { running = false; return; }
     if (ch === 'r'.charCodeAt(0)) { if (tab.currentUrl) navigate(tab, tab.currentUrl, { fromHistory: true }); return; }
+    if (ch === 'x'.charCodeAt(0)) { stopLoading(tab); return; }
     if (ch === '['.charCodeAt(0)) { goBack(tab);    return; }
     if (ch === ']'.charCodeAt(0)) { goForward(tab); return; }
     if (ch === keys.ESC) { if (focusedId) { fs.blur(); tab.pageView.invalidate(); } return; }
@@ -360,6 +388,8 @@ export function createController(deps) {
 
   function closeTab(index) {
     if (index < 0) return;
+    const closing = tabManager.list()[index];
+    if (closing) httpClient.abortTab(closing.id);
     tabManager.remove(index);
     if (tabManager.count() === 0) { running = false; return; }
     render();
@@ -372,13 +402,28 @@ export function createController(deps) {
       tab.statusText = 'Unsupported scheme: ' + p.scheme + '://';
       render(); return;
     }
+    /* Whatever this tab was still loading (old page, its images) is obsolete */
+    httpClient.abortTab(tab.id);
+    tab.navId++;
+
     tab.currentUrl = url;
     tab.loading = true;
     tab.formState.blur();
     tab.formState.reset();
     tab.omnibox.setText(url);
     tab.pageView.setContent('Loading ' + url + ' …', []);
-    httpClient.fetch(url, { ...options, tabId: tab.id });
+    httpClient.fetch(url, { ...options, tabId: tab.id, navId: tab.navId });
+  }
+
+  function stopLoading(tab) {
+    httpClient.abortTab(tab.id);
+    if (tab.loading) {
+      tab.loading = false;
+      tab.statusText = 'Stopped';
+      tab.pageView.setContent('Stopped loading ' + tab.currentUrl, []);
+    } else {
+      tab.statusText = 'Stopped loading images';
+    }
   }
 
   function goBack(tab) {
@@ -406,7 +451,7 @@ export function createController(deps) {
     const tab = resolveTab(tabId);
     if (!tab) return;
     tab.statusText = msg;
-    if (tab === tabManager.active()) render();
+    if (tab === tabManager.active()) requestRender();
   }
 
   function handleError(tabId, url, msg) {
@@ -429,7 +474,7 @@ export function createController(deps) {
                     cols - 2, Math.max(4, rows - 7),
                     options.displayW || 0, options.displayH || 0);
       tab.pageView.invalidate();
-      if (tab === tabManager.active()) render();
+      if (tab === tabManager.active()) requestRender();
       return;
     }
 
@@ -481,11 +526,14 @@ export function createController(deps) {
       imagesCount = parsed.images.length;
 
       if (settings.get('showImages')) {
+        const requested = new Set();
         for (const img of parsed.images) {
           if (imageView.has(img.src)) continue;
+          if (requested.has(img.src)) continue;       /* same image used twice */
           if (/\.svg(\?|#|$)/i.test(img.src)) continue;
+          requested.add(img.src);
           httpClient.fetch(img.src, {
-            tabId: tab.id, binary: true, imageFor: tab.id,
+            tabId: tab.id, navId: tab.navId, binary: true, imageFor: tab.id,
             imageSrc: img.src, displayW: img.width || 0, displayH: img.height || 0,
             redirectCount: 0,
           });
@@ -514,6 +562,7 @@ export function createController(deps) {
   return {
     render, handleInput,
     handleStatus, handleResponse, handleError,
+    requestRender, flushRender, msUntilRender, isStale,
     isRunning: () => running,
   };
 }

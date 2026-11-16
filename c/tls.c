@@ -14,16 +14,46 @@
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
 
 typedef struct {
-    SSL_CTX *ctx;
     SSL *ssl;
     BIO *rbio;
     BIO *wbio;
 } TLSConnection;
 
+/* One SSL_CTX for the whole process.
+ *
+ * Creating an SSL_CTX and loading the system CA bundle (~120-140 certs) is
+ * expensive (tens of ms, much more on phones). Doing it per connection froze
+ * the UI every time a page opened another HTTPS connection (one per image).
+ * The context is created lazily on first use and never freed: it lives as
+ * long as the process. SSL objects created from it only borrow it. */
+static SSL_CTX *g_ctx = NULL;
+
+static SSL_CTX *tls_shared_ctx(const char **err) {
+    if (g_ctx) return g_ctx;
+
+    SSL_CTX *c = SSL_CTX_new(TLS_client_method());
+    if (!c) { *err = "SSL_CTX_new failed"; return NULL; }
+
+    SSL_CTX_set_max_proto_version(c, TLS1_2_VERSION);
+
+    /* Load system CA bundle for peer verification.
+     * On Debian/Ubuntu: /etc/ssl/certs/ca-certificates.crt
+     * On RHEL/Fedora: /etc/pki/tls/certs/ca-bundle.crt
+     * OpenSSL probes multiple standard locations automatically. */
+    if (SSL_CTX_set_default_verify_paths(c) != 1) {
+        SSL_CTX_free(c);
+        *err = "Failed to load system CA bundle (install ca-certificates?)";
+        return NULL;
+    }
+    SSL_CTX_set_verify(c, SSL_VERIFY_PEER, NULL);
+
+    g_ctx = c;
+    return g_ctx;
+}
+
 static void tls_conn_free(TLSConnection *conn) {
     if (!conn) return;
-    if (conn->ssl) SSL_free(conn->ssl);
-    if (conn->ctx) SSL_CTX_free(conn->ctx);
+    if (conn->ssl) SSL_free(conn->ssl);   /* also frees the BIOs it owns */
     free(conn);
 }
 
@@ -90,36 +120,26 @@ static JSValue js_tls_init(JSContext *ctx, JSValueConst this_val, int argc, JSVa
 
 static JSValue js_tls_new(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val; (void)argc; (void)argv;
+
+    const char *err = NULL;
+    SSL_CTX *sctx = tls_shared_ctx(&err);
+    if (!sctx) return JS_ThrowInternalError(ctx, "%s", err ? err : "TLS init failed");
+
     TLSConnection *conn = calloc(1, sizeof(TLSConnection));
     if (!conn) return JS_ThrowOutOfMemory(ctx);
 
-    conn->ctx = SSL_CTX_new(TLS_client_method());
-    if (!conn->ctx) { free(conn); return JS_ThrowInternalError(ctx, "SSL_CTX_new failed"); }
-
-    SSL_CTX_set_max_proto_version(conn->ctx, TLS1_2_VERSION);
-
-    /* Load system CA bundle for peer verification.
-     * On Debian/Ubuntu: /etc/ssl/certs/ca-certificates.crt
-     * On RHEL/Fedora: /etc/pki/tls/certs/ca-bundle.crt
-     * OpenSSL probes multiple standard locations automatically. */
-    if (SSL_CTX_set_default_verify_paths(conn->ctx) != 1) {
-        tls_conn_free(conn);
-        return JS_ThrowInternalError(ctx,
-            "Failed to load system CA bundle (install ca-certificates?)");
-    }
-
-    SSL_CTX_set_verify(conn->ctx, SSL_VERIFY_PEER, NULL);
-
-    conn->ssl = SSL_new(conn->ctx);
+    conn->ssl = SSL_new(sctx);
     if (!conn->ssl) { tls_conn_free(conn); return JS_ThrowInternalError(ctx, "SSL_new failed"); }
 
     conn->rbio = BIO_new(BIO_s_mem());
     conn->wbio = BIO_new(BIO_s_mem());
     if (!conn->rbio || !conn->wbio) {
+        if (conn->rbio) BIO_free(conn->rbio);
+        if (conn->wbio) BIO_free(conn->wbio);
         tls_conn_free(conn);
         return JS_ThrowInternalError(ctx, "BIO_new failed");
     }
-    SSL_set_bio(conn->ssl, conn->rbio, conn->wbio);
+    SSL_set_bio(conn->ssl, conn->rbio, conn->wbio);   /* SSL now owns both BIOs */
     SSL_set_connect_state(conn->ssl);
 
     return JS_NewInt64(ctx, (int64_t)(intptr_t)conn);

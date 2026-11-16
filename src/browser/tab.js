@@ -17,5 +17,6 @@ export function createTab(tui, theme, imageView) {
     mode: 'omnibox',
     statusText: 'New Tab',
     loading: false,
+    navId: 0,          /* bumped on every navigation; lets us drop stale async results */
   };
 }

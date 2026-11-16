@@ -36,11 +36,19 @@ export class CustomEvent extends Event {
 export class EventTarget {
   constructor() { this._listeners = new Map(); }
 
+  /* The DOM signature is addEventListener(type, listener, options) where
+   * options is either a boolean (legacy: capture) or an object. React 18
+   * uses the boolean form (true = capture). Handle both. */
   addEventListener(type, listener, options) {
     if (!listener) return;
     type = String(type);
-    const once    = options && typeof options === 'object' ? !!options.once    : false;
-    const capture = options && typeof options === 'object' ? !!options.capture : false;
+    let once = false;
+    let capture = false;
+    if (options === true) capture = true;
+    else if (options && typeof options === 'object') {
+      once    = !!options.once;
+      capture = !!options.capture;
+    }
     let list = this._listeners.get(type);
     if (!list) { list = []; this._listeners.set(type, list); }
     for (const e of list) {
@@ -51,7 +59,11 @@ export class EventTarget {
 
   removeEventListener(type, listener, options) {
     type = String(type);
-    const capture = options && typeof options === 'object' ? !!options.capture : false;
+    let capture = false;
+    if (options === true) capture = true;
+    else if (options && typeof options === 'object') {
+      capture = !!options.capture;
+    }
     const list = this._listeners.get(type);
     if (!list) return;
     for (let i = 0; i < list.length; i++) {
@@ -65,7 +77,6 @@ export class EventTarget {
   dispatchEvent(ev) {
     if (!ev || typeof ev !== 'object') return true;
 
-    /* Build the propagation path: this → … → document */
     const path = [];
     let n = this;
     while (n) { path.push(n); n = n.parentNode || null; }
@@ -73,13 +84,11 @@ export class EventTarget {
 
     if (ev.target === null) ev.target = this;
 
-    /* Capture phase: outermost → innermost */
     for (let i = path.length - 1; i >= 0; i--) {
       ev.currentTarget = path[i];
       _fire(path[i], ev, true);
       if (ev._stopPropagation) return !ev.defaultPrevented;
     }
-    /* Target + bubble phase: innermost → outermost */
     for (let i = 0; i < path.length; i++) {
       ev.currentTarget = path[i];
       _fire(path[i], ev, false);
@@ -92,8 +101,6 @@ export class EventTarget {
 function _fire(target, ev, capturePhase) {
   const list = target._listeners && target._listeners.get(ev.type);
   if (!list) return;
-  /* Snapshot: a listener that removes another during dispatch must not
-   * skip the remaining entries. */
   const snapshot = list.slice();
   for (const entry of snapshot) {
     if (entry.capture !== capturePhase) continue;

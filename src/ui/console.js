@@ -5,15 +5,15 @@
  * panel. Drains globalThis._lastPumpError (set by C's js_pump_jobs) into
  * the panel as errors after every pump.
  *
+ * "Last result" is stored in $_ (not _) because _ is the global that
+ * lodash / underscore / many older libraries claim. Writing to _ would
+ * clobber page state on every console command.
+ *
  * Paste-safe submission: pressing Enter with balanced input does NOT
  * evaluate immediately. It sets pendingRun; the drain loop in main.js
- * calls flushPending() only after stdin is empty. If more bytes arrive
- * before the drain ends, they are treated as paste continuation: the
- * suppressed newline is reinserted and pendingRun is cleared. This
- * batches a multi-line paste into a single eval instead of running each
- * line as a separate submission (which would break `const x = 1` on
- * line 1 followed by `x` on line 2, since QuickJS scopes const/let to a
- * single eval).
+ * calls flushPending() only after stdin is empty. Extra bytes after
+ * Enter reinsert the suppressed newline, treating it as paste
+ * continuation and batching into a single eval.
  *
  * Keys:
  *   Tab         complete identifier (globals, dotted paths)
@@ -23,7 +23,7 @@
  *   Ctrl+L      clear output
  *   Ctrl+U      clear input
  *   PgUp/PgDn   scroll output
- *   _           (after a result) references the last value
+ *   $_          (after a result) references the last value
  */
 
 const MAX_OUTPUT_ITEMS = 500;
@@ -40,7 +40,7 @@ export function createConsole({ tui, theme }) {
   let historyIdx = -1;
   let savedInput = '';
   let scrollY    = 0;
-  let pendingRun = false;    /* Enter suppressed; awaiting end-of-batch */
+  let pendingRun = false;
 
   const P = theme.pairs;
   const pairBg     = P.page    != null ? P.page    : 1;
@@ -183,14 +183,13 @@ export function createConsole({ tui, theme }) {
     let result, error;
     try { result = (0, eval)(code); } catch (e) { error = e; }
 
-    /* Drain microtasks the eval may have scheduled. Errors from C-side
-     * pumps surface in the panel via _lastPumpError. */
     pumpJobsAndDrain();
 
     if (error) {
       pushOutput({ kind: 'error', text: formatError(error) });
     } else if (result !== undefined) {
-      globalThis._ = result;
+      /* Store in $_ not _ — see header comment. */
+      globalThis.$_ = result;
 
       if (result && typeof result.then === 'function') {
         pushOutput({ kind: 'result', text: 'Promise { <pending> }' });
@@ -210,8 +209,6 @@ export function createConsole({ tui, theme }) {
     scrollY = 0;
   }
 
-  /* Called by main.js after the getch() drain loop ends. If Enter was
-   * suppressed earlier and no further input arrived, execute now. */
   function flushPending() {
     if (!pendingRun) return;
     pendingRun = false;
@@ -305,7 +302,6 @@ export function createConsole({ tui, theme }) {
   /* --- key handling ---------------------------------------------------- */
 
   function handleKey(ch) {
-    /* Cancel keys: discard any suppressed Enter without reinserting it. */
     if (ch === tui.KEY_F12 || ch === 27 /* ESC */) {
       pendingRun = false;
       if (ch === 27 && input.length > 0) { input = ''; cursor = 0; return; }
@@ -317,7 +313,6 @@ export function createConsole({ tui, theme }) {
     if (ch === 3  /* Ctrl+C */) { pendingRun = false; input = ''; cursor = 0; return; }
     if (ch === 9  /* Tab */)    { pendingRun = false; complete(); return; }
 
-    /* Enter: defer evaluation. flushPending() decides at end of batch. */
     if (ch === tui.KEY_ENTER || ch === 10 || ch === 13) {
       if (looksBalanced(input)) {
         pendingRun = true;
@@ -328,9 +323,6 @@ export function createConsole({ tui, theme }) {
       return;
     }
 
-    /* Any other key arriving with pendingRun set means the previous Enter
-     * was part of a paste (its batch had more bytes to come). Reinsert the
-     * suppressed newline and cancel the auto-run so this becomes one eval. */
     if (pendingRun) {
       input = input.slice(0, cursor) + '\n' + input.slice(cursor);
       cursor++;
@@ -391,7 +383,7 @@ export function createConsole({ tui, theme }) {
 
     tui.fillPair(y, x, h, w, pairBg);
 
-    const header = ' CONSOLE   Tab: complete   F12: close   Ctrl+L: clear   ↑/↓: history   _: last ';
+    const header = ' CONSOLE   Tab: complete   F12: close   Ctrl+L: clear   ↑/↓: history   $_: last ';
     tui.printPair(y, x, header.slice(0, w).padEnd(w, ' '),
                   pairHeader, tui.A_BOLD | tui.A_REVERSE);
 
@@ -405,8 +397,6 @@ export function createConsole({ tui, theme }) {
     const outTop    = 1;
     const outHeight = Math.max(1, inputTop - (y + 1));
 
-    /* Clip to w-1: text printed at x+1; len==w would end at x+w,
-     * one column past the last valid index → ncurses wrap → stale cells. */
     const avail = Math.max(1, w - 1);
 
     const lines = [];

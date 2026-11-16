@@ -1,15 +1,21 @@
 /* HTML → DOM tree.
  *
- * Same tokenizer and same "naive stack" behavior as html-to-text.js so
- * that domToText(htmlToDom(html)) produces byte-identical segments for
- * well-formed HTML. Malformed HTML can differ: html-to-text does a
- * "pop-until-match" on close, which a properly-nested tree cannot
- * reproduce. Valid HTML (what React/Vite/etc. emit) is unaffected.
+ * Same naive-stack semantics as html-to-text.js so that
+ * domToText(htmlToDom(html)) produces byte-identical segments for
+ * well-formed HTML.
  *
- * <style> content is extracted and returned separately; <script> is
- * stripped for now (script execution is a later PR).
+ * Differences from html-to-text:
+ *   - <script> is NOT stripped. Each <script> element stays in the tree
+ *     (empty, no text child) and is captured into `scripts[]` with its
+ *     inline source and attributes. Script execution is a controller job.
+ *   - The tokenizer is script-aware: content between <script>…</script>
+ *     is captured as raw text, so `<` and `>` inside JS string literals
+ *     do not confuse tag detection. Same for <style> and <textarea>.
+ *   - <style> is still extracted via regex before tokenizing (same as
+ *     html-to-text), returned as `css[]`.
  */
 
+import { resolveUrl } from 'src/base/url.js';
 import { decodeHtmlEntities } from 'src/content/html-entities.js';
 
 function parseAttrs(str) {
@@ -24,6 +30,12 @@ function parseAttrs(str) {
   }
   return attrs;
 }
+
+const RAW_CONTENT_TAGS = new Set(['script', 'style', 'textarea']);
+const VOID_TAGS = new Set([
+  'area','base','br','col','embed','hr','img','input',
+  'link','meta','param','source','track','wbr'
+]);
 
 function tokenize(html) {
   const tokens = [];
@@ -42,26 +54,41 @@ function tokenize(html) {
     const raw = html.slice(lt + 1, gt).trim();
     if (raw.startsWith('/')) {
       tokens.push({ type: 'close', tag: raw.slice(1).trim().toLowerCase() });
-    } else if (raw.startsWith('!')) {
-      /* DOCTYPE */
-    } else {
-      const selfClose = raw.endsWith('/');
-      const tagText = selfClose ? raw.slice(0, -1).trim() : raw;
-      const spaceIdx = tagText.search(/\s/);
-      const name = (spaceIdx < 0 ? tagText : tagText.slice(0, spaceIdx)).toLowerCase();
-      const attrsStr = spaceIdx < 0 ? '' : tagText.slice(spaceIdx);
-      tokens.push({ type: 'open', tag: name, attrs: parseAttrs(attrsStr), selfClose });
+      i = gt + 1;
+      continue;
+    }
+    if (raw.startsWith('!')) { i = gt + 1; continue; }
+
+    const selfClose = raw.endsWith('/');
+    const tagText = selfClose ? raw.slice(0, -1).trim() : raw;
+    const spaceIdx = tagText.search(/\s/);
+    const name = (spaceIdx < 0 ? tagText : tagText.slice(0, spaceIdx)).toLowerCase();
+    const attrsStr = spaceIdx < 0 ? '' : tagText.slice(spaceIdx);
+    const attrs = parseAttrs(attrsStr);
+    tokens.push({ type: 'open', tag: name, attrs, selfClose });
+
+    /* Raw-content mode: capture everything until matching close tag as
+     * one text token, so `<` inside doesn't confuse the tokenizer. */
+    if (!selfClose && RAW_CONTENT_TAGS.has(name)) {
+      const closeTag = '</' + name;
+      const closeIdx = html.toLowerCase().indexOf(closeTag, gt + 1);
+      if (closeIdx < 0) {
+        const rest = html.slice(gt + 1);
+        if (rest.length > 0) tokens.push({ type: 'text', value: rest });
+        i = html.length;
+        continue;
+      }
+      const content = html.slice(gt + 1, closeIdx);
+      if (content.length > 0) tokens.push({ type: 'text', value: content });
+      tokens.push({ type: 'close', tag: name });
+      const closeGt = html.indexOf('>', closeIdx);
+      i = closeGt < 0 ? html.length : closeGt + 1;
+      continue;
     }
     i = gt + 1;
   }
   return tokens;
 }
-
-/* Elements whose content is text, not markup. The tokenizer will produce
- * inner tokens for these, but the tree builder captures the content as a
- * single raw text node and skips those tokens. Currently only <textarea>
- * needs this (script/style already stripped before tokenizing). */
-const RAW_CONTENT_TAGS = new Set(['textarea']);
 
 export function htmlToDom(html, baseUrl, document) {
   const styleCSS = [];
@@ -69,13 +96,13 @@ export function htmlToDom(html, baseUrl, document) {
     styleCSS.push(css);
     return '';
   });
-  html = html.replace(/<script[\s\S]*?<\/script>/gi, '');
 
   const body = document.body;
   while (body.firstChild) body.removeChild(body.firstChild);
 
   const tokens = tokenize(html);
   const stack = [{ tag: '#root', node: body }];
+  const scripts = [];
 
   function current() { return stack[stack.length - 1].node; }
 
@@ -86,32 +113,40 @@ export function htmlToDom(html, baseUrl, document) {
     return el;
   }
 
-  const VOID_TAGS = new Set([
-    'area','base','br','col','embed','hr','img','input',
-    'link','meta','param','source','track','wbr'
-  ]);
-
   for (let ti = 0; ti < tokens.length; ti++) {
     const tok = tokens[ti];
 
-    /* Inside a raw-content element, everything is text until its close. */
+    /* Inside a raw-content element (script/style/textarea): everything is
+     * raw text until its matching close. */
     const top = stack[stack.length - 1];
     if (top && top.rawContent) {
       if (tok.type === 'text') { top.rawText += tok.value; continue; }
+      if (tok.type === 'close' && tok.tag === top.tag) {
+        if (top.tag === 'script') {
+          const el = top.node;
+          el._inlineCode = top.rawText;
+          const srcAttr = el.getAttribute('src');
+          scripts.push({
+            element: el,
+            inline: top.rawText,
+            src: srcAttr ? resolveUrl(baseUrl, decodeHtmlEntities(srcAttr)) : null,
+            type: (el.getAttribute('type') || 'text/javascript').toLowerCase().trim(),
+            async: el.hasAttribute('async'),
+            defer: el.hasAttribute('defer'),
+          });
+        } else {
+          const txt = document.createTextNode(top.rawText);
+          top.node.appendChild(txt);
+        }
+        stack.pop();
+        continue;
+      }
       if (tok.type === 'open') {
-        /* Preserve "<tag" literally, matching html-to-text's capture. */
         const attrStr = Object.entries(tok.attrs)
           .map(([k, v]) => v === '' ? ' ' + k : ` ${k}="${v}"`).join('');
         top.rawText += '<' + tok.tag + attrStr + (tok.selfClose ? '/' : '') + '>';
         continue;
       }
-      if (tok.type === 'close' && tok.tag === top.tag) {
-        const txt = document.createTextNode(top.rawText);
-        top.node.appendChild(txt);
-        stack.pop();
-        continue;
-      }
-      /* Stray close inside raw-content — treat as literal text. */
       if (tok.type === 'close') { top.rawText += '</' + tok.tag + '>'; continue; }
     }
 
@@ -135,5 +170,5 @@ export function htmlToDom(html, baseUrl, document) {
     }
   }
 
-  return { css: styleCSS };
+  return { css: styleCSS, scripts };
 }

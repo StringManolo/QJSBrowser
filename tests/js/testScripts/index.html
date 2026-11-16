@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>QJSBrowser Test Suite</title>
+</head>
+<body>
+
+<h1>QJSBrowser Test Suite</h1>
+
+<!-- Static HTML test: the only thing that renders if JS is completely broken. -->
+<p id="js-status">✗ JavaScript is NOT running — you are seeing static HTML only.</p>
+
+<p>Static HTML, entities, links, formatting:
+   <strong>bold</strong>, <em>italic</em>,
+   <a href="https://example.com">a link to example.com</a>,
+   &amp; &copy; &mdash; &hellip; &nbsp; &ntilde; &aacute;.</p>
+
+<blockquote>Blockquote — should be indented in the rendered output.</blockquote>
+
+<pre>pre-formatted
+    preserves
+        whitespace</pre>
+
+<h2>Lists</h2>
+<ul>
+  <li>Unordered item 1</li>
+  <li>Unordered item 2</li>
+  <li>Unordered item 3</li>
+</ul>
+<ol>
+  <li>Ordered item 1</li>
+  <li>Ordered item 2</li>
+  <li>Ordered item 3</li>
+</ol>
+
+<h2>Form controls</h2>
+<form id="test-form" action="https://example.com/submit" method="GET">
+  <p>Text: <input type="text" name="t" placeholder="type here" size="20"></p>
+  <p>Password: <input type="password" name="p" size="15"></p>
+  <p>
+    <label><input type="checkbox" name="cb1"> Checkbox 1</label>
+    <label><input type="checkbox" name="cb2" checked> Checkbox 2 (checked)</label>
+  </p>
+  <p>Radio:
+    <input type="radio" name="r" value="a"> A
+    <input type="radio" name="r" value="b" checked> B
+    <input type="radio" name="r" value="c"> C</p>
+  <p><select name="sel">
+    <option value="1">Option 1</option>
+    <option value="2" selected>Option 2</option>
+    <option value="3">Option 3</option>
+  </select></p>
+  <p><textarea name="msg" rows="2" cols="30">textarea default value</textarea></p>
+  <p>
+    <button type="submit">Submit</button>
+    <button type="reset">Reset</button>
+    <button type="button" id="test-btn">Click me</button>
+  </p>
+</form>
+
+<h2>Script tests</h2>
+<div id="script-tests"></div>
+
+<h2>Event tests</h2>
+<div id="event-tests"></div>
+
+<h2>Timer tests</h2>
+<div id="timer-tests"></div>
+
+<h2>DOM API tests</h2>
+<div id="dom-tests"></div>
+
+<h2>Window globals</h2>
+<div id="globals-tests"></div>
+
+<h2>External script (requires network)</h2>
+<div id="external-tests"></div>
+
+<script>
+/* log() writes a green/red paragraph into a section box. Using var so it
+ * becomes a global on globalThis (indirect eval → var = global binding). */
+var log = function(section, name, ok, detail) {
+  var box = document.getElementById(section);
+  if (!box) return;
+  var p = document.createElement('p');
+  p.textContent = (ok ? '✓ ' : '✗ ') + name + (detail ? ' — ' + detail : '');
+  p.style.color = ok ? '#66ff66' : '#ff4444';
+  box.appendChild(p);
+};
+
+/* Replace the "JS is not running" banner. */
+var status = document.getElementById('js-status');
+if (status) {
+  status.textContent = '✓ JavaScript is running';
+  status.style.color = '#66ff66';
+}
+
+log('script-tests', 'Inline script executed', true);
+log('script-tests', 'window and document exist',
+    typeof window !== 'undefined' && typeof document !== 'undefined');
+</script>
+
+<script>
+/* This script throws on purpose. Everything after it MUST still run. */
+throw new Error('intentional test error — should not stop subsequent scripts');
+</script>
+
+<script>
+log('script-tests', 'Error isolation (this script ran after a throw)', true);
+</script>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  log('event-tests', 'DOMContentLoaded fired', true,
+      'readyState=' + document.readyState);
+});
+</script>
+
+<script>
+window.addEventListener('load', function() {
+  log('event-tests', 'load event fired', true,
+      'readyState=' + document.readyState);
+});
+</script>
+
+<script>
+setTimeout(function() {
+  log('timer-tests', 'setTimeout(fn, 100) fired', true);
+}, 100);
+
+var _n = 0;
+var _id = setInterval(function() {
+  _n++;
+  if (_n === 3) {
+    clearInterval(_id);
+    log('timer-tests', 'setInterval fired 3 times', true);
+  }
+}, 50);
+
+setTimeout(function() {
+  log('timer-tests', 'setTimeout(fn, 300) fired', true);
+}, 300);
+</script>
+
+<script>
+try {
+  var f = document.getElementById('test-form');
+  log('dom-tests', 'getElementById("test-form")', f !== null);
+
+  var input = document.querySelector('input[name="t"]');
+  log('dom-tests', 'querySelector("input[name=t]")', input !== null);
+
+  var inputs = document.querySelectorAll('input');
+  log('dom-tests', 'querySelectorAll("input")', inputs.length > 0,
+      inputs.length + ' inputs found');
+
+  var div = document.createElement('div');
+  div.textContent = 'This <div> was built with createElement + appendChild';
+  div.style.color = '#66ff66';
+  document.getElementById('dom-tests').appendChild(div);
+
+  div.classList.add('test');
+  log('dom-tests', 'classList.add + contains', div.classList.contains('test'));
+
+  div.setAttribute('data-x', 'v');
+  log('dom-tests', 'setAttribute + getAttribute',
+      div.getAttribute('data-x') === 'v');
+
+  div.textContent = 'changed';
+  log('dom-tests', 'textContent round-trip', div.textContent === 'changed');
+
+  document.getElementById('dom-tests').removeChild(div);
+  log('dom-tests', 'removeChild', div.parentNode === null);
+} catch (e) {
+  log('dom-tests', 'Exception during DOM tests', false, e.message || String(e));
+}
+</script>
+
+<script>
+try {
+  var btn = document.getElementById('test-btn');
+  var clicked = false;
+  btn.addEventListener('click', function() { clicked = true; });
+  btn.click();
+  log('event-tests', 'btn.click() fires click listener', clicked);
+
+  var bubbled = false;
+  var form = document.getElementById('test-form');
+  form.addEventListener('click', function(e) {
+    if (e.target === btn) bubbled = true;
+  });
+  btn.click();
+  log('event-tests', 'click bubbles to <form>', bubbled);
+} catch (e) {
+  log('event-tests', 'Exception during event tests', false, e.message || String(e));
+}
+</script>
+
+<script>
+try {
+  log('globals-tests', 'innerWidth / innerHeight > 0',
+      typeof innerWidth === 'number' && innerWidth > 0,
+      innerWidth + ' x ' + innerHeight);
+
+  log('globals-tests', 'navigator.userAgent',
+      typeof navigator.userAgent === 'string' && navigator.userAgent.length > 0,
+      navigator.userAgent);
+
+  log('globals-tests', 'location.href is a string',
+      typeof location.href === 'string',
+      location.href);
+
+  log('globals-tests', 'performance.now() returns a number',
+      typeof performance.now() === 'number',
+      performance.now().toFixed(0) + 'ms');
+
+  log('globals-tests', 'document.title is a string',
+      typeof document.title === 'string',
+      '"' + document.title + '"');
+
+  log('globals-tests', 'localStorage round-trip', (function() {
+    try {
+      localStorage.setItem('__t', 'v');
+      var got = localStorage.getItem('__t');
+      localStorage.removeItem('__t');
+      return got === 'v';
+    } catch (_) { return false; }
+  })());
+} catch (e) {
+  log('globals-tests', 'Exception during globals tests', false, e.message || String(e));
+}
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.min.js"></script>
+
+<script>
+if (typeof window._ === 'function' && window._ && typeof window._.chunk === 'function') {
+  try {
+    var chunked = window._.chunk([1,2,3,4,5,6], 2);
+    log('external-tests', 'External script loaded (lodash)',
+        chunked.length === 3 && chunked[0][0] === 1,
+        '_.chunk([1..6], 2) = ' + JSON.stringify(chunked));
+  } catch (e) {
+    log('external-tests', 'Lodash loaded but threw', false, e.message || String(e));
+  }
+} else {
+  log('external-tests', 'External script NOT loaded — no network, or fetch failed',
+      false);
+}
+</script>
+
+<script>
+setTimeout(function() {
+  var p = document.createElement('p');
+  p.textContent = '═══════════ END OF TESTS ═══════════';
+  p.style.color = '#ffcc00';
+  document.body.appendChild(p);
+}, 600);
+</script>
+
+</body>
+</html>

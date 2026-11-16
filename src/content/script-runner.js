@@ -30,6 +30,14 @@ function resolveModuleSpecifier(spec, baseUrl) {
     const hash = baseUrl.indexOf('#');
     return (hash >= 0 ? baseUrl.slice(0, hash) : baseUrl) + spec;
   }
+  /* Lenient: some bundles strip the "./" from dynamic imports, leaving
+   * a bare filename. If it looks like a file (has a known extension),
+   * resolve it against the parent anyway. Better than throwing, because
+   * the alternative is QuickJS falling through to its native loader,
+   * which reads from disk and fails. */
+  if (/\.(m?js|ts|json|css|wasm)(\?|#|$)/i.test(spec)) {
+    return resolveUrl(baseUrl, './' + spec);
+  }
   throw new Error('bare import specifier "' + spec + '" is not supported');
 }
 

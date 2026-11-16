@@ -37,31 +37,37 @@ export function createModuleLoader({ fetchSource, resolveSpecifier }) {
   }
 
   async function fetchGraph(url, visited, order, preFetchedSource) {
-    if (visited.has(url)) return;
-    visited.add(url);
+  if (visited.has(url)) return;
+  visited.add(url);
 
-    if (isCSS(url)) {
-      let source = preFetchedSource;
-      if (source === undefined) source = await fetchSource(url);
-      injectStyle(source, url);
-      modules.set(url, { code: '', imports: [], exports: {}, executed: true });
-      return;
-    }
-
-    const source = preFetchedSource !== undefined
-                 ? preFetchedSource
-                 : await fetchSource(url);
-    const { code, imports } = transpileModule(source, url, resolveSpecifier);
-    modules.set(url, { code, imports, exports: {}, executed: false });
-
-    for (const dep of imports) {
-      if (modules.has(dep) || visited.has(dep)) continue;
-      await fetchGraph(dep, visited, order);
-    }
-    order.push(url);
+  if (isCSS(url)) {
+    let source = preFetchedSource;
+    if (source === undefined) source = await fetchSource(url);
+    try { console.log('[esm] css ' + url); } catch (_) {}
+    injectStyle(source, url);
+    modules.set(url, { code: '', imports: [], exports: {}, executed: true });
+    return;
   }
 
-  function executeModule(url) {
+  const source = preFetchedSource !== undefined
+               ? preFetchedSource
+               : await fetchSource(url);
+  try { console.log('[esm] fetch ' + url + ' (' + source.length + ' bytes)'); } catch (_) {}
+
+  const { code, imports } = transpileModule(source, url, resolveSpecifier);
+  modules.set(url, { code, imports, exports: {}, executed: false });
+  try {
+    console.log('[esm] transpiled ' + url + ' -> deps=[' + imports.join(', ') + ']');
+  } catch (_) {}
+
+  for (const dep of imports) {
+    if (modules.has(dep) || visited.has(dep)) continue;
+    await fetchGraph(dep, visited, order);
+  }
+  order.push(url);
+}
+
+function executeModule(url) {
   const m = modules.get(url);
   if (!m || m.executed) return m ? m.exports : {};
   m.executed = true;
@@ -73,20 +79,33 @@ export function createModuleLoader({ fetchSource, resolveSpecifier }) {
   }
 
   const moduleImport = (spec) => {
-    const depUrl = resolveSpecifier(spec, url);
-    return ensureLoaded(depUrl).then(mm => mm.exports);
+    let depUrl;
+    try {
+      depUrl = resolveSpecifier(spec, url);
+    } catch (e) {
+      try { console.error('[esm] RESOLVE FAILED "' + spec + '" from ' + url + ': ' + e.message); } catch (_) {}
+      throw e;
+    }
+    try { console.log('[esm] dynamic import "' + spec + '" from ' + url + ' -> ' + depUrl); } catch (_) {}
+    return ensureLoaded(depUrl).then(mm => mm.exports)
+      .catch((e) => {
+        try { console.error('[esm] import failed ' + depUrl + ': ' + (e && e.message || e)); } catch (_) {}
+        throw e;
+      });
   };
   const moduleRequire = () => {};
 
-  /* Keep the wrapper on a single line so stack traces point at the
-   * original source line/column, not the wrapper. Critical for
-   * debugging minified bundles where S is indistinguishable from
-   * any other single-letter function. */
   const fn = new Function(
     '__modules__', '__exports__', '__import', '__require',
     "'use strict';" + m.code
   );
-  fn(modulesArg, m.exports, moduleImport, moduleRequire);
+  try {
+    fn(modulesArg, m.exports, moduleImport, moduleRequire);
+    try { console.log('[esm] executed ' + url); } catch (_) {}
+  } catch (e) {
+    try { console.error('[esm] exec failed ' + url + ': ' + (e && e.message || e)); } catch (_) {}
+    throw e;
+  }
   return m.exports;
 }
 

@@ -33,8 +33,6 @@ export function createController(deps) {
 
   const dialog = createSettingsDialog(
     tui, theme, settings, cookieJar, tabManager,
-    /* onClearHistory: returns the total count before clearing so the
-     * dialog can surface "History cleared (N entries)" in the status bar. */
     () => {
       let total = 0;
       for (const t of tabManager.list()) {
@@ -44,8 +42,6 @@ export function createController(deps) {
       return total;
     },
     deps.onToggleConsole || null,
-    /* onStatus: writes a status-bar message for actions like Clear
-     * cookies / Clear history so the user gets feedback. */
     (msg) => {
       const tab = tabManager.active();
       if (!tab) return;
@@ -53,6 +49,97 @@ export function createController(deps) {
       requestRender();
     }
   );
+
+  /* window.fetch — SPA routes call it to load JSON / chunks. Handles:
+   *   - absolute URL         http(s)://...        → as-is
+   *   - protocol-relative    //host/path          → prepend current scheme
+   *   - absolute path        /api/foo             → origin + path
+   *   - relative path        ./data/foo, data/foo → resolve against page dir
+   *   - hash-only            #frag                → same page
+   *
+   * Without resolution, '/writeups/foo.json' fed to parseUrl() returns
+   * null (no scheme/host), the httpClient errors with 'Invalid URL',
+   * and the SPA shows its generic "Error loading ..." message — which
+   * is exactly what stringmanolo.qzz.io did when clicking a writeup
+   * card. */
+  if (!globalThis.fetch) {
+    globalThis.fetch = (input, init) => {
+      let rawUrl;
+      if (typeof input === 'string') rawUrl = input;
+      else if (input && typeof input.url === 'string') rawUrl = input.url;
+      else rawUrl = String(input);
+
+      let url = rawUrl;
+      try {
+        const loc = globalThis.location;
+        const base = (loc && loc.href) || '';
+        if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) {
+          if (url.startsWith('//')) {
+            const scheme = (base.match(/^([a-z][a-z0-9+.-]*):/i) || [])[1] || 'https';
+            url = scheme + ':' + url;
+          } else if (url.startsWith('/')) {
+            const m = base.match(/^([a-z][a-z0-9+.-]*:\/\/[^\/]+)/i);
+            url = (m ? m[1] : '') + url;
+          } else if (url.startsWith('#')) {
+            url = base.split('#')[0] + url;
+          } else {
+            try {
+              if (typeof globalThis.URL === 'function') {
+                url = new globalThis.URL(url, base).href;
+              } else {
+                const b = base.split('#')[0].split('?')[0];
+                const dir = b.substring(0, b.lastIndexOf('/') + 1);
+                const parts = (dir + url).split('/');
+                const stack = [];
+                for (const p of parts) {
+                  if (p === '..') stack.pop();
+                  else if (p !== '.' && p !== '') stack.push(p);
+                }
+                const origin = (base.match(/^([a-z][a-z0-9+.-]*:\/\/[^\/]+)/i) || [])[1] || '';
+                url = origin + '/' + stack.join('/');
+              }
+            } catch (_) {}
+          }
+        }
+      } catch (_) {}
+
+      const opts = init || {};
+      const method = (opts.method || 'GET').toUpperCase();
+      const body = (opts.body !== undefined && opts.body !== null)
+                   ? String(opts.body) : null;
+
+      try { console.log('[fetch] ' + method + ' ' + url); } catch (_) {}
+
+      return httpClient.fetchPromise(url, { method, body }).then(({ resp }) => {
+        const h = resp.headers || {};
+        try { console.log('[fetch] → ' + resp.status + ' ' + url); } catch (_) {}
+
+        return {
+          ok: resp.status >= 200 && resp.status < 300,
+          status: resp.status,
+          statusText: resp.statusText || '',
+          url,
+          headers: {
+            get: (n) => h[String(n).toLowerCase()] || null,
+            has: (n) => String(n).toLowerCase() in h,
+            forEach: (cb) => Object.entries(h).forEach(([k, v]) => cb(v, k)),
+          },
+          text: () => Promise.resolve(resp.body || ''),
+          json: () => new Promise((resolve, reject) => {
+            try { resolve(JSON.parse(resp.body)); }
+            catch (e) { reject(new SyntaxError('Invalid JSON from ' + url + ': ' + e.message)); }
+          }),
+          arrayBuffer: () => Promise.resolve(
+            resp.rawBytes ? resp.rawBytes.buffer : new ArrayBuffer(0)),
+          blob: () => Promise.reject(new Error('fetch().blob() not supported')),
+          clone() { return this; },
+        };
+      }).catch((e) => {
+        try { console.error('[fetch] FAILED ' + url + ': ' + (e && e.message || e)); } catch (_) {}
+        throw e;
+      });
+    };
+  }
 
   let running = true;
   let domOwner = { tabId: null, navId: 0 };
@@ -90,13 +177,6 @@ export function createController(deps) {
     const focused = tab.formState.getFocused();
     const focusCursor = focused ? tab.formState.cursorPos() : 0;
 
-    /* Capture the live DOM node that currently holds focus BEFORE we
-     * blow away the form state. React reuses the same DOM node when it
-     * re-renders a controlled <input> (same position, no key change),
-     * so after domToText re-traverses the tree we can reattach focus
-     * by node identity. This matters because simple React inputs often
-     * have no `name` attribute — the name|kind heuristic was a no-op
-     * and focus was dropped on every keystroke. */
     const activeNode = (typeof globalThis.document !== 'undefined')
       ? globalThis.document.activeElement
       : null;
@@ -117,9 +197,6 @@ export function createController(deps) {
       }
     }
 
-    /* Restore focus. Primary: match by DOM node identity. Fallback:
-     * match by name+kind for the rare case where React replaced the
-     * node (activeElement becomes <body>) and the element carries a name. */
     let restored = false;
     if (activeNode && activeNode !== globalThis.document.body) {
       for (const [id, node] of newNodes) {
@@ -183,10 +260,6 @@ export function createController(deps) {
     const tab = tabManager.active();
     if (!tab) return;
 
-    /* If React committed since the last paint (domDirty = true), re-serialize
-     * the DOM here so any render() path — synchronous from handleInput,
-     * throttled from flushRender, or explicit from navigation — picks up
-     * the latest state in one place. */
     if (tab.domDirty && domOwner.tabId === tab.id && domOwner.navId === tab.navId) {
       refreshTabFromDom(tab);
     } else {
@@ -237,9 +310,6 @@ export function createController(deps) {
 
     tui.refresh();
 
-    /* Skip image flush when the settings dialog is open. Images live on
-     * a separate terminal layer that text cells can't cover, so they
-     * overlapped the menu. */
     if (!dialog.isOpen()) {
       tui.flushImages(cursorY, cursorX);
     }
@@ -283,16 +353,6 @@ export function createController(deps) {
       }
     }
 
-    /* Drain pending microtasks here — OUTSIDE any event dispatch.
-     *
-     * React 18 classifies 'input'/'change' as ContinuousEventPriority
-     * (not Discrete like 'click'/'keydown'). Discrete events run flushSync
-     * at the end of dispatch, so the commit completes before dispatchEvent
-     * returns. Continuous events schedule the render via the React
-     * scheduler (MessageChannel = microtask in our polyfill) and return
-     * immediately. If we don't pump, the synchronous render() below paints
-     * stale segments. Pumping after all dispatch handlers have returned is
-     * safe; pumping inside dispatch is not (it re-enters React mid-flush). */
     if (typeof pumpJobs === 'function') {
       try { pumpJobs(200); } catch (_) {}
     }
@@ -306,10 +366,6 @@ export function createController(deps) {
     }
   }
 
-  /* Write node[prop] bypassing any instance-level setter. React 18 installs
-   * a custom value/checked setter on the instance to track changes; writing
-   * through the prototype's descriptor leaves the tracker stale, so the
-   * input event we dispatch right after triggers onChange normally. */
   function setNativeProp(node, prop, value) {
     const proto = Object.getPrototypeOf(node);
     const desc = proto ? Object.getOwnPropertyDescriptor(proto, prop) : null;
@@ -474,30 +530,82 @@ export function createController(deps) {
   }
 
   function handlePageClick(tab, relX, relY, pageW) {
-    const line = tab.pageView.lineAt(relY, pageW);
-    if (!line) { tab.mode = 'page'; tab.formState.blur(); tab.pageView.invalidate(); return; }
-
-    let cx = 0;
-    for (const seg of line) {
-      if (seg.kind === 'img') { cx += seg.cols; continue; }
-      const w = (seg.text || '').length;
-      if (w > 0 && relX >= cx && relX < cx + w) {
-        if (seg.elementId) {
-          activateFormElement(tab, seg.elementId);
-          return;
-        }
-        if (seg.linkN !== null) {
-          const link = tab.pageView.links.find(l => l.n === seg.linkN);
-          if (link) { navigate(tab, link.href); return; }
-        }
-        break;
-      }
-      cx += w;
-    }
+  const line = tab.pageView.lineAt(relY, pageW);
+  if (!line) {
+    tab.mode = 'page';
     tab.formState.blur();
     tab.pageView.invalidate();
-    tab.mode = 'page';
+    return;
   }
+
+  let cx = 0;
+  for (const seg of line) {
+    if (seg.kind === 'img') {
+      /* Image segments can carry a synthetic link for click-through
+       * (registered in pushImage). Handle both real links and node
+       * dispatch just like text below. */
+      if (seg.linkN !== null && seg.linkN !== undefined) {
+        const link = tab.pageView.links.find(l => l.n === seg.linkN);
+        if (link) {
+          if (link.href) { navigate(tab, link.href); return; }
+          if (link.node) {
+            try {
+              const ev = new Event('click', { bubbles: true, cancelable: true });
+              link.node.dispatchEvent(ev);
+            } catch (_) {}
+            return;
+          }
+        }
+      }
+      cx += seg.cols;
+      continue;
+    }
+
+    const w = (seg.text || '').length;
+    if (w > 0 && relX >= cx && relX < cx + w) {
+      /* Case 1: form control. */
+      if (seg.elementId && tab.formState.get(seg.elementId)) {
+        activateFormElement(tab, seg.elementId);
+        return;
+      }
+
+      /* Case 2: link (real or synthetic).
+       *
+       * linkN survives pageView.lineAt() (text segments that had
+       * elementId lose it because lineAt reconstructs the object;
+       * linkN is preserved because it's used for rendering). That's
+       * why the "Read full writeup →" <div onClick> cards work: they
+       * have a synthetic link {href:null, node:<innermost>} registered
+       * at domToText time, and clicking dispatches a real DOM click on
+       * the node, which bubbles to the React onClick ancestor and
+       * navigates. */
+      if (seg.linkN !== null && seg.linkN !== undefined) {
+        const link = tab.pageView.links.find(l => l.n === seg.linkN);
+        if (link) {
+          if (link.href) {
+            navigate(tab, link.href);
+            return;
+          }
+          if (link.node && typeof link.node.dispatchEvent === 'function') {
+            try {
+              const ev = new Event('click', { bubbles: true, cancelable: true });
+              link.node.dispatchEvent(ev);
+            } catch (_) {}
+            return;
+          }
+        }
+      }
+
+      /* Case 3: no link, no form — plain text. Blur any focus and stop. */
+      break;
+    }
+    cx += w;
+  }
+
+  tab.formState.blur();
+  tab.pageView.invalidate();
+  tab.mode = 'page';
+} 
 
   function activateFormElement(tab, elementId) {
     const el = tab.formState.get(elementId);
@@ -616,21 +724,6 @@ export function createController(deps) {
     render();
   }
 
-  /* navigate() is the single source of truth for URL changes, called from:
-   *   - <a href="#foo"> clicks        → handlePageClick → navigate
-   *   - window.location.hash = 'x'    → setUrl → navigate
-   *   - back/forward (hash history)   → goBack/goForward → navigate
-   *
-   * Hash-only changes on the same document (same base URL before '#')
-   * do NOT fetch — that would reload the SPA and lose state. Instead:
-   *   - fresh hash change:  push to history + fire hashchange
-   *   - fromHistory:        history index already moved, fire popstate + hashchange
-   * Both events, deferred to a microtask so React isn't re-entered
-   * mid-dispatch (same principle as pumpJobs-at-end-of-handleInput).
-   *
-   * Without this, <a href="#foo"> clicks re-fetched the whole HTML,
-   * remounting React from scratch, AND hash entries were never pushed
-   * so back skipped past them entirely. */
   function navigate(tab, url, options = {}) {
     const p = parseUrl(url);
     if (!p) { tab.statusText = 'Invalid URL: ' + url; render(); return; }

@@ -76,18 +76,12 @@ installGlobals({
       const target = String(newUrl || '');
       if (!target || target === 'about:blank') return;
 
-      /* pushState/replaceState: silent URL mutation, no event, no fetch.
-       * Per spec, only back/forward fire popstate; the caller is
-       * responsible for updating the view. */
       if (kind === 'pushstate' || kind === 'replacestate') {
         tab.currentUrl = target;
         try { tab.omnibox.setText(target); } catch (_) {}
         return;
       }
 
-      /* Every other kind goes through navigate(), which detects
-       * hash-only changes (dispatch event + push history, no fetch)
-       * vs real navigation (fetch + replace on fromHistory). */
       const opts = (kind === 'popstate') ? { fromHistory: true }
                  : (kind === 'reload')   ? { reload: true }
                  : {};
@@ -102,10 +96,10 @@ installDomGlobals();
 
 /* DOM extensions that nodes.js and dom-globals.js do NOT provide.
  * Runs AFTER installDomGlobals() so document.createElement exists.
- * See the audit: getBoundingClientRect, focus, blur, click, remove,
+ * Per the audit: getBoundingClientRect, focus, blur, click, remove,
  * matches, closest, contains, classList, style.setProperty,
  * createComment, createDocumentFragment, querySelector(All), children
- * are all implemented in src/dom/nodes.js — do NOT duplicate them here. */
+ * are all in src/dom/nodes.js — do NOT duplicate them here. */
 (function extendElementPrototype() {
   const doc = globalThis.document;
   if (!doc) return;

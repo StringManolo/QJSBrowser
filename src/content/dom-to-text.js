@@ -13,6 +13,16 @@
  * If nodeMap is provided, populates it with elementId → Element DOM.
  * The controller uses this to dispatch real click/input events at the
  * original node when the user interacts with the TUI.
+ *
+ * Click-through fix: pageView.lineAt() rebuilds text segments on every
+ * render and drops custom properties (elementId, _node). Only `linkN`
+ * survives. So we use linkN as the transport channel: for any text
+ * inside an ancestor with a React onClick prop, we register a synthetic
+ * link ({n, href: null, node}) and set linkN on the segment. Click
+ * handling then dispatches a DOM click on `node`, which bubbles to the
+ * React onClick ancestor exactly like a real browser click. This is
+ * what makes <div onClick> cards clickable — the "Read full writeup →"
+ * pattern on stringmanolo.qzz.io.
  */
 
 import { resolveUrl } from 'src/base/url.js';
@@ -31,6 +41,7 @@ const INLINE_BG_TAGS = new Set(['code','kbd','samp','mark','pre']);
 const TEXT_INPUT_TYPES = new Set(['text','email','tel','url','number','search','password']);
 const CLICKABLE_KINDS = new Set(['submit', 'reset', 'button']);
 const SKIP_SUBTREE_TAGS = new Set(['style','script','title','noscript','template']);
+const REACT_CLICK_MAX_DEPTH = 6;
 
 function parseDim(v) {
   if (!v) return 0;
@@ -69,6 +80,38 @@ function svgSize(node) {
   return null;
 }
 
+/* Build a WeakMap of nodes that carry a React onClick prop. Scans once
+ * per domToText() call. The __reactProps$<hash> key is React's internal
+ * convention for attaching props to host DOM nodes; it's how the
+ * delegated listener on #root discovers what handler to invoke. If a
+ * node has this key with a function `onClick`, a click on it or its
+ * descendants will fire that handler. */
+function buildClickableMap(root) {
+  const map = new WeakMap();
+  function visit(n) {
+    if (!n || n.nodeType !== 1) return;
+    try {
+      const keys = Object.keys(n);
+      for (let i = 0; i < keys.length; i++) {
+        const k = keys[i];
+        if (k.length > 13 && k.charCodeAt(0) === 95 /* _ */ &&
+            k.startsWith('__reactProps$')) {
+          const p = n[k];
+          if (p && typeof p.onClick === 'function') {
+            map.set(n, true);
+            break;
+          }
+        }
+      }
+    } catch (_) {}
+    if (n.childNodes) {
+      for (let i = 0; i < n.childNodes.length; i++) visit(n.childNodes[i]);
+    }
+  }
+  visit(root);
+  return map;
+}
+
 export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
   const rules = [];
   for (const css of cssTexts || []) for (const rule of parseStylesheet(css)) rules.push(rule);
@@ -78,6 +121,27 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
   const images = [];
   const _stack = [];
   let linkN = 0;
+
+  const clickable = buildClickableMap(root);
+
+  function nearestClickable(node) {
+    let cur = node;
+    let d = 0;
+    while (cur && d < REACT_CLICK_MAX_DEPTH) {
+      if (clickable.has(cur)) return cur;
+      cur = cur.parentNode;
+      d++;
+    }
+    return null;
+  }
+
+  function registerSyntheticLink(node) {
+    if (!node) return null;
+    if (!nearestClickable(node)) return null;
+    linkN++;
+    links.push({ n: linkN, href: null, node, text: '' });
+    return linkN;
+  }
 
   function makeEntry(node) {
     const tag = node.localName;
@@ -171,14 +235,6 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
     return { fgAnsi, bgAnsi, bold, underline, indent, pre, hidden, pairOverride };
   }
 
-  /* tag is the element being entered or exited. Only suppress the
-   * "last segment was a form" short-circuit when the tag is a form
-   * itself, so that adjacent form controls stay inline within a form.
-   * For block containers (article, section, div) holding form controls,
-   * we DO want the break — otherwise rows of <button>s all collapse
-   * onto one line. This was the calculator bug: the input+buttons all
-   * rendered inline because article's break was being suppressed by
-   * the form-segment guard. */
   function emitBlockBreak(tag) {
     if (segments.length === 0) return;
     const last = segments[segments.length - 1];
@@ -230,13 +286,35 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
       text = text.replace(/\n/g, '\n' + pad);
     }
 
+    /* Not a real link? Check for a React onClick ancestor. If found,
+     * register a synthetic link (href:null, node:<innermost>). linkN is
+     * the only custom property lineAt() preserves, so it's our vehicle
+     * for transporting the node reference through pageView. */
+    const innermost = _stack[_stack.length - 1];
+    const node = innermost ? innermost._el : null;
+    if (linkNForSeg === null && node) {
+      const synthetic = registerSyntheticLink(node);
+      if (synthetic !== null) {
+        linkNForSeg = synthetic;
+        links[synthetic - 1].text = text;
+      }
+    }
+
     let pairId;
     if (s.fgAnsi >= 0 || s.bgAnsi >= 0) pairId = theme.lookupPair(s.fgAnsi, s.bgAnsi);
     else if (s.pairOverride) pairId = theme.pairs.pairOverride;
+    else if (linkNForSeg !== null && links[linkNForSeg - 1] && links[linkNForSeg - 1].href)
+      pairId = theme.pairs.link;
     else if (linkNForSeg !== null) pairId = theme.pairs.link;
     else pairId = theme.pairs.page;
 
-    segments.push({ text, linkN: linkNForSeg, pair: pairId, bold: s.bold, underline: s.underline });
+    segments.push({
+      text,
+      linkN: linkNForSeg,
+      pair: pairId,
+      bold: s.bold,
+      underline: s.underline,
+    });
   }
 
   function pushFormSegment(kind, info, node) {
@@ -372,7 +450,8 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
       width: parseDim(node.getAttribute('width')),
       height: parseDim(node.getAttribute('height')),
     });
-    segments.push({ type: 'img', src, alt });
+    const synthetic = registerSyntheticLink(node);
+    segments.push({ type: 'img', src, alt, linkN: synthetic });
   }
 
   function pushSvg(node) {
@@ -398,6 +477,12 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
       linkNForSeg = a.n;
       a.accumulated += label;
       if (!a.prefixEmitted) { text = `[${a.n}]` + label; a.prefixEmitted = true; }
+    } else {
+      const synthetic = registerSyntheticLink(node);
+      if (synthetic !== null) {
+        linkNForSeg = synthetic;
+        links[synthetic - 1].text = label;
+      }
     }
 
     segments.push({
@@ -504,7 +589,9 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
 
   if (links.length > 0) {
     segments.push({ text: '\n\n─── Links ───\n', linkN: null });
-    for (const l of links) segments.push({ text: `[${l.n}] ${l.href}\n`, linkN: l.n });
+    for (const l of links) {
+      if (l.href) segments.push({ text: `[${l.n}] ${l.href}\n`, linkN: l.n });
+    }
   }
 
   let text = '';

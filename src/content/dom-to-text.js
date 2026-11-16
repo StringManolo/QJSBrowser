@@ -23,22 +23,13 @@ import { TAG_DEFAULTS } from 'src/css/defaults.js';
 import { decodeHtmlEntities } from 'src/content/html-entities.js';
 
 const BLOCK_TAGS = ['p','div','h1','h2','h3','h4','h5','h6',
-                    'blockquote','pre','ul','ol','table','form'];
+                    'blockquote','pre','ul','ol','table','form',
+                    'article','section','header','footer','main',
+                    'nav','aside','figure','figcaption','details',
+                    'summary','fieldset','address'];
 const INLINE_BG_TAGS = new Set(['code','kbd','samp','mark','pre']);
 const TEXT_INPUT_TYPES = new Set(['text','email','tel','url','number','search','password']);
 const CLICKABLE_KINDS = new Set(['submit', 'reset', 'button']);
-
-/* Subtrees whose text content should never be emitted as page text.
- * - style:     CSS text; example.com's s.js injects one via
- *              insertAdjacentHTML and, without this skip, the rules
- *              appear as a paragraph.
- * - script:    JS source; htmlToDom never creates a text child, but
- *              defensive skip is cheap.
- * - title:     metadata; because html-to-dom drops the <head> wrapper,
- *              a document <title> ends up as a direct child of <body>
- *              and would otherwise render as page text.
- * - noscript:  content for browsers without JS; we have JS.
- * - template:  inert by spec. */
 const SKIP_SUBTREE_TAGS = new Set(['style','script','title','noscript','template']);
 
 function parseDim(v) {
@@ -60,9 +51,6 @@ function fontSizeLevel(fs) {
   if (px >= 16) return 5; return 6;
 }
 
-/* Extract intrinsic dimensions from an inline <svg>. Priority order:
- * width/height attributes, then viewBox "minX minY W H" (with commas
- * or spaces). Returns null if neither is usable. */
 function svgSize(node) {
   const w = parseFloat(node.getAttribute('width'));
   const h = parseFloat(node.getAttribute('height'));
@@ -183,11 +171,19 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
     return { fgAnsi, bgAnsi, bold, underline, indent, pre, hidden, pairOverride };
   }
 
-  function emitBlockBreak() {
+  /* tag is the element being entered or exited. Only suppress the
+   * "last segment was a form" short-circuit when the tag is a form
+   * itself, so that adjacent form controls stay inline within a form.
+   * For block containers (article, section, div) holding form controls,
+   * we DO want the break — otherwise rows of <button>s all collapse
+   * onto one line. This was the calculator bug: the input+buttons all
+   * rendered inline because article's break was being suppressed by
+   * the form-segment guard. */
+  function emitBlockBreak(tag) {
     if (segments.length === 0) return;
     const last = segments[segments.length - 1];
     if (last.kind === 'bullet') return;
-    if (last.type === 'form') return;
+    if (last.type === 'form' && tag === 'form') return;
     const lastText = last.text || '';
     if (lastText.endsWith('\n\n')) return;
     if (lastText.endsWith('\n')) segments.push({ text: '\n', linkN: null });
@@ -379,14 +375,6 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
     segments.push({ type: 'img', src, alt });
   }
 
-  /* Inline <svg>: emit a text placeholder. Full rasterization needs
-   * NanoSVG in image.so and a live DOM → string serializer; cost/benefit
-   * for a 2-cell icon is poor. The placeholder keeps the layout
-   * readable. Label priority: aria-label, then <title>/<desc> child,
-   * then intrinsic dimensions ("[svg 44×44]"), then bare "[svg]".
-   * If the svg sits inside an <a>, the placeholder inherits link
-   * semantics: the [N] prefix is attached on first emission inside the
-   * link and clicking it navigates, matching <img> inside <a>. */
   function pushSvg(node) {
     let label = node.getAttribute('aria-label') || '';
     if (!label) {
@@ -424,7 +412,7 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
   function enterElement(node) {
     const tag = node.localName;
     if (tag === 'form') {
-      emitBlockBreak();
+      emitBlockBreak('form');
       _stack.push(makeEntry(node));
       return;
     }
@@ -445,7 +433,7 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
       _stack.push(makeEntry(node));
       return;
     }
-    if (BLOCK_TAGS.includes(tag)) emitBlockBreak();
+    if (BLOCK_TAGS.includes(tag)) emitBlockBreak(tag);
     _stack.push(makeEntry(node));
   }
 
@@ -463,11 +451,11 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
         return;
       }
       if (tag === 'form') {
-        emitBlockBreak();
+        emitBlockBreak('form');
         _stack.pop();
         return;
       }
-      if (BLOCK_TAGS.includes(tag)) emitBlockBreak();
+      if (BLOCK_TAGS.includes(tag)) emitBlockBreak(tag);
     }
     _stack.pop();
   }
@@ -482,7 +470,7 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
     if (SKIP_SUBTREE_TAGS.has(tag)) return;
 
     if (tag === 'br') { segments.push({ text: '\n', linkN: null }); return; }
-    if (tag === 'hr') { emitBlockBreak(); segments.push({ text: '────\n', linkN: null }); return; }
+    if (tag === 'hr') { emitBlockBreak('hr'); segments.push({ text: '────\n', linkN: null }); return; }
     if (tag === 'img') { pushImage(node); return; }
     if (tag === 'input') { enterInput(node); return; }
     if (tag === 'svg') { pushSvg(node); return; }

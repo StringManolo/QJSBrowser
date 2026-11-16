@@ -22,3 +22,5 @@
 - Add cache
 - Add mouse support to the console
 - Improve console UI
+- Add scroll to the console (auto scroll when copy to clipboard)
+

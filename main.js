@@ -6,19 +6,20 @@ import zlib  from 'zlib';
 import fs    from 'fs';
 import dns   from 'dns';
 
-import { buildKeyMap }      from 'src/base/keys.js';
-import { createScheduler }  from 'src/base/scheduler.js';
-import { createTimers }     from 'src/base/timers.js';
-import { installGlobals }   from 'src/browser/globals.js';
-import { installDomGlobals } from 'src/browser/dom-globals.js';
-import { createTheme }      from 'src/ui/theme.js';
-import { createConsole }    from 'src/ui/console.js';
-import { createImageView }  from 'src/ui/image-view.js';
-import { createHttpClient } from 'src/net/http-client.js';
-import { createCookieJar }  from 'src/net/cookies.js';
-import { createSettings }   from 'src/browser/settings.js';
-import { createTabManager } from 'src/browser/tab-manager.js';
-import { createController } from 'src/browser/controller.js';
+import { buildKeyMap }        from 'src/base/keys.js';
+import { createScheduler }    from 'src/base/scheduler.js';
+import { createTimers }       from 'src/base/timers.js';
+import { installGlobals }     from 'src/browser/globals.js';
+import { installDomGlobals }  from 'src/browser/dom-globals.js';
+import { parseHtmlInto }      from 'src/content/html-to-dom.js';
+import { createTheme }        from 'src/ui/theme.js';
+import { createConsole }      from 'src/ui/console.js';
+import { createImageView }    from 'src/ui/image-view.js';
+import { createHttpClient }   from 'src/net/http-client.js';
+import { createCookieJar }    from 'src/net/cookies.js';
+import { createSettings }     from 'src/browser/settings.js';
+import { createTabManager }   from 'src/browser/tab-manager.js';
+import { createController }   from 'src/browser/controller.js';
 
 tui.init();
 tui.mouseEnable();
@@ -69,6 +70,126 @@ installGlobals({
 });
 
 installDomGlobals();
+
+/* DOM APIs that React 18 / real-world pages call but that dom-globals.js
+ * doesn't provide. Added here (not in globals.js) because the Element
+ * prototype hierarchy only exists after installDomGlobals() builds the
+ * Document/Node/Element classes. */
+(function extendElementPrototype() {
+  const doc = globalThis.document;
+  if (!doc) return;
+  let probe;
+  try { probe = doc.createElement('div'); } catch (_) {}
+  if (!probe) return;
+  const proto = Object.getPrototypeOf(probe);
+  if (!proto) return;
+
+  /* insertAdjacentHTML. Positions per DOM spec:
+   *   beforebegin — before `this` in its parent
+   *   afterbegin  — inside `this`, as first child
+   *   beforeend   — inside `this`, as last child
+   *   afterend    — after `this` in its parent
+   * Scripts are parsed but never executed (matches browsers). */
+  if (typeof proto.insertAdjacentHTML !== 'function') {
+    proto.insertAdjacentHTML = function (pos, html) {
+      const scratch = doc.createElement('div');
+      parseHtmlInto(html, '', doc, scratch);
+      const nodes = Array.prototype.slice.call(scratch.childNodes || []);
+      pos = String(pos).toLowerCase();
+      if (pos === 'beforebegin') {
+        if (this.parentNode) for (const n of nodes) this.parentNode.insertBefore(n, this);
+      } else if (pos === 'afterbegin') {
+        const first = this.firstChild;
+        for (const n of nodes) this.insertBefore(n, first);
+      } else if (pos === 'beforeend') {
+        for (const n of nodes) this.appendChild(n);
+      } else if (pos === 'afterend') {
+        if (this.parentNode) {
+          const next = this.nextSibling;
+          for (const n of nodes) this.parentNode.insertBefore(n, next);
+        }
+      } else {
+        throw new Error("insertAdjacentHTML: invalid position '" + pos + "'");
+      }
+    };
+  }
+
+  /* Element-scoped querySelector/querySelectorAll. The stub in globals.js
+   * only defines document.querySelector*, which leaves
+   * document.body.querySelector undefined — example.com's s.js and most
+   * modern bundles call it on specific elements. Scoped to descendants
+   * (excludes `this`, per spec). */
+  if (typeof proto.querySelectorAll !== 'function') {
+    proto.querySelectorAll = function (sel) {
+      const out = [];
+      if (!sel || typeof sel !== 'string') return out;
+      const m = sel.match(/^([a-z][a-z0-9-]*)?(?:#([\w-]+))?(?:\.([\w-]+))?/i);
+      if (!m) return out;
+      const wantTag = (m[1] || '').toLowerCase();
+      const wantId  = m[2] || null;
+      const wantCls = m[3] || null;
+      const walk = (n) => {
+        if (!n || !n.tagName) return;
+        const t = (n.tagName || '').toLowerCase();
+        let ok = true;
+        if (wantTag && t !== wantTag) ok = false;
+        if (ok && wantId  && n.getAttribute && n.getAttribute('id') !== wantId) ok = false;
+        if (ok && wantCls && n.classList && !n.classList.contains(wantCls)) ok = false;
+        if (ok) out.push(n);
+        if (n.childNodes) for (const c of n.childNodes) walk(c);
+      };
+      if (this.childNodes) for (const c of this.childNodes) walk(c);
+      return out;
+    };
+    proto.querySelector = function (sel) {
+      return this.querySelectorAll(sel)[0] || null;
+    };
+  }
+
+  /* lang/dir as reflected attributes. example.com's script sets
+   * p.lang = "en" and then checks p.lang == "ar" to pick the user's
+   * language. Without reflection, the setter creates a shadow property
+   * that never touches the `lang` attribute, and the getter returns
+   * undefined — the multi-language picker silently does nothing. */
+  if (!Object.getOwnPropertyDescriptor(proto, 'lang')) {
+    Object.defineProperty(proto, 'lang', {
+      configurable: true,
+      get() { return this.getAttribute ? (this.getAttribute('lang') || '') : ''; },
+      set(v) { if (this.setAttribute) this.setAttribute('lang', String(v)); },
+    });
+  }
+  if (!Object.getOwnPropertyDescriptor(proto, 'dir')) {
+    Object.defineProperty(proto, 'dir', {
+      configurable: true,
+      get() { return this.getAttribute ? (this.getAttribute('dir') || '') : ''; },
+      set(v) { if (this.setAttribute) this.setAttribute('dir', String(v)); },
+    });
+  }
+
+  /* prepend (idempotent — patchDom's version may already be here). */
+  if (typeof proto.prepend !== 'function') {
+    proto.prepend = function (...kids) {
+      const first = this.firstChild;
+      for (const k of kids) this.insertBefore(k, first);
+    };
+  }
+
+  /* children (used by example.com's B.children[0]). */
+  if (!Object.getOwnPropertyDescriptor(proto, 'children')) {
+    Object.defineProperty(proto, 'children', {
+      configurable: true,
+      get() {
+        const out = [];
+        const list = this.childNodes || [];
+        for (let i = 0; i < list.length; i++) {
+          const n = list[i];
+          if (n && n.nodeType === 1) out.push(n);
+        }
+        return out;
+      },
+    });
+  }
+})();
 
 /* Redirect every console.* call to the in-TUI console.
  *

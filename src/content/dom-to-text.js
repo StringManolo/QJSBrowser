@@ -28,6 +28,19 @@ const INLINE_BG_TAGS = new Set(['code','kbd','samp','mark','pre']);
 const TEXT_INPUT_TYPES = new Set(['text','email','tel','url','number','search','password']);
 const CLICKABLE_KINDS = new Set(['submit', 'reset', 'button']);
 
+/* Subtrees whose text content should never be emitted as page text.
+ * - style:     CSS text; example.com's s.js injects one via
+ *              insertAdjacentHTML and, without this skip, the rules
+ *              appear as a paragraph.
+ * - script:    JS source; htmlToDom never creates a text child, but
+ *              defensive skip is cheap.
+ * - title:     metadata; because html-to-dom drops the <head> wrapper,
+ *              a document <title> ends up as a direct child of <body>
+ *              and would otherwise render as page text.
+ * - noscript:  content for browsers without JS; we have JS.
+ * - template:  inert by spec. */
+const SKIP_SUBTREE_TAGS = new Set(['style','script','title','noscript','template']);
+
 function parseDim(v) {
   if (!v) return 0;
   if (!/^\d+$/.test(String(v).trim())) return 0;
@@ -45,6 +58,27 @@ function fontSizeLevel(fs) {
   if (px >= 32) return 1; if (px >= 24) return 2;
   if (px >= 20) return 3; if (px >= 18) return 4;
   if (px >= 16) return 5; return 6;
+}
+
+/* Extract intrinsic dimensions from an inline <svg>. Priority order:
+ * width/height attributes, then viewBox "minX minY W H" (with commas
+ * or spaces). Returns null if neither is usable. */
+function svgSize(node) {
+  const w = parseFloat(node.getAttribute('width'));
+  const h = parseFloat(node.getAttribute('height'));
+  if (isFinite(w) && isFinite(h) && w > 0 && h > 0)
+    return { w: Math.round(w), h: Math.round(h) };
+  const vb = node.getAttribute('viewBox');
+  if (vb) {
+    const parts = String(vb).trim().split(/[\s,]+/).filter(Boolean);
+    if (parts.length === 4) {
+      const wv = parseFloat(parts[2]);
+      const hv = parseFloat(parts[3]);
+      if (isFinite(wv) && isFinite(hv) && wv > 0 && hv > 0)
+        return { w: Math.round(wv), h: Math.round(hv) };
+    }
+  }
+  return null;
 }
 
 export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
@@ -215,9 +249,6 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
     const id = formState.addElement(info);
     if (nodeMap && node) nodeMap.set(id, node);
 
-    /* Botones consecutivos se pegan sin separación porque no hay layout
-     * inline-block. Añadimos un espacio antes de un botón clicable si
-     * el segmento anterior es otro botón o texto sin nueva línea. */
     if (CLICKABLE_KINDS.has(kind) && segments.length > 0) {
       const last = segments[segments.length - 1];
       if (last.type === 'form') {
@@ -320,8 +351,6 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
   function enterButton(node) {
     if (!formState) return;
     const type = (node.getAttribute('type') || 'submit').toLowerCase();
-    /* label: value attribute primero; si no hay, textContent del botón
-     * (React escribe el label como hijo de texto, no como value=""). */
     const valueAttr = node.getAttribute('value') || '';
     const label = valueAttr || node.textContent || '';
     pushFormSegment(
@@ -348,6 +377,48 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
       height: parseDim(node.getAttribute('height')),
     });
     segments.push({ type: 'img', src, alt });
+  }
+
+  /* Inline <svg>: emit a text placeholder. Full rasterization needs
+   * NanoSVG in image.so and a live DOM → string serializer; cost/benefit
+   * for a 2-cell icon is poor. The placeholder keeps the layout
+   * readable. Label priority: aria-label, then <title>/<desc> child,
+   * then intrinsic dimensions ("[svg 44×44]"), then bare "[svg]".
+   * If the svg sits inside an <a>, the placeholder inherits link
+   * semantics: the [N] prefix is attached on first emission inside the
+   * link and clicking it navigates, matching <img> inside <a>. */
+  function pushSvg(node) {
+    let label = node.getAttribute('aria-label') || '';
+    if (!label) {
+      for (const c of node.childNodes) {
+        if (c.nodeType === 1 &&
+            (c.localName === 'title' || c.localName === 'desc')) {
+          const t = (c.textContent || '').trim();
+          if (t) { label = t; break; }
+        }
+      }
+    }
+    if (!label) {
+      const sz = svgSize(node);
+      label = sz ? `[svg ${sz.w}×${sz.h}]` : '[svg]';
+    }
+
+    const a = topLink();
+    let linkNForSeg = null;
+    let text = label;
+    if (a && a.href) {
+      linkNForSeg = a.n;
+      a.accumulated += label;
+      if (!a.prefixEmitted) { text = `[${a.n}]` + label; a.prefixEmitted = true; }
+    }
+
+    segments.push({
+      text,
+      linkN: linkNForSeg,
+      pair: linkNForSeg !== null ? theme.pairs.link : theme.pairs.warning,
+      bold: false,
+      underline: false,
+    });
   }
 
   function enterElement(node) {
@@ -408,10 +479,13 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
 
     const tag = node.localName;
 
+    if (SKIP_SUBTREE_TAGS.has(tag)) return;
+
     if (tag === 'br') { segments.push({ text: '\n', linkN: null }); return; }
     if (tag === 'hr') { emitBlockBreak(); segments.push({ text: '────\n', linkN: null }); return; }
     if (tag === 'img') { pushImage(node); return; }
     if (tag === 'input') { enterInput(node); return; }
+    if (tag === 'svg') { pushSvg(node); return; }
 
     if (tag === 'option') {
       enterOption(node);
@@ -429,8 +503,6 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
       return;
     }
     if (tag === 'button') {
-      /* El botón consume su textContent como label en enterButton.
-       * NO caminar hijos — el texto ya está en el segment form. */
       enterButton(node);
       return;
     }

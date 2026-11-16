@@ -6,15 +6,14 @@
  *   - style is a Proxy: el.style.color = 'red' works, kebab-cases camelCase.
  *   - classList stays in sync with the `class` attribute.
  *   - EventTarget bubbling goes up parentNode to the document.
- *   - innerHTML setter currently replaces content with text; a real HTML
- *     parser arrives in a later PR.
+ *   - innerHTML setter currently replaces content with text.
  *   - Every mutator notifies src/dom/mutation-hook.js so the active tab
  *     can be re-serialized on the next frame (dom-live-render).
  *   - isConnected gates notification so building a detached tree or a
  *     DocumentFragment doesn't spam the hook.
- *   - document.write is a no-op with a warning (matches post-parse write
- *     semantics loosely; legacy pages using it during parse will lose
- *     content — acceptable for modern pages).
+ *   - document.write is a no-op with a warning.
+ *   - ownerDocument returns the document that created the node (or the
+ *     current global document for nodes built via `new Element(...)`).
  */
 
 import { EventTarget, Event } from 'src/dom/events.js';
@@ -22,6 +21,7 @@ import { notifyMutation, beginMutationBatch, endMutationBatch } from 'src/dom/mu
 
 const ELEMENT_NODE = 1;
 const TEXT_NODE    = 3;
+const COMMENT_NODE = 8;
 const DOCUMENT_NODE = 9;
 const DOCUMENT_FRAGMENT_NODE = 11;
 
@@ -103,9 +103,14 @@ export class Node extends EventTarget {
     super();
     this.parentNode = null;
     this.childNodes = [];
+    this._ownerDocument = null;
   }
 
   get nodeType() { return 0; }
+  get ownerDocument() {
+    if (this.nodeType === DOCUMENT_NODE) return null;
+    return this._ownerDocument || globalThis.document || null;
+  }
   get firstChild() { return this.childNodes[0] || null; }
   get lastChild()  { return this.childNodes[this.childNodes.length - 1] || null; }
   get nextSibling() {
@@ -211,7 +216,9 @@ export class Node extends EventTarget {
     for (const c of this.childNodes) c.parentNode = null;
     this.childNodes = [];
     if (v !== null && v !== undefined && String(v).length > 0) {
-      this.appendChild(new Text(String(v)));
+      const t = new Text(String(v));
+      t._ownerDocument = this.ownerDocument;
+      this.appendChild(t);
     } else if (this.isConnected) {
       notifyMutation();
     }
@@ -219,15 +226,21 @@ export class Node extends EventTarget {
 
   append(...nodes) {
     for (const n of nodes) {
-      if (typeof n === 'string') this.appendChild(new Text(n));
-      else if (n) this.appendChild(n);
+      if (typeof n === 'string') {
+        const t = new Text(n);
+        t._ownerDocument = this.ownerDocument;
+        this.appendChild(t);
+      } else if (n) this.appendChild(n);
     }
   }
   prepend(...nodes) {
     const first = this.firstChild;
     for (const n of nodes) {
-      if (typeof n === 'string') this.insertBefore(new Text(n), first);
-      else if (n) this.insertBefore(n, first);
+      if (typeof n === 'string') {
+        const t = new Text(n);
+        t._ownerDocument = this.ownerDocument;
+        this.insertBefore(t, first);
+      } else if (n) this.insertBefore(n, first);
     }
   }
 
@@ -251,6 +264,21 @@ export class Text extends Node {
   get textContent() { return this._data; }
   set textContent(v) { this._data = String(v == null ? '' : v); if (this.isConnected) notifyMutation(); }
   get length() { return this._data.length; }
+}
+
+export class Comment extends Node {
+  constructor(data) {
+    super();
+    this._data = String(data == null ? '' : data);
+  }
+  get nodeType() { return COMMENT_NODE; }
+  get nodeName() { return '#comment'; }
+  get nodeValue() { return this._data; }
+  set nodeValue(v) { this._data = String(v == null ? '' : v); }
+  get data() { return this._data; }
+  set data(v) { this._data = String(v == null ? '' : v); }
+  get textContent() { return this._data; }
+  set textContent(v) { this._data = String(v == null ? '' : v); }
 }
 
 class ClassList {
@@ -446,17 +474,38 @@ export class Document extends Node {
   }
   get nodeType() { return DOCUMENT_NODE; }
   get nodeName() { return '#document'; }
+  get defaultView() { return globalThis; }
+  get activeElement() { return this.body; }
+  get visibilityState() { return 'visible'; }
+  hasFocus() { return true; }
 
-  createElement(tag)           { return new Element(tag); }
-  createElementNS(ns, tag)     { return new Element(tag, ns); }
-  createTextNode(data)         { return new Text(data); }
-  createDocumentFragment()     { return new DocumentFragment(); }
-  createEvent(type)            { return new Event(String(type)); }
+  createElement(tag) {
+    const el = new Element(tag);
+    el._ownerDocument = this;
+    return el;
+  }
+  createElementNS(ns, tag) {
+    const el = new Element(tag, ns);
+    el._ownerDocument = this;
+    return el;
+  }
+  createTextNode(data) {
+    const t = new Text(data);
+    t._ownerDocument = this;
+    return t;
+  }
+  createComment(data) {
+    const c = new Comment(data);
+    c._ownerDocument = this;
+    return c;
+  }
+  createDocumentFragment() {
+    const f = new DocumentFragment();
+    f._ownerDocument = this;
+    return f;
+  }
+  createEvent(type) { return new Event(String(type)); }
 
-  /* document.write is a no-op: legacy pages that use it during parse
-   * will miss content, but modern (React/Vite/webpack) pages never call
-   * it. Post-parse write would wipe the entire document per spec, which
-   * we'd rather not emulate — silently ignoring is less destructive. */
   write(..._args) {
     console.warn('[document.write] not supported — ignored');
   }
@@ -501,6 +550,9 @@ function serialize(node) {
   if (node.nodeType === TEXT_NODE) {
     return String(node.data)
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  if (node.nodeType === COMMENT_NODE) {
+    return '<!--' + String(node.data) + '-->';
   }
   if (node.nodeType !== ELEMENT_NODE) return '';
   const tag = node.localName;

@@ -39,18 +39,31 @@ function makeLocation(url) {
     hash,
     origin,
     toString() { return url; },
-    /* Navigation from JS is not wired yet (needs a callback into the
-     * controller). Surface the limitation rather than silently no-op. */
     assign()  { console.warn('[location] navigation not implemented yet'); },
     replace() { console.warn('[location] navigation not implemented yet'); },
     reload()  { console.warn('[location] reload not implemented yet'); },
   };
 }
 
+/* Minimal MessageChannel: enough for React 18's scheduler. Delivery is
+ * deferred via setTimeout so the event loop stays cooperative. */
+class MessageChannelPolyfill {
+  constructor() {
+    this.port1 = { onmessage: null, postMessage: null, start() {}, close() {} };
+    this.port2 = { onmessage: null, postMessage: null, start() {}, close() {} };
+    const p1 = this.port1, p2 = this.port2;
+    p2.postMessage = (data) => {
+      setTimeout(() => { if (p1.onmessage) p1.onmessage({ data }); }, 0);
+    };
+    p1.postMessage = (data) => {
+      setTimeout(() => { if (p2.onmessage) p2.onmessage({ data }); }, 0);
+    };
+  }
+}
+
 export function installGlobals({ tui, timers, getUrl }) {
   const g = globalThis;
 
-  /* window === globalThis */
   if (!Object.getOwnPropertyDescriptor(g, 'window')) {
     Object.defineProperty(g, 'window', {
       value: g, configurable: true, writable: false,
@@ -58,7 +71,6 @@ export function installGlobals({ tui, timers, getUrl }) {
   }
   g.self = g;
 
-  /* navigator */
   if (!g.navigator) {
     g.navigator = {
       userAgent: 'Mozilla/5.0 (X11; Linux x86_64) QJSBrowser/0.1',
@@ -73,7 +85,6 @@ export function installGlobals({ tui, timers, getUrl }) {
     };
   }
 
-  /* viewport size (from ncurses) */
   function readSize() {
     try { return tui.size(); } catch (_) { return { rows: 24, cols: 80 }; }
   }
@@ -87,7 +98,6 @@ export function installGlobals({ tui, timers, getUrl }) {
   Object.defineProperty(g, 'pageXOffset', { value: 0, configurable: true });
   Object.defineProperty(g, 'pageYOffset', { value: 0, configurable: true });
 
-  /* performance */
   if (!g.performance) {
     const t0 = Date.now();
     g.performance = {
@@ -101,11 +111,9 @@ export function installGlobals({ tui, timers, getUrl }) {
     };
   }
 
-  /* storage (in-memory; persistence is a separate PR) */
   if (!g.localStorage)   g.localStorage   = makeStorage();
   if (!g.sessionStorage) g.sessionStorage = makeStorage();
 
-  /* matchMedia (always "no match" — no CSS media query engine yet) */
   if (!g.matchMedia) {
     g.matchMedia = (q) => ({
       matches: false,
@@ -115,13 +123,11 @@ export function installGlobals({ tui, timers, getUrl }) {
     });
   }
 
-  /* timers */
   g.setTimeout    = timers.setTimeout;
   g.setInterval   = timers.setInterval;
   g.clearTimeout  = timers.clearTimeout;
   g.clearInterval = timers.clearInterval;
 
-  /* requestAnimationFrame — 16 ms granularity is fine for a terminal */
   if (!g.requestAnimationFrame) {
     g.requestAnimationFrame = (fn) => {
       return timers.setTimeout(() => {
@@ -132,12 +138,13 @@ export function installGlobals({ tui, timers, getUrl }) {
     g.cancelAnimationFrame = (id) => timers.clearTimeout(id);
   }
 
-  /* queueMicrotask — QuickJS promises are microtask-driven already */
   if (!g.queueMicrotask) {
     g.queueMicrotask = (fn) => { Promise.resolve().then(fn); };
   }
 
-  /* location — read-only view over the active tab URL */
+  /* React 18's scheduler uses this to schedule work without polling. */
+  if (!g.MessageChannel) g.MessageChannel = MessageChannelPolyfill;
+
   if (!g.location) {
     Object.defineProperty(g, 'location', {
       configurable: true,
@@ -145,7 +152,6 @@ export function installGlobals({ tui, timers, getUrl }) {
     });
   }
 
-  /* history — no-op stubs so routers don't crash */
   if (!g.history) {
     g.history = {
       length: 1,
@@ -156,7 +162,8 @@ export function installGlobals({ tui, timers, getUrl }) {
     };
   }
 
-  /* console aliases React/Webpack print through */
+  if (!g.hasFocus) g.hasFocus = () => true;
+
   if (g.console) {
     if (!g.console.warn)  g.console.warn  = g.console.log;
     if (!g.console.info)  g.console.info  = g.console.log;

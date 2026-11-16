@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>QJSBrowser React Smoke Test</title>
+</head>
+<body>
+
+<h2>React Smoke Test</h2>
+<p>This page loads React 18 (production UMD) from jsdelivr, mounts a
+   component into <code>#root</code>, and verifies it rendered.</p>
+
+<div id="root"></div>
+
+<div id="log"></div>
+
+<script>
+function logReact(msg, ok) {
+  var box = document.getElementById('log');
+  if (!box) return;
+  var p = document.createElement('p');
+  p.textContent = (ok ? '✓ ' : '✗ ') + msg;
+  p.style.color = ok ? '#66ff66' : '#ff4444';
+  box.appendChild(p);
+}
+
+function describeRoot(container) {
+  var kids = container.childNodes;
+  var parts = ['childNodes.length=' + kids.length];
+  for (var i = 0; i < kids.length && i < 10; i++) {
+    var k = kids[i];
+    var t = k.nodeType === 1 ? k.localName
+          : k.nodeType === 3 ? '#text(' + JSON.stringify(k.data.slice(0, 20)) + ')'
+          : k.nodeType === 8 ? '#comment(' + JSON.stringify(k.data.slice(0, 20)) + ')'
+          : 'node#' + k.nodeType;
+    parts.push(t);
+  }
+  return parts.join(' | ');
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  if (typeof React === 'undefined')    { logReact('React global missing', false); return; }
+  if (typeof ReactDOM === 'undefined') { logReact('ReactDOM global missing', false); return; }
+  logReact('React + ReactDOM globals loaded', true);
+
+  var needed = [
+    'Node','Element','HTMLElement','Text','Comment','Document','DocumentFragment',
+    'CharacterData','NodeList','HTMLCollection',
+    'HTMLDivElement','HTMLSpanElement','HTMLInputElement','HTMLMediaElement',
+    'HTMLVideoElement','HTMLAudioElement','HTMLIFrameElement',
+    'SVGElement','SVGSVGElement',
+    'Event','MouseEvent','PointerEvent','KeyboardEvent','WheelEvent',
+    'FocusEvent','InputEvent',
+    'MutationObserver',
+  ];
+  var missing = [];
+  for (var i = 0; i < needed.length; i++) {
+    if (typeof window[needed[i]] === 'undefined') missing.push(needed[i]);
+  }
+  if (missing.length === 0) {
+    logReact('All ' + needed.length + ' expected DOM classes are defined', true);
+  } else {
+    logReact('MISSING DOM classes: ' + missing.join(', '), false);
+  }
+
+  try {
+    var container = document.getElementById('root');
+    if (!container) { logReact('no #root element', false); return; }
+
+    var root = ReactDOM.createRoot(container);
+    logReact('createRoot(#root) succeeded', true);
+
+    root.render(
+      React.createElement(
+        'h1',
+        { style: { color: '#66ff66' } },
+        'Hello from React!'
+      )
+    );
+    logReact('root.render() called', true);
+    logReact('immediately after render (concurrent mode is async): ' +
+             describeRoot(container), true);
+
+    setTimeout(function() {
+      /* Query WITHIN the container, not the whole document — the static
+       * <h2>React Smoke Test</h2> heading is not what we're looking for. */
+      var h1 = container.querySelector('h1');
+      if (h1 && h1.textContent === 'Hello from React!') {
+        logReact('React rendered <h1>Hello from React!</h1>', true);
+        logReact('DONE — React is functional', true);
+      } else {
+        logReact('React did not render at t=1000ms', false);
+        logReact('  root state: ' + describeRoot(container), false);
+        logReact('  root.innerHTML: ' +
+                 JSON.stringify(container.innerHTML.slice(0, 200)), false);
+      }
+    }, 1000);
+  } catch (e) {
+    logReact('React threw: ' + (e && e.stack || String(e)), false);
+  }
+});
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+
+</body>
+</html>

@@ -31,7 +31,8 @@ export function createController(deps) {
     () => {
       /* Clear history in every open tab */
       for (const t of tabManager.list()) t.history.clear();
-    }
+    },
+    deps.onToggleConsole || null
   );
 
   let running = true;

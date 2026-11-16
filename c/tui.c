@@ -212,6 +212,21 @@ static JSValue t_set_cursor(JSContext *c, JSValueConst v, int ac, JSValueConst *
   return JS_UNDEFINED;
 }
 
+static JSValue t_ungetch(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
+  (void)v; (void)ac;
+  int ch;
+  if (JS_ToInt32(c, &ch, av[0])) return JS_EXCEPTION;
+  return JS_NewInt32(c, ungetch(ch));
+}
+
+/* Force the next refresh() to repaint the physical screen from scratch.
+ * Used to eliminate stale cells left behind by overlays (console, images). */
+static JSValue t_clearok(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
+  (void)c; (void)v; (void)ac; (void)av;
+  clearok(stdscr, TRUE);
+  return JS_UNDEFINED;
+}
+
 static JSValue t_mouse_enable(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
   (void)c; (void)v; (void)ac; (void)av;
   mmask_t supported = mousemask(
@@ -321,6 +336,8 @@ static const JSCFunctionListEntry tui_funcs[] = {
   JS_CFUNC_DEF("box", 6, t_box),
   JS_CFUNC_DEF("hline", 5, t_hline),
   JS_CFUNC_DEF("setCursor", 1, t_set_cursor),
+  JS_CFUNC_DEF("ungetch", 1, t_ungetch),
+  JS_CFUNC_DEF("clearok", 0, t_clearok),
   JS_CFUNC_DEF("mouseEnable", 0, t_mouse_enable),
   JS_CFUNC_DEF("mouseDisable", 0, t_mouse_disable),
   JS_CFUNC_DEF("getMouse", 0, t_get_mouse),
@@ -343,6 +360,9 @@ static const JSCFunctionListEntry tui_consts[] = {
   JS_PROP_INT32_DEF("KEY_DOWN",      KEY_DOWN,      JS_PROP_CONFIGURABLE),
   JS_PROP_INT32_DEF("KEY_HOME",      KEY_HOME,      JS_PROP_CONFIGURABLE),
   JS_PROP_INT32_DEF("KEY_END",       KEY_END,       JS_PROP_CONFIGURABLE),
+  JS_PROP_INT32_DEF("KEY_PPAGE",     KEY_PPAGE,     JS_PROP_CONFIGURABLE),
+  JS_PROP_INT32_DEF("KEY_NPAGE",     KEY_NPAGE,     JS_PROP_CONFIGURABLE),
+  JS_PROP_INT32_DEF("KEY_F12",       KEY_F(12),     JS_PROP_CONFIGURABLE),
   JS_PROP_INT32_DEF("KEY_RESIZE",    KEY_RESIZE,    JS_PROP_CONFIGURABLE),
   JS_PROP_INT32_DEF("KEY_MOUSE",     KEY_MOUSE,     JS_PROP_CONFIGURABLE),
   JS_PROP_INT32_DEF("ERR",           ERR,           JS_PROP_CONFIGURABLE),

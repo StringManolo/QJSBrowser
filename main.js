@@ -20,6 +20,7 @@ import { createCookieJar }    from 'src/net/cookies.js';
 import { createSettings }     from 'src/browser/settings.js';
 import { createTabManager }   from 'src/browser/tab-manager.js';
 import { createController }   from 'src/browser/controller.js';
+import { Event }              from 'src/dom/events.js';
 
 tui.init();
 tui.mouseEnable();
@@ -67,19 +68,73 @@ installGlobals({
       return (tab && tab.currentUrl) || '';
     } catch (_) { return ''; }
   },
+  setUrl: (newUrl, kind) => {
+    try {
+      const tab = tabManager.active();
+      if (!tab) return;
+
+      const target = String(newUrl || '');
+      if (!target || target === 'about:blank') return;
+
+      const oldUrl  = tab.currentUrl || '';
+      const oldBase = oldUrl.split('#')[0];
+      const newBase = target.split('#')[0];
+
+      /* Hash-only change on the SAME document: don't fetch (that would
+       * reload the SPA and lose state). Update tab URL, then dispatch
+       * hashchange/popstate on a microtask so React isn't re-entered
+       * mid-dispatch — same principle as the pumpJobs-at-end-of-
+       * handleInput fix. Microtasks flush inside pumpJobs(200), so the
+       * router's setState commits in the same frame. */
+      if (kind === 'hashchange' || (kind === 'popstate' && oldBase === newBase)) {
+        tab.currentUrl = target;
+        try { tab.omnibox.setText(target); } catch (_) {}
+        Promise.resolve().then(() => {
+          try {
+            const type = (kind === 'popstate') ? 'popstate' : 'hashchange';
+            globalThis.dispatchEvent(new Event(type, { bubbles: false }));
+          } catch (_) {}
+        });
+        return;
+      }
+
+      /* pushState/replaceState: silent URL change, no event (caller
+       * is responsible for re-rendering; only back/forward fire
+       * popstate per spec). */
+      if (kind === 'pushstate' || kind === 'replacestate') {
+        tab.currentUrl = target;
+        try { tab.omnibox.setText(target); } catch (_) {}
+        return;
+      }
+
+      /* Real navigation (host/path changed, or explicit reload). */
+      realController.navigate(tab, target,
+        kind === 'reload' ? { fromHistory: true } : {});
+    } catch (e) {
+      try { console.error('[setUrl] ' + (e && e.message || e)); } catch (_) {}
+    }
+  },
 });
 
 installDomGlobals();
 
-/* DOM extensions. Must run AFTER installDomGlobals() so document exists.
+/* DOM extensions that nodes.js and dom-globals.js do NOT provide.
  *
- * The console.log calls here run BEFORE hookConsole, so they go to
- * stderr (visible in the terminal, prefixed with [js] by the C-side
- * console shim). That is intentional: if a patch fails, we want to see
- * it even when devConsole hasn't been wired up yet.
+ * Per the audit: getBoundingClientRect, focus, blur, click, remove,
+ * matches, closest, contains, classList, style.setProperty,
+ * createComment, createDocumentFragment, querySelector(All), children
+ * are all implemented in src/dom/nodes.js — do NOT duplicate them here.
  *
- * Every patch is guarded by its own try/catch so a single failure cannot
- * prevent the others from installing. */
+ * What IS missing and belongs here:
+ *   - insertAdjacentHTML    (example.com's s.js calls it)
+ *   - lang / dir reflection (example.com's lang picker reads these)
+ *   - innerText             (CRA calculators read e.target.innerText)
+ *   - window.getComputedStyle (React + libraries on commit)
+ *   - Element.scrollIntoView / scrollTo / scrollBy (routers, popovers)
+ *
+ * Runs AFTER installDomGlobals() so document.createElement exists.
+ * Console.log calls before hookConsole go to stderr via the C shim;
+ * that is intentional so patch failures are visible even without F12. */
 (function extendElementPrototype() {
   const doc = globalThis.document;
   if (!doc) {
@@ -94,7 +149,10 @@ installDomGlobals();
     return;
   }
 
-  /* ---- insertAdjacentHTML ---- */
+  /* ==================================================================
+   * insertAdjacentHTML
+   * Positions per DOM spec. Scripts parsed but not executed (matches
+   * browser behavior for insertAdjacentHTML). */
   try {
     if (typeof proto.insertAdjacentHTML !== 'function') {
       proto.insertAdjacentHTML = function (pos, html) {
@@ -122,37 +180,12 @@ installDomGlobals();
     }
   } catch (_) {}
 
-  /* ---- querySelector / querySelectorAll ---- */
-  try {
-    if (typeof proto.querySelectorAll !== 'function') {
-      proto.querySelectorAll = function (sel) {
-        const out = [];
-        if (!sel || typeof sel !== 'string') return out;
-        const m = sel.match(/^([a-z][a-z0-9-]*)?(?:#([\w-]+))?(?:\.([\w-]+))?/i);
-        if (!m) return out;
-        const wantTag = (m[1] || '').toLowerCase();
-        const wantId  = m[2] || null;
-        const wantCls = m[3] || null;
-        const walk = (n) => {
-          if (!n || !n.tagName) return;
-          const t = (n.tagName || '').toLowerCase();
-          let ok = true;
-          if (wantTag && t !== wantTag) ok = false;
-          if (ok && wantId  && n.getAttribute && n.getAttribute('id') !== wantId) ok = false;
-          if (ok && wantCls && n.classList && !n.classList.contains(wantCls)) ok = false;
-          if (ok) out.push(n);
-          if (n.childNodes) for (const c of n.childNodes) walk(c);
-        };
-        if (this.childNodes) for (const c of this.childNodes) walk(c);
-        return out;
-      };
-      proto.querySelector = function (sel) {
-        return this.querySelectorAll(sel)[0] || null;
-      };
-    }
-  } catch (_) {}
-
-  /* ---- lang / dir reflection ---- */
+  /* ==================================================================
+   * lang / dir as reflected attributes.
+   * example.com's script sets p.lang = 'en' and then checks p.lang == 'ar'
+   * to pick the user's language. Without reflection, the setter creates
+   * a shadow property that never touches the `lang` attribute and the
+   * getter returns undefined. */
   try {
     if (!Object.getOwnPropertyDescriptor(proto, 'lang')) {
       Object.defineProperty(proto, 'lang', {
@@ -172,48 +205,43 @@ installDomGlobals();
     }
   } catch (_) {}
 
-  /* ---- prepend ---- */
+  /* ==================================================================
+   * window.getComputedStyle — MISSING per audit. React reads
+   * computed style on mount for transition/visibility checks; some
+   * libraries (Headless UI, Radix) use it for behavior. A zeroed-out
+   * stub is enough to stop the crash. */
   try {
-    if (typeof proto.prepend !== 'function') {
-      proto.prepend = function (...kids) {
-        const first = this.firstChild;
-        for (const k of kids) this.insertBefore(k, first);
+    if (typeof globalThis.getComputedStyle !== 'function') {
+      globalThis.getComputedStyle = function () {
+        return { getPropertyValue: () => '', length: 0 };
       };
     }
   } catch (_) {}
 
-  /* ---- children ---- */
+  /* ==================================================================
+   * Element.scrollIntoView / scrollTo / scrollBy — MISSING per audit.
+   * Popovers, modals (Radix, Headless UI), and routers call
+   * scrollIntoView after mounting. No-op is correct here: there is no
+   * scroll geometry to target. */
   try {
-    if (!Object.getOwnPropertyDescriptor(proto, 'children')) {
-      Object.defineProperty(proto, 'children', {
-        configurable: true,
-        get() {
-          const out = [];
-          const list = this.childNodes || [];
-          for (let i = 0; i < list.length; i++) {
-            const n = list[i];
-            if (n && n.nodeType === 1) out.push(n);
-          }
-          return out;
-        },
-      });
+    if (typeof proto.scrollIntoView !== 'function') {
+      proto.scrollIntoView = function () {};
     }
+  } catch (_) {}
+  try {
+    if (typeof proto.scrollTo !== 'function') proto.scrollTo = function () {};
+    if (typeof proto.scrollBy !== 'function') proto.scrollBy = function () {};
   } catch (_) {}
 
   /* ==================================================================
-   * innerText — TWO independent install paths, each guarded by its
-   * own try/catch, with explicit console.log so we can tell WHICH
-   * path (if any) succeeded. The calculator's onClick handler reads
-   * e.target.innerText; if it returns undefined the display goes to
-   * "0undefined" → NaN on next click. That is the exact bug this fixes.
-   * ================================================================== */
-
+   * innerText — MISSING per audit (verified empirically: the DOM
+   * prototype in nodes.js has no innerText). Two independent install
+   * paths so a restrictive proto doesn't lose the API. */
   const innerTextGet = function () {
     try {
       const tc = this.textContent;
       if (tc !== undefined && tc !== null) return String(tc);
     } catch (_) {}
-    /* textContent missing/empty: walk children directly. */
     let out = '';
     const kids = this.childNodes;
     if (kids && kids.length) {
@@ -245,9 +273,7 @@ installDomGlobals();
   };
 
   let installed = false;
-  let installMethod = 'none';
 
-  /* Path 1 — Element.prototype. */
   if (!Object.getOwnPropertyDescriptor(proto, 'innerText')) {
     try {
       Object.defineProperty(proto, 'innerText', {
@@ -257,65 +283,48 @@ installDomGlobals();
         set: innerTextSet,
       });
       installed = true;
-      installMethod = 'prototype';
       try { console.log('[dom-patch] innerText: prototype OK'); } catch (_) {}
     } catch (e) {
       try { console.log('[dom-patch] innerText: prototype FAILED — ' +
                         (e && e.message ? e.message : String(e))); } catch (_) {}
     }
   } else {
-    /* Already defined (idempotent run, or another module got here first). */
     installed = true;
-    installMethod = 'prototype (pre-existing)';
     try { console.log('[dom-patch] innerText: prototype already present'); } catch (_) {}
   }
 
-  /* Path 2 — createElement hook. Only attempted if Path 1 failed. */
   if (!installed) {
     try {
-      if (typeof doc.createElement === 'function') {
-        if (doc.createElement.__innerTextPatched) {
-          installed = true;
-          installMethod = 'createElement hook (pre-existing)';
-          try { console.log('[dom-patch] innerText: createElement hook already present'); } catch (_) {}
-        } else {
-          const origCreate = doc.createElement;
-          const patched = function (tag, opts) {
-            const el = origCreate.call(doc, tag, opts);
-            if (el && !('innerText' in el)) {
-              try {
-                Object.defineProperty(el, 'innerText', {
-                  configurable: true,
-                  enumerable: false,
-                  get: innerTextGet,
-                  set: innerTextSet,
-                });
-              } catch (_) {}
-            }
-            return el;
-          };
-          patched.__innerTextPatched = true;
-
-          /* Try plain assignment first. */
-          try { doc.createElement = patched; } catch (_) {}
-          /* If assignment didn't stick (getter-only property), define. */
-          if (doc.createElement !== patched) {
+      if (typeof doc.createElement === 'function' && !doc.createElement.__innerTextPatched) {
+        const origCreate = doc.createElement;
+        const patched = function (tag, opts) {
+          const el = origCreate.call(doc, tag, opts);
+          if (el && !('innerText' in el)) {
             try {
-              Object.defineProperty(doc, 'createElement', {
+              Object.defineProperty(el, 'innerText', {
                 configurable: true,
-                writable: true,
-                value: patched,
+                enumerable: false,
+                get: innerTextGet,
+                set: innerTextSet,
               });
             } catch (_) {}
           }
-
-          if (doc.createElement && doc.createElement.__innerTextPatched) {
-            installed = true;
-            installMethod = 'createElement hook';
-            try { console.log('[dom-patch] innerText: createElement hook OK'); } catch (_) {}
-          } else {
-            try { console.log('[dom-patch] innerText: createElement hook could not be installed (assignment rejected)'); } catch (_) {}
-          }
+          return el;
+        };
+        patched.__innerTextPatched = true;
+        try { doc.createElement = patched; } catch (_) {}
+        if (doc.createElement !== patched) {
+          try {
+            Object.defineProperty(doc, 'createElement', {
+              configurable: true, writable: true, value: patched,
+            });
+          } catch (_) {}
+        }
+        if (doc.createElement && doc.createElement.__innerTextPatched) {
+          installed = true;
+          try { console.log('[dom-patch] innerText: createElement hook OK'); } catch (_) {}
+        } else {
+          try { console.log('[dom-patch] innerText: createElement hook rejected'); } catch (_) {}
         }
       }
     } catch (e) {
@@ -324,20 +333,16 @@ installDomGlobals();
     }
   }
 
-  /* Verify on a FRESH element. This is the ground truth. */
+  /* Final verification on a fresh element. */
   try {
     const test = doc.createElement('span');
     const ok = test && ('innerText' in test) && typeof test.innerText === 'string';
-    if (ok) {
-      try { console.log('[dom-patch] innerText: VERIFIED on fresh element'); } catch (_) {}
-    } else {
-      try { console.log('[dom-patch] innerText: STILL MISSING on fresh element (installed=' +
-                        installed + ', method=' + installMethod + ')'); } catch (_) {}
-    }
-  } catch (e) {
-    try { console.log('[dom-patch] innerText: verify threw — ' +
-                      (e && e.message ? e.message : String(e))); } catch (_) {}
-  }
+    try {
+      console.log(ok
+        ? '[dom-patch] innerText: VERIFIED on fresh element'
+        : '[dom-patch] innerText: STILL MISSING on fresh element (installed=' + installed + ')');
+    } catch (_) {}
+  } catch (_) {}
 })();
 
 /* Redirect console.* to the in-TUI dev console. */

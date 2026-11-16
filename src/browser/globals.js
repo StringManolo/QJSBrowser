@@ -1,9 +1,18 @@
 /* Browser-shaped globals that page JS (React, Webpack, Vite, polyfills)
- * touch during bootstrap. No DOM yet — that's PR 2. Idempotent: safe to
- * call twice (checks existence before defining). */
-import { resolveUrl } from 'src/base/url.js';
-import { Event } from 'src/dom/events.js';
+ * touch during bootstrap. No DOM here — that's dom-globals.js and
+ * nodes.js. Idempotent: safe to call twice.
+ *
+ * Signature: installGlobals({ tui, timers, getUrl, setUrl })
+ *
+ *   getUrl() → string    current tab URL (may be '' before navigation)
+ *   setUrl(url, kind)    called by window.location setters and
+ *                        history.pushState/replaceState. `kind` is one
+ *                        of 'hashchange' | 'popstate' | 'pushstate' |
+ *                        'replacestate' | 'navigate' | 'reload'. The
+ *                        caller (main.js) decides whether to fetch or
+ *                        just mutate the URL and fire an event. */
 
+import { Event, CustomEvent } from 'src/dom/events.js';
 
 function makeStorage() {
   const m = new Map();
@@ -17,46 +26,82 @@ function makeStorage() {
   };
 }
 
-function makeLocation(url) {
-  url = url || 'about:blank';
-  let scheme = 'about', host = '', port = '', path = url;
-  const m = url.match(/^([a-z][a-z0-9+.-]*):\/\/([^\/:?#]+)(?::(\d+))?([\/?#].*)?$/i);
-  if (m) {
-    scheme = m[1].toLowerCase();
-    host   = m[2];
-    port   = m[3] || '';
-    path   = m[4] || '/';
+/* location as a STABLE object (not a getter returning a new instance
+ * per access), with dynamic getters reading the current URL and setters
+ * delegating to setUrl.
+ *
+ * Stable, because a getter-per-access made `window.location.hash = 'x'`
+ * write to a throwaway object — hash-router SPA buttons were dead. */
+function makeLocation(getUrl, setUrl) {
+  function cur() {
+    try { return getUrl ? (getUrl() || '') : ''; } catch (_) { return ''; }
   }
-  const pathOnly = path.split('?')[0].split('#')[0] || '/';
-  const search   = path.includes('?') ? '?' + path.split('?')[1].split('#')[0] : '';
-  const hash     = path.includes('#') ? '#' + path.split('#')[1] : '';
-  const origin   = host ? scheme + '://' + host + (port ? ':' + port : '') : 'null';
-  return {
-    href: url,
-    protocol: scheme + ':',
-    host: host + (port ? ':' + port : ''),
-    hostname: host,
-    port,
-    pathname: pathOnly,
-    search,
-    hash,
-    origin,
-    toString() { return url; },
-    assign()  { console.warn('[location] navigation not implemented yet'); },
-    replace() { console.warn('[location] navigation not implemented yet'); },
-    reload()  { console.warn('[location] reload not implemented yet'); },
+  function parse(u) {
+    u = u || 'about:blank';
+    let scheme = 'about', host = '', port = '', path = u;
+    const m = u.match(/^([a-z][a-z0-9+.-]*):\/\/([^\/:?#]+)(?::(\d+))?([\/?#].*)?$/i);
+    if (m) {
+      scheme = m[1].toLowerCase();
+      host   = m[2];
+      port   = m[3] || '';
+      path   = m[4] || '/';
+    }
+    const pathOnly = path.split('?')[0].split('#')[0] || '/';
+    const search   = path.includes('?') ? '?' + path.split('?')[1].split('#')[0] : '';
+    const hash     = path.includes('#') ? '#' + path.split('#')[1] : '';
+    const origin   = host ? scheme + '://' + host + (port ? ':' + port : '') : 'null';
+    return { scheme, host, port, pathOnly, search, hash, origin };
+  }
+  function notify(newUrl, kind) {
+    if (!setUrl) return;
+    try { setUrl(String(newUrl), kind); } catch (_) {}
+  }
+
+  const loc = {
+    get href()     { return cur(); },
+    set href(v)    { notify(v, 'navigate'); },
+    get protocol() { return parse(cur()).scheme + ':'; },
+    get host()     { const p = parse(cur()); return p.host + (p.port ? ':' + p.port : ''); },
+    get hostname() { return parse(cur()).host; },
+    get port()     { return parse(cur()).port; },
+    get origin()   { return parse(cur()).origin; },
+
+    get pathname() { return parse(cur()).pathOnly; },
+    set pathname(v) {
+      const p = parse(cur());
+      const np = String(v).startsWith('/') ? String(v) : '/' + String(v);
+      notify(p.origin + np + p.search + p.hash, 'navigate');
+    },
+
+    get search()   { return parse(cur()).search; },
+    set search(v) {
+      const p = parse(cur());
+      const sv = String(v || '');
+      const ns = sv ? (sv.startsWith('?') ? sv : '?' + sv) : '';
+      notify(p.origin + p.pathOnly + ns + p.hash, 'navigate');
+    },
+
+    get hash()     { return parse(cur()).hash; },
+    set hash(v) {
+      const u = cur();
+      const base = u.split('#')[0];
+      const sv = String(v == null ? '' : v);
+      if (!sv || sv === '#') { notify(base, 'hashchange'); return; }
+      const nh = sv.startsWith('#') ? sv : '#' + sv;
+      notify(base + nh, 'hashchange');
+    },
+
+    toString()     { return cur(); },
+    assign(v)      { notify(v, 'navigate'); },
+    replace(v)     { notify(v, 'navigate'); },
+    reload()       { notify(cur(), 'reload'); },
   };
+  return loc;
 }
 
-/* Minimal MessageChannel: enough for React 18's scheduler.
- *
- * Delivery is via microtask rather than setTimeout. With setTimeout, the
- * update is queued for the next timers.runDue() iteration — but the loop
- * may be sleeping in epoll_wait if no fd is readable, delaying the render
- * until the next event. That manifests as "the input field shows what I
- * typed, but Text: stays the old value until I click a button". Microtask
- * delivery happens inside pumpJobs(), which runs immediately before
- * mutation hooks fire and flushRender re-serializes the DOM. */
+/* Minimal MessageChannel for React 18's scheduler. Delivery via
+ * microtask so commits land inside pumpJobs(), before the mutation
+ * hook fires and flushRender re-serializes. */
 class MessageChannelPolyfill {
   constructor() {
     this.port1 = { onmessage: null, postMessage: null, start() {}, close() {} };
@@ -81,9 +126,10 @@ class MessageChannelPolyfill {
   }
 }
 
-export function installGlobals({ tui, timers, getUrl }) {
+export function installGlobals({ tui, timers, getUrl, setUrl }) {
   const g = globalThis;
 
+  /* ---------------- window / self ---------------- */
   if (!Object.getOwnPropertyDescriptor(g, 'window')) {
     Object.defineProperty(g, 'window', {
       value: g, configurable: true, writable: false,
@@ -91,6 +137,7 @@ export function installGlobals({ tui, timers, getUrl }) {
   }
   g.self = g;
 
+  /* ---------------- navigator ---------------- */
   if (!g.navigator) {
     g.navigator = {
       userAgent: 'Mozilla/5.0 (X11; Linux x86_64) QJSBrowser/0.1',
@@ -105,16 +152,7 @@ export function installGlobals({ tui, timers, getUrl }) {
     };
   }
 
-  if (!g.Event) {
-  g.Event = Event;
-  g.CustomEvent      = Event;
-  g.KeyboardEvent    = Event;
-  g.MouseEvent       = Event;
-  g.FocusEvent       = Event;
-  g.InputEvent       = Event;
-  g.UIEvent          = Event;
-}
-
+  /* ---------------- viewport ---------------- */
   function readSize() {
     try { return tui.size(); } catch (_) { return { rows: 24, cols: 80 }; }
   }
@@ -128,6 +166,7 @@ export function installGlobals({ tui, timers, getUrl }) {
   Object.defineProperty(g, 'pageXOffset', { value: 0, configurable: true });
   Object.defineProperty(g, 'pageYOffset', { value: 0, configurable: true });
 
+  /* ---------------- performance ---------------- */
   if (!g.performance) {
     const t0 = Date.now();
     g.performance = {
@@ -141,120 +180,34 @@ export function installGlobals({ tui, timers, getUrl }) {
     };
   }
 
+  /* ---------------- storage ---------------- */
   if (!g.localStorage)   g.localStorage   = makeStorage();
   if (!g.sessionStorage) g.sessionStorage = makeStorage();
 
+  /* ---------------- matchMedia ----------------
+   * No document access — safe here, unlike Element patches.
+   *
+   * prefers-reduced-motion:no-preference → matches:true. Many libs
+   * (Framer Motion, Tailwind, CSS-in-JS) branch on this. Returning
+   * false for everything pushes them to the reduced-motion path,
+   * which sometimes calls APIs we don't have. Returning true selects
+   * the animated path, where all the calls are guarded stubs. */
   if (!g.matchMedia) {
-    g.matchMedia = (q) => ({
-      matches: false,
-      media: String(q),
-      addListener() {}, removeListener() {},
-      addEventListener() {}, removeEventListener() {},
-    });
+    g.matchMedia = (q) => {
+      const m = {
+        matches: false,
+        media: String(q),
+        addListener() {}, removeListener() {},
+        addEventListener() {}, removeEventListener() {},
+      };
+      if (/prefers-reduced-motion\s*:\s*no-preference/.test(String(q))) {
+        m.matches = true;
+      }
+      return m;
+    };
   }
 
-  if (!g.URLSearchParams) {
-  g.URLSearchParams = function URLSearchParams(init) {
-    if (!(this instanceof g.URLSearchParams)) return new g.URLSearchParams(init);
-    this._map = new Map();
-    if (typeof init === 'string') {
-      const s = init.startsWith('?') ? init.slice(1) : init;
-      if (s) {
-        for (const pair of s.split('&')) {
-          if (!pair) continue;
-          const eq = pair.indexOf('=');
-          const k = eq < 0 ? pair : pair.slice(0, eq);
-          const v = eq < 0 ? '' : pair.slice(eq + 1);
-          this._map.set(decodeURIComponent(k),
-                        decodeURIComponent(v.replace(/\+/g, ' ')));
-        }
-      }
-    } else if (init && typeof init === 'object') {
-      for (const k of Object.keys(init)) this._map.set(k, String(init[k]));
-    }
-    this.get    = (k) => this._map.has(k) ? this._map.get(k) : null;
-    this.getAll = (k) => this._map.has(k) ? [this._map.get(k)] : [];
-    this.set    = (k, v) => { this._map.set(String(k), String(v)); };
-    this.has    = (k) => this._map.has(k);
-    this.delete = (k) => { this._map.delete(k); };
-    this.append = (k, v) => { this._map.set(String(k), String(v)); };
-    this.forEach = (cb) => this._map.forEach((v, k) => cb(v, k, this));
-    this.toString = () => {
-      const parts = [];
-      this._map.forEach((v, k) =>
-        parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(v)));
-      return parts.join('&');
-    };
-  };
-}
-
-if (!g.URL) {
-  g.URL = function URL(spec, base) {
-    if (!(this instanceof g.URL)) return new g.URL(spec, base);
-    let href = String(spec);
-    if (base !== undefined) href = resolveUrl(String(base), href);
-    this.href = href;
-    const m = href.match(/^([a-z][a-z0-9+.-]*):\/\/([^\/:?#]+)(?::(\d+))?([\/?#][^#]*)?(#.*)?$/i);
-    if (m) {
-      this.protocol = m[1].toLowerCase() + ':';
-      this.hostname = m[2];
-      this.port     = m[3] || '';
-      this.host     = m[2] + (m[3] ? ':' + m[3] : '');
-      const pathQ   = m[4] || '/';
-      const qi      = pathQ.indexOf('?');
-      this.pathname = qi >= 0 ? pathQ.slice(0, qi) : pathQ;
-      this.search   = qi >= 0 ? pathQ.slice(qi) : '';
-      this.hash     = m[5] || '';
-      this.origin   = this.protocol + '//' + this.host;
-    } else {
-      this.protocol = ''; this.hostname = ''; this.port = '';
-      this.host     = ''; this.pathname = href; this.search = '';
-      this.hash     = ''; this.origin   = 'null';
-    }
-    this.searchParams = new g.URLSearchParams(this.search);
-    this.toString = function () { return this.href; };
-  };
-}
-
-  if (!g.MutationObserver) {
-  g.MutationObserver = class MutationObserver {
-    constructor(callback) { this._cb = callback; }
-    observe() {}
-    disconnect() {}
-    takeRecords() { return []; }
-  };
-
-  if (g.document && typeof g.document.querySelectorAll !== 'function') {
-  g.document.querySelectorAll = function (sel) {
-    const out = [];
-    if (!sel || typeof sel !== 'string') return out;
-    const m = sel.match(/^([a-z][a-z0-9-]*)?(?:#([\w-]+))?(?:\.([\w-]+))?/i);
-    if (!m) return out;
-    const tag = (m[1] || '').toLowerCase();
-    const id = m[2] || null;
-    const cls = m[3] || null;
-    function walk(node) {
-      if (!node || !node.tagName) {
-        if (node && node.childNodes) for (const c of node.childNodes) walk(c);
-        return;
-      }
-      const t = (node.tagName || '').toLowerCase();
-      let ok = true;
-      if (tag && t !== tag) ok = false;
-      if (ok && id && node.getAttribute && node.getAttribute('id') !== id) ok = false;
-      if (ok && cls && node.classList && !node.classList.contains(cls)) ok = false;
-      if (ok) out.push(node);
-      if (node.childNodes) for (const c of node.childNodes) walk(c);
-    }
-    walk(g.document.body);
-    return out;
-  };
-  g.document.querySelector = function (sel) {
-    return g.document.querySelectorAll(sel)[0] || null;
-  };
-}
-}
-
+  /* ---------------- timers ---------------- */
   g.setTimeout    = timers.setTimeout;
   g.setInterval   = timers.setInterval;
   g.clearTimeout  = timers.clearTimeout;
@@ -274,380 +227,239 @@ if (!g.URL) {
     g.queueMicrotask = (fn) => { Promise.resolve().then(fn); };
   }
 
-  /* React 18's scheduler uses this to schedule work without polling. */
   if (!g.MessageChannel) g.MessageChannel = MessageChannelPolyfill;
 
+  /* ---------------- location ---------------- */
   if (!g.location) {
-    Object.defineProperty(g, 'location', {
-      configurable: true,
-      get() { return makeLocation(getUrl ? getUrl() : ''); },
-    });
+    const loc = makeLocation(getUrl, setUrl);
+    try {
+      Object.defineProperty(g, 'location', {
+        configurable: true,
+        writable: false,
+        value: loc,
+      });
+    } catch (_) {
+      g.location = loc;
+    }
   }
 
+  /* ---------------- history ---------------- */
   if (!g.history) {
     g.history = {
       length: 1,
       state: null,
-      pushState(_s, _t, _u) {},
-      replaceState(_s, _t, _u) {},
+      pushState(_state, _title, url) {
+        if (setUrl && url) {
+          try { setUrl(String(url), 'pushstate'); } catch (_) {}
+        }
+      },
+      replaceState(_state, _title, url) {
+        if (setUrl && url) {
+          try { setUrl(String(url), 'replacestate'); } catch (_) {}
+        }
+      },
       back() {}, forward() {}, go() {},
     };
   }
 
+  /* ---------------- misc ---------------- */
   if (!g.hasFocus) g.hasFocus = () => true;
 
   if (g.console) {
-  if (!g.console.error) g.console.error = g.console.warn || g.console.log;
-  if (!g.console.warn)  g.console.warn  = g.console.error || g.console.log;
-  if (!g.console.info)  g.console.info  = g.console.log;
-  if (!g.console.debug) g.console.debug = g.console.log;
+    if (!g.console.error) g.console.error = g.console.warn || g.console.log;
+    if (!g.console.warn)  g.console.warn  = g.console.error || g.console.log;
+    if (!g.console.info)  g.console.info  = g.console.log;
+    if (!g.console.debug) g.console.debug = g.console.log;
   }
 
-  if (g.console && typeof g.console.error === 'function') {
-  const origErr = g.console.error.bind(g.console);
-  const fmt = (a) => {
-    if (a === null || a === undefined) return String(a);
-    if (typeof a === 'string') return a;
-    if (typeof a === 'object') {
-      try {
-        if (a.name || a.message)
-          return (a.name || 'Error') + ': ' + (a.message || '') +
-                 (a.stack ? '\n' + a.stack : '');
-        const s = JSON.stringify(a);
-        return s && s !== '{}' ? s : Object.prototype.toString.call(a);
-      } catch (_) { return String(a); }
-    }
-    return String(a);
-  };
-  g.console.error = function (...args) {
-    origErr(...args.map(fmt));
-  };
-}
+  /* ---------------- DOM Event constructors ---------------- */
+  if (!g.Event)         g.Event         = Event;
+  if (!g.CustomEvent)   g.CustomEvent   = CustomEvent;
+  if (!g.KeyboardEvent) g.KeyboardEvent = Event;
+  if (!g.MouseEvent)    g.MouseEvent    = Event;
+  if (!g.FocusEvent)    g.FocusEvent    = Event;
+  if (!g.InputEvent)    g.InputEvent    = Event;
+  if (!g.UIEvent)       g.UIEvent       = Event;
 
-  /* Patch Element/Node/Document prototypes for React 18 compatibility.
- * React's commit phase calls these on every host component:
- *   getBoundingClientRect, focus, blur, remove, contains,
- *   insertBefore, classList.*, style.setProperty, click,
- *   scrollIntoView, getComputedStyle, createComment, etc.
- * Any missing method manifests as "TypeError: not a function" deep
- * in React's commitRoot, which is impossible to trace from the
- * minified bundle. This block fills the common gaps. */
-(function patchDom() {
-  const doc = g.document;
-  if (!doc) return;
-
-  let probe = null;
-  try { probe = doc.createElement('div'); } catch (_) {}
-  if (!probe) return;
-
-  const elProto  = Object.getPrototypeOf(probe);
-  const nodeProto = elProto ? Object.getPrototypeOf(elProto) : null;
-  const docProto = Object.getPrototypeOf(doc);
-
-  function addMissing(proto, name, fn) {
-    if (!proto) return;
-    if (typeof proto[name] !== 'function') {
-      try { proto[name] = fn; } catch (_) {}
-    }
-  }
-
-  /* --- Element --- */
-  addMissing(elProto, 'getBoundingClientRect', function () {
-    return { x: 0, y: 0, width: 0, height: 0,
-             top: 0, left: 0, right: 0, bottom: 0 };
-  });
-  addMissing(elProto, 'getClientRects', function () { return []; });
-  addMissing(elProto, 'scrollIntoView', function () {});
-  addMissing(elProto, 'scrollTo', function () {});
-  addMissing(elProto, 'scrollBy', function () {});
-  addMissing(elProto, 'focus', function () {
-    if (g.document) g.document.activeElement = this;
-  });
-  addMissing(elProto, 'blur', function () {
-    if (g.document && g.document.activeElement === this)
-      g.document.activeElement = g.document.body;
-  });
-  addMissing(elProto, 'click', function () {
-    this.dispatchEvent(new g.Event('click',
-      { bubbles: true, cancelable: true }));
-  });
-  addMissing(elProto, 'remove', function () {
-    if (this.parentNode) this.parentNode.removeChild(this);
-  });
-  addMissing(elProto, 'matches', function () { return false; });
-  addMissing(elProto, 'closest', function () { return null; });
-  addMissing(elProto, 'append', function (...kids) {
-    for (const k of kids) this.appendChild(k);
-  });
-  addMissing(elProto, 'prepend', function (...kids) {
-    const first = this.firstChild;
-    for (const k of kids) this.insertBefore(k, first);
-  });
-
-  /* --- Node --- */
-  addMissing(nodeProto, 'contains', function (other) {
-    let cur = other;
-    while (cur) { if (cur === this) return true; cur = cur.parentNode; }
-    return false;
-  });
-
-  /* --- classList: full impl if missing --- */
-  if (!probe.classList || typeof probe.classList.add !== 'function') {
-    const clsStore = new WeakMap();
-    function getSet(el) {
-      if (!clsStore.has(el)) {
-        const cur = (el.getAttribute && el.getAttribute('class')) || '';
-        clsStore.set(el, new Set(cur.split(/\s+/).filter(Boolean)));
-      }
-      return clsStore.get(el);
-    }
-    function sync(el, s) {
-      if (el.setAttribute) el.setAttribute('class', [...s].join(' '));
-    }
-    const api = {
-      add:      function (...names) { const s = getSet(this); names.forEach(n => s.add(n)); sync(this, s); },
-      remove:   function (...names) { const s = getSet(this); names.forEach(n => s.delete(n)); sync(this, s); },
-      contains: function (n) { return getSet(this).has(n); },
-      toggle:   function (n, force) {
-        const s = getSet(this); const has = s.has(n);
-        const want = force === undefined ? !has : !!force;
-        if (want) s.add(n); else s.delete(n);
-        sync(this, s); return want;
-      },
-      item:     function (i) { return [...getSet(this)][i] || null; },
-    };
-    try {
-      Object.defineProperty(elProto, 'classList', {
-        configurable: true,
-        get() { return api; },
-      });
-    } catch (_) {}
-  }
-
-  /* --- style: setProperty/getPropertyValue if missing --- */
-  if (probe.style) {
-    addMissing(Object.getPrototypeOf(probe.style), 'setProperty',
-      function (k, v) { this[k] = String(v); });
-    addMissing(Object.getPrototypeOf(probe.style), 'getPropertyValue',
-      function (k) { return String(this[k] || ''); });
-    addMissing(Object.getPrototypeOf(probe.style), 'removeProperty',
-      function (k) { const old = this[k]; delete this[k]; return old; });
-  }
-
-  /* --- Document --- */
-  addMissing(docProto, 'createComment', function () {
-    return this.createTextNode('');
-  });
-  addMissing(docProto, 'createDocumentFragment', function () {
-    return this.createElement('fragment');
-  });
-  addMissing(docProto, 'getComputedStyle', function () {
-    return { getPropertyValue: () => '', length: 0 };
-  });
-
-  /* --- window --- */
-  if (!g.getComputedStyle) {
-    g.getComputedStyle = function () {
-      return { getPropertyValue: () => '', length: 0 };
+  /* ---------------- MutationObserver (Vite modulepreload polyfill) ---------------- */
+  if (!g.MutationObserver) {
+    g.MutationObserver = class MutationObserver {
+      constructor(callback) { this._cb = callback; }
+      observe() {}
+      disconnect() {}
+      takeRecords() { return []; }
     };
   }
-  if (!g.scrollTo)   g.scrollTo   = function () {};
-  if (!g.scrollBy)   g.scrollBy   = function () {};
-  if (!g.scroll)     g.scroll     = function () {};
-  if (!g.alert)      g.alert      = function () {};
-  if (!g.confirm)    g.confirm    = function () { return false; };
-  if (!g.prompt)     g.prompt     = function () { return null; };
-  if (!g.open)       g.open       = function () { return null; };
-})();
 
-  /* --- IntersectionObserver: usado para scroll-detection, lazy load,
- * fade-in animations. React apps lo invocan desde useEffect.
- * Stub: nunca dispara callback. Si la página depende de scroll para
- * mostrar contenido, no aparecerá — pero al menos no crashea. */
-if (!g.IntersectionObserver) {
-  g.IntersectionObserver = class IntersectionObserver {
-    constructor(cb, opts) { this._cb = cb; this.root = null;
-                            this.rootMargin = '0px'; this.thresholds = [0]; }
-    observe() {}
-    unobserve() {}
-    disconnect() {}
-    takeRecords() { return []; }
-  };
-}
-
-/* --- ResizeObserver: usado por react-resize-detector, charts, etc. --- */
-if (!g.ResizeObserver) {
-  g.ResizeObserver = class ResizeObserver {
-    constructor(cb) { this._cb = cb; }
-    observe() {}
-    unobserve() {}
-    disconnect() {}
-  };
-}
-
-/* --- requestIdleCallback: usado por React 18 para hidratación no urgente. --- */
-if (!g.requestIdleCallback) {
-  g.requestIdleCallback = function (cb) {
-    return timers.setTimeout(function () {
-      try { cb({ didTimeout: false, timeRemaining: () => 50 }); }
-      catch (e) { console.error('[rIC] ' + (e && e.message || e)); }
-    }, 0);
-  };
-  g.cancelIdleCallback = function (id) { timers.clearTimeout(id); };
-}
-
-/* --- crypto: usado por React DevTools / librerías modernas. --- */
-if (!g.crypto) {
-  g.crypto = {
-    randomUUID() {
-      let s = '';
-      for (let i = 0; i < 32; i++) {
-        s += ((Math.random() * 16) | 0).toString(16);
-        if (i === 7 || i === 11 || i === 15 || i === 19) s += '-';
+  /* ---------------- URL / URLSearchParams (Vite chunk loaders) ---------------- */
+  if (!g.URLSearchParams) {
+    g.URLSearchParams = function URLSearchParams(init) {
+      if (!(this instanceof g.URLSearchParams)) return new g.URLSearchParams(init);
+      this._map = new Map();
+      if (typeof init === 'string') {
+        const s = init.startsWith('?') ? init.slice(1) : init;
+        if (s) {
+          for (const pair of s.split('&')) {
+            if (!pair) continue;
+            const eq = pair.indexOf('=');
+            const k = eq < 0 ? pair : pair.slice(0, eq);
+            const v = eq < 0 ? '' : pair.slice(eq + 1);
+            this._map.set(decodeURIComponent(k),
+                          decodeURIComponent(v.replace(/\+/g, ' ')));
+          }
+        }
+      } else if (init && typeof init === 'object') {
+        for (const k of Object.keys(init)) this._map.set(k, String(init[k]));
       }
-      return s;
-    },
-    getRandomValues(arr) {
-      for (let i = 0; i < arr.length; i++)
-        arr[i] = (Math.random() * 256) | 0;
-      return arr;
-    },
-  };
-}
+    };
+    const P = g.URLSearchParams.prototype;
+    P.get    = function (k) { return this._map.has(k) ? this._map.get(k) : null; };
+    P.getAll = function (k) { return this._map.has(k) ? [this._map.get(k)] : []; };
+    P.set    = function (k, v) { this._map.set(String(k), String(v)); };
+    P.has    = function (k) { return this._map.has(k); };
+    P.delete = function (k) { this._map.delete(k); };
+    P.append = function (k, v) { this._map.set(String(k), String(v)); };
+    P.forEach = function (cb) { this._map.forEach((v, k) => cb(v, k, this)); };
+    P.toString = function () {
+      const parts = [];
+      this._map.forEach((v, k) =>
+        parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(v)));
+      return parts.join('&');
+    };
+  }
 
-/* --- WAAPI: element.animate() es cada vez más común (framer-motion,
- * auto-animate). Stub que devuelve un objeto Animation. --- */
-(function patchAnimate() {
-  if (!g.document) return;
-  let probe;
-  try { probe = g.document.createElement('div'); } catch (_) { return; }
-  if (!probe) return;
-  const proto = Object.getPrototypeOf(probe);
-  if (!proto || typeof proto.animate === 'function') return;
-  proto.animate = function () {
-    return { finished: Promise.resolve(), cancel() {}, play() {},
-             pause() {}, finish() {}, onfinish: null };
-  };
-})();
-
-  /* --- Canvas: Lottie, charts, animaciones. Stub que no dibuja. --- */
-(function patchCanvas() {
-  if (!g.document) return;
-  let canvas;
-  try { canvas = g.document.createElement('canvas'); } catch (_) { return; }
-  if (!canvas) return;
-  const proto = Object.getPrototypeOf(canvas);
-  if (!proto || typeof proto.getContext === 'function') return;
-  proto.getContext = function () {
-    return new Proxy({}, {
-      get(_, key) {
-        if (key === 'canvas') return canvas;
-        if (key === 'measureText') return () => ({ width: 0 });
-        if (key === 'getImageData') return () => ({ data: new Uint8ClampedArray(4) });
-        return () => {};
-      },
-      set() { return true; },
-    });
-  };
-})();
-
-/* --- Audio: a veces usado para feedback de UI. --- */
-if (!g.Audio) {
-  g.Audio = class Audio {
-    constructor(src) { this.src = src; this.volume = 1; }
-    play() { return Promise.resolve(); }
-    pause() {}
-    load() {}
-    addEventListener() {}
-  };
-}
-
-/* --- history.pushState: SPA routers lo usan en useEffect de montaje. --- */
-if (g.history) {
-  const h = g.history;
-  if (typeof h.pushState !== 'function') h.pushState = function () {};
-  if (typeof h.replaceState !== 'function') h.replaceState = function () {};
-  if (typeof h.back !== 'function') h.back = function () {};
-  if (typeof h.forward !== 'function') h.forward = function () {};
-  if (typeof h.go !== 'function') h.go = function () {};
-}
-
-/* --- matchMedia con matches reales: framer-motion, tailwind, etc.
- * El stub actual siempre devuelve matches:false, lo que hace que
- * framer-motion elija el path "reduced motion" y a veces llame a
- * APIs que no tenemos. Hacerlo más "real" evita ese path. --- */
-if (g.matchMedia) {
-  const orig = g.matchMedia;
-  g.matchMedia = function (q) {
-    const m = orig(q);
-    /* prefers-reduced-motion:no-preference es el default "normal".
-     * Devolver true aquí hace que libs con animaciones escojan el
-     * path con animaciones (que al menos tienen stubs). */
-    if (/prefers-reduced-motion\s*:\s*no-preference/.test(q)) m.matches = true;
-    return m;
-  };
-}
-
-  /* --- window as EventTarget.
- *
- * React 18 / SPA routers / analytics scripts do
- *   window.addEventListener('hashchange' | 'popstate' | 'resize' |
- *                           'scroll' | 'load' | 'visibilitychange', cb)
- * on mount. `window` is globalThis, and globalThis has no
- * addEventListener unless we add it — Element.prototype listeners
- * don't help. Without this, the first such useEffect throws
- * "TypeError: not a function" deep in React's commit.
- *
- * Implementation: a minimal per-type listener registry on globalThis.
- * `dispatchEvent` on window is wired so that events dispatched via
- * `globalThis.dispatchEvent(ev)` (e.g. the 'load' event the controller
- * fires after scripts run) reach window listeners too. */
-if (typeof g.addEventListener !== 'function') {
-  const _windowListeners = Object.create(null);
-
-  g.addEventListener = function (type, cb) {
-    if (!type || typeof cb !== 'function') return;
-    (_windowListeners[type] || (_windowListeners[type] = [])).push(cb);
-  };
-  g.removeEventListener = function (type, cb) {
-    const arr = _windowListeners[type];
-    if (!arr) return;
-    const i = arr.indexOf(cb);
-    if (i >= 0) arr.splice(i, 1);
-  };
-  g.dispatchEvent = function (ev) {
-    if (!ev || !ev.type) return true;
-    const arr = _windowListeners[ev.type];
-    if (arr) {
-      for (const cb of arr.slice()) {
-        try { cb(ev); }
-        catch (e) {
-          console.error('[window listener ' + ev.type + '] ' +
-                        (e && e.message || e));
+  if (!g.URL) {
+    g.URL = function URL(spec, base) {
+      if (!(this instanceof g.URL)) return new g.URL(spec, base);
+      let href = String(spec);
+      if (base !== undefined) {
+        if (!/^[a-z][a-z0-9+.-]*:/i.test(href)) {
+          try {
+            const b = new g.URL(base);
+            const origin = b.protocol + '//' + b.host;
+            if (href.startsWith('/')) href = origin + href;
+            else if (href.startsWith('#')) href = origin + b.pathname + b.search + href;
+            else if (href.startsWith('?')) href = origin + b.pathname + href;
+            else {
+              const dir = b.pathname.substring(0, b.pathname.lastIndexOf('/') + 1);
+              const parts = (dir + href).split('/');
+              const stack = [];
+              for (const p of parts) {
+                if (p === '..') stack.pop();
+                else if (p !== '.' && p !== '') stack.push(p);
+              }
+              href = origin + '/' + stack.join('/');
+            }
+          } catch (_) {}
         }
       }
-    }
-    return !ev.defaultPrevented;
-  };
-}
+      this.href = href;
+      const m = href.match(/^([a-z][a-z0-9+.-]*):\/\/([^\/:?#]+)(?::(\d+))?([\/?#][^#]*)?(#.*)?$/i);
+      if (m) {
+        this.protocol = m[1].toLowerCase() + ':';
+        this.hostname = m[2];
+        this.port     = m[3] || '';
+        this.host     = m[2] + (m[3] ? ':' + m[3] : '');
+        const pathQ   = m[4] || '/';
+        const qi      = pathQ.indexOf('?');
+        this.pathname = qi >= 0 ? pathQ.slice(0, qi) : pathQ;
+        this.search   = qi >= 0 ? pathQ.slice(qi) : '';
+        this.hash     = m[5] || '';
+        this.origin   = this.protocol + '//' + this.host;
+      } else {
+        this.protocol = ''; this.hostname = ''; this.port = '';
+        this.host     = ''; this.pathname = href; this.search = '';
+        this.hash     = ''; this.origin   = 'null';
+      }
+      this.searchParams = new g.URLSearchParams(this.search);
+      this.toString = function () { return this.href; };
+    };
+  }
 
-/* window.location.hash: makeLocation ya devuelve string para .hash,
- * pero verificamos que getUrl() no retorne undefined al inicio.
- * Si el tab aún no ha navegado, url='' → makeLocation('') → 'about:blank'
- * → path='about:blank', sin '#', hash=''. Seguro. */
+  /* ---------------- window.scroll* (SPA routers on mount) ---------------- */
+  if (!g.scrollTo) g.scrollTo = function () {};
+  if (!g.scroll)   g.scroll   = function () {};
+  if (!g.scrollBy) g.scrollBy = function () {};
+  if (!g.scrollToLines) g.scrollToLines = function () {};
+  if (!g.scrollByLines) g.scrollByLines = function () {};
+  if (!g.scrollByPages) g.scrollByPages = function () {};
 
-  /* --- window.scrollTo: SPA routers (this exact bundle, línea 261) lo
- * llaman desde el useEffect de mount del componente raíz. Sin él,
- * el primer render commitea pero el efecto revienta con "not a function"
- * y React desmonta. No-op es semánticamente correcto: no hay scroll
- * real en un TUI. */
-if (!g.scrollTo) g.scrollTo = function () {};
-if (!g.scroll)   g.scroll   = function () {};
-if (!g.scrollBy) g.scrollBy = function () {};
-if (!g.scrollByLines)     g.scrollByLines     = function () {};
-if (!g.scrollByPages)     g.scrollByPages     = function () {};
-if (!g.scrollToLines)     g.scrollToLines     = function () {};
+  /* ---------------- IntersectionObserver / ResizeObserver ---------------- */
+  if (!g.IntersectionObserver) {
+    g.IntersectionObserver = class IntersectionObserver {
+      constructor(cb) { this._cb = cb; this.root = null; this.rootMargin = '0px'; this.thresholds = [0]; }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      takeRecords() { return []; }
+    };
+  }
+  if (!g.ResizeObserver) {
+    g.ResizeObserver = class ResizeObserver {
+      constructor(cb) { this._cb = cb; }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+  }
 
+  /* ---------------- requestIdleCallback (React 18 hydration) ---------------- */
+  if (!g.requestIdleCallback) {
+    g.requestIdleCallback = function (cb) {
+      return timers.setTimeout(function () {
+        try { cb({ didTimeout: false, timeRemaining: () => 50 }); }
+        catch (e) { console.error('[rIC] ' + (e && e.message || e)); }
+      }, 0);
+    };
+    g.cancelIdleCallback = function (id) { timers.clearTimeout(id); };
+  }
 
+  /* ---------------- crypto ---------------- */
+  if (!g.crypto) {
+    g.crypto = {
+      randomUUID() {
+        let s = '';
+        for (let i = 0; i < 32; i++) {
+          s += ((Math.random() * 16) | 0).toString(16);
+          if (i === 7 || i === 11 || i === 15 || i === 19) s += '-';
+        }
+        return s;
+      },
+      getRandomValues(arr) {
+        for (let i = 0; i < arr.length; i++)
+          arr[i] = (Math.random() * 256) | 0;
+        return arr;
+      },
+    };
+  }
 
+  /* ---------------- window as EventTarget ---------------- */
+  if (typeof g.addEventListener !== 'function') {
+    const _windowListeners = Object.create(null);
+
+    g.addEventListener = function (type, cb) {
+      if (!type || typeof cb !== 'function') return;
+      (_windowListeners[type] || (_windowListeners[type] = [])).push(cb);
+    };
+    g.removeEventListener = function (type, cb) {
+      const arr = _windowListeners[type];
+      if (!arr) return;
+      const i = arr.indexOf(cb);
+      if (i >= 0) arr.splice(i, 1);
+    };
+    g.dispatchEvent = function (ev) {
+      if (!ev || !ev.type) return true;
+      const arr = _windowListeners[ev.type];
+      if (arr) {
+        for (const cb of arr.slice()) {
+          try { cb(ev); }
+          catch (e) {
+            console.error('[window listener ' + ev.type + '] ' +
+                          (e && e.message || e));
+          }
+        }
+      }
+      return !ev.defaultPrevented;
+    };
+  }
 }

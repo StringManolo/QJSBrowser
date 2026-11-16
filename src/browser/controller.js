@@ -937,5 +937,6 @@ export function createController(deps) {
     handleStatus, handleResponse, handleError,
     requestRender, flushRender, msUntilRender, isStale,
     isRunning: () => running,
+    navigate,
   };
 }

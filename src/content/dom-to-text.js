@@ -11,19 +11,18 @@
  * so the text isn't duplicated.
  *
  * If nodeMap is provided, populates it with elementId → Element DOM.
- * The controller uses this to dispatch real click/input events at the
- * original node when the user interacts with the TUI.
  *
- * Click-through fix: pageView.lineAt() rebuilds text segments on every
- * render and drops custom properties (elementId, _node). Only `linkN`
- * survives. So we use linkN as the transport channel: for any text
- * inside an ancestor with a React onClick prop, we register a synthetic
- * link ({n, href: null, node}) and set linkN on the segment. Click
- * handling then dispatches a DOM click on `node`, which bubbles to the
- * React onClick ancestor exactly like a real browser click. This is
- * what makes <div onClick> cards clickable — the "Read full writeup →"
- * pattern on stringmanolo.qzz.io.
- */
+ * Click-through: pageView.lineAt() rebuilds segments on every render
+ * and drops custom properties (elementId, _node). Only linkN survives.
+ * So for text inside an ancestor with React onClick we register a
+ * synthetic link ({n, href:null, node}) and set linkN — the click
+ * handler dispatches a real DOM click on `node`, which bubbles to the
+ * React onClick ancestor. This is what makes <div onClick> cards work.
+ *
+ * Invisible-color fix: raw CSS colors below a luminance threshold
+ * (dark text on what is presumed a dark terminal) are replaced by the
+ * theme's default page color. The site's link colors (#0066cc etc.)
+ * are above the threshold and survive, so links stay blue. */
 
 import { resolveUrl } from 'src/base/url.js';
 import { parseStylesheet, parseInlineStyle } from 'src/css/parser.js';
@@ -80,12 +79,23 @@ function svgSize(node) {
   return null;
 }
 
-/* Build a WeakMap of nodes that carry a React onClick prop. Scans once
- * per domToText() call. The __reactProps$<hash> key is React's internal
- * convention for attaching props to host DOM nodes; it's how the
- * delegated listener on #root discovers what handler to invoke. If a
- * node has this key with a function `onClick`, a click on it or its
- * descendants will fire that handler. */
+/* ANSI-color blacklist for "invisible on dark terminal":
+ *   0  = black
+ *   8  = bright black (= dark gray on most terminals)
+ *   232-244 = dark gray shades in the 256-color palette
+ * Everything else (including blue #4 for links, cyan #6, and the
+ * "bright" range 9-15) is preserved. The idea: if a page hardcodes a
+ * dark color assuming a light background, the terminal will be black
+ * and the text disappears. Replacing with the theme's page color makes
+ * the text readable without touching the link colors (blue #0066cc
+ * maps to ANSI 4, not in the blacklist). */
+function isInvisibleOnBlack(idx) {
+  if (idx < 0) return false;
+  if (idx === 0 || idx === 8) return true;
+  if (idx >= 232 && idx <= 244) return true;
+  return false;
+}
+
 function buildClickableMap(root) {
   const map = new WeakMap();
   function visit(n) {
@@ -94,7 +104,7 @@ function buildClickableMap(root) {
       const keys = Object.keys(n);
       for (let i = 0; i < keys.length; i++) {
         const k = keys[i];
-        if (k.length > 13 && k.charCodeAt(0) === 95 /* _ */ &&
+        if (k.length > 13 && k.charCodeAt(0) === 95 &&
             k.startsWith('__reactProps$')) {
           const p = n[k];
           if (p && typeof p.onClick === 'function') {
@@ -210,11 +220,17 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
     for (const e of _stack) if (e.inlineStyle) Object.assign(decls, e.inlineStyle);
 
     const fg = parseCssColor(decls['color']);
-    const fgAnsi = snapToAnsi(fg, -1);
+    let fgAnsi = snapToAnsi(fg, -1);
+    /* Drop dark-on-dark colors so the theme's default page color takes
+     * over. Preserves link colors (blue #4, cyan #6) and bright colors
+     * (9-15), which are visible on black. */
+    if (isInvisibleOnBlack(fgAnsi)) fgAnsi = -1;
+
     const innermost = _stack[_stack.length - 1];
     const isInlineBg = innermost && INLINE_BG_TAGS.has(innermost.tag);
-    const bgAnsi = isInlineBg
+    let bgAnsi = isInlineBg
       ? snapToAnsi(parseCssColor(decls['background-color']), -1) : -1;
+    if (isInvisibleOnBlack(bgAnsi)) bgAnsi = -1;
 
     const bold = decls['font-weight'] === 'bold' ||
                  (parseInt(decls['font-weight'], 10) >= 600);
@@ -286,10 +302,6 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
       text = text.replace(/\n/g, '\n' + pad);
     }
 
-    /* Not a real link? Check for a React onClick ancestor. If found,
-     * register a synthetic link (href:null, node:<innermost>). linkN is
-     * the only custom property lineAt() preserves, so it's our vehicle
-     * for transporting the node reference through pageView. */
     const innermost = _stack[_stack.length - 1];
     const node = innermost ? innermost._el : null;
     if (linkNForSeg === null && node) {
@@ -303,8 +315,6 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
     let pairId;
     if (s.fgAnsi >= 0 || s.bgAnsi >= 0) pairId = theme.lookupPair(s.fgAnsi, s.bgAnsi);
     else if (s.pairOverride) pairId = theme.pairs.pairOverride;
-    else if (linkNForSeg !== null && links[linkNForSeg - 1] && links[linkNForSeg - 1].href)
-      pairId = theme.pairs.link;
     else if (linkNForSeg !== null) pairId = theme.pairs.link;
     else pairId = theme.pairs.page;
 

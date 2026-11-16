@@ -2,15 +2,7 @@
  * touch during bootstrap. No DOM here — that's dom-globals.js and
  * nodes.js. Idempotent: safe to call twice.
  *
- * Signature: installGlobals({ tui, timers, getUrl, setUrl })
- *
- *   getUrl() → string    current tab URL (may be '' before navigation)
- *   setUrl(url, kind)    called by window.location setters and
- *                        history.pushState/replaceState. `kind` is one
- *                        of 'hashchange' | 'popstate' | 'pushstate' |
- *                        'replacestate' | 'navigate' | 'reload'. The
- *                        caller (main.js) decides whether to fetch or
- *                        just mutate the URL and fire an event. */
+ * Signature: installGlobals({ tui, timers, getUrl, setUrl }) */
 
 import { Event, CustomEvent } from 'src/dom/events.js';
 
@@ -26,12 +18,6 @@ function makeStorage() {
   };
 }
 
-/* location as a STABLE object (not a getter returning a new instance
- * per access), with dynamic getters reading the current URL and setters
- * delegating to setUrl.
- *
- * Stable, because a getter-per-access made `window.location.hash = 'x'`
- * write to a throwaway object — hash-router SPA buttons were dead. */
 function makeLocation(getUrl, setUrl) {
   function cur() {
     try { return getUrl ? (getUrl() || '') : ''; } catch (_) { return ''; }
@@ -99,9 +85,6 @@ function makeLocation(getUrl, setUrl) {
   return loc;
 }
 
-/* Minimal MessageChannel for React 18's scheduler. Delivery via
- * microtask so commits land inside pumpJobs(), before the mutation
- * hook fires and flushRender re-serializes. */
 class MessageChannelPolyfill {
   constructor() {
     this.port1 = { onmessage: null, postMessage: null, start() {}, close() {} };
@@ -129,7 +112,6 @@ class MessageChannelPolyfill {
 export function installGlobals({ tui, timers, getUrl, setUrl }) {
   const g = globalThis;
 
-  /* ---------------- window / self ---------------- */
   if (!Object.getOwnPropertyDescriptor(g, 'window')) {
     Object.defineProperty(g, 'window', {
       value: g, configurable: true, writable: false,
@@ -137,7 +119,6 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
   }
   g.self = g;
 
-  /* ---------------- navigator ---------------- */
   if (!g.navigator) {
     g.navigator = {
       userAgent: 'Mozilla/5.0 (X11; Linux x86_64) QJSBrowser/0.1',
@@ -152,7 +133,6 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
     };
   }
 
-  /* ---------------- viewport ---------------- */
   function readSize() {
     try { return tui.size(); } catch (_) { return { rows: 24, cols: 80 }; }
   }
@@ -166,7 +146,6 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
   Object.defineProperty(g, 'pageXOffset', { value: 0, configurable: true });
   Object.defineProperty(g, 'pageYOffset', { value: 0, configurable: true });
 
-  /* ---------------- performance ---------------- */
   if (!g.performance) {
     const t0 = Date.now();
     g.performance = {
@@ -180,18 +159,24 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
     };
   }
 
-  /* ---------------- storage ---------------- */
   if (!g.localStorage)   g.localStorage   = makeStorage();
   if (!g.sessionStorage) g.sessionStorage = makeStorage();
 
   /* ---------------- matchMedia ----------------
-   * No document access — safe here, unlike Element patches.
    *
-   * prefers-reduced-motion:no-preference → matches:true. Many libs
-   * (Framer Motion, Tailwind, CSS-in-JS) branch on this. Returning
-   * false for everything pushes them to the reduced-motion path,
-   * which sometimes calls APIs we don't have. Returning true selects
-   * the animated path, where all the calls are guarded stubs. */
+   * Only one non-default response: prefers-reduced-motion:no-preference
+   * returns matches:true. Many libs take an "animations on" path when
+   * true (guarded stubs), and the reduced-motion path when false
+   * sometimes calls APIs we don't have.
+   *
+   * prefers-color-scheme: dark was briefly forced to true to make text
+   * visible on black terminals, but that also hijacked the site's dark
+   * theme (colors were reassigned to shades that snapToAnsi mapped
+   * poorly — links lost their blue). Reverted. The "invisible color"
+   * problem is now solved in dom-to-text.js by filtering very dark
+   * ANSI colors to the theme's default page color, which fixes the
+   * dark text WITHOUT touching the site's light theme and therefore
+   * preserves the link colors. */
   if (!g.matchMedia) {
     g.matchMedia = (q) => {
       const m = {
@@ -200,14 +185,11 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
         addListener() {}, removeListener() {},
         addEventListener() {}, removeEventListener() {},
       };
-      if (/prefers-reduced-motion\s*:\s*no-preference/.test(String(q))) {
-        m.matches = true;
-      }
+      if (/prefers-reduced-motion\s*:\s*no-preference/.test(String(q))) m.matches = true;
       return m;
     };
   }
 
-  /* ---------------- timers ---------------- */
   g.setTimeout    = timers.setTimeout;
   g.setInterval   = timers.setInterval;
   g.clearTimeout  = timers.clearTimeout;
@@ -229,7 +211,6 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
 
   if (!g.MessageChannel) g.MessageChannel = MessageChannelPolyfill;
 
-  /* ---------------- location ---------------- */
   if (!g.location) {
     const loc = makeLocation(getUrl, setUrl);
     try {
@@ -243,7 +224,6 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
     }
   }
 
-  /* ---------------- history ---------------- */
   if (!g.history) {
     g.history = {
       length: 1,
@@ -262,7 +242,6 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
     };
   }
 
-  /* ---------------- misc ---------------- */
   if (!g.hasFocus) g.hasFocus = () => true;
 
   if (g.console) {
@@ -272,7 +251,6 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
     if (!g.console.debug) g.console.debug = g.console.log;
   }
 
-  /* ---------------- DOM Event constructors ---------------- */
   if (!g.Event)         g.Event         = Event;
   if (!g.CustomEvent)   g.CustomEvent   = CustomEvent;
   if (!g.KeyboardEvent) g.KeyboardEvent = Event;
@@ -281,7 +259,6 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
   if (!g.InputEvent)    g.InputEvent    = Event;
   if (!g.UIEvent)       g.UIEvent       = Event;
 
-  /* ---------------- MutationObserver (Vite modulepreload polyfill) ---------------- */
   if (!g.MutationObserver) {
     g.MutationObserver = class MutationObserver {
       constructor(callback) { this._cb = callback; }
@@ -291,7 +268,6 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
     };
   }
 
-  /* ---------------- URL / URLSearchParams (Vite chunk loaders) ---------------- */
   if (!g.URLSearchParams) {
     g.URLSearchParams = function URLSearchParams(init) {
       if (!(this instanceof g.URLSearchParams)) return new g.URLSearchParams(init);
@@ -376,7 +352,6 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
     };
   }
 
-  /* ---------------- window.scroll* (SPA routers on mount) ---------------- */
   if (!g.scrollTo) g.scrollTo = function () {};
   if (!g.scroll)   g.scroll   = function () {};
   if (!g.scrollBy) g.scrollBy = function () {};
@@ -384,7 +359,6 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
   if (!g.scrollByLines) g.scrollByLines = function () {};
   if (!g.scrollByPages) g.scrollByPages = function () {};
 
-  /* ---------------- IntersectionObserver / ResizeObserver ---------------- */
   if (!g.IntersectionObserver) {
     g.IntersectionObserver = class IntersectionObserver {
       constructor(cb) { this._cb = cb; this.root = null; this.rootMargin = '0px'; this.thresholds = [0]; }
@@ -403,7 +377,6 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
     };
   }
 
-  /* ---------------- requestIdleCallback (React 18 hydration) ---------------- */
   if (!g.requestIdleCallback) {
     g.requestIdleCallback = function (cb) {
       return timers.setTimeout(function () {
@@ -414,7 +387,6 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
     g.cancelIdleCallback = function (id) { timers.clearTimeout(id); };
   }
 
-  /* ---------------- crypto ---------------- */
   if (!g.crypto) {
     g.crypto = {
       randomUUID() {
@@ -433,7 +405,6 @@ export function installGlobals({ tui, timers, getUrl, setUrl }) {
     };
   }
 
-  /* ---------------- window as EventTarget ---------------- */
   if (typeof g.addEventListener !== 'function') {
     const _windowListeners = Object.create(null);
 

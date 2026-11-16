@@ -95,11 +95,7 @@ installGlobals({
 installDomGlobals();
 
 /* DOM extensions that nodes.js and dom-globals.js do NOT provide.
- * Runs AFTER installDomGlobals() so document.createElement exists.
- * Per the audit: getBoundingClientRect, focus, blur, click, remove,
- * matches, closest, contains, classList, style.setProperty,
- * createComment, createDocumentFragment, querySelector(All), children
- * are all in src/dom/nodes.js — do NOT duplicate them here. */
+ * Runs AFTER installDomGlobals() so document.createElement exists. */
 (function extendElementPrototype() {
   const doc = globalThis.document;
   if (!doc) return;
@@ -134,6 +130,55 @@ installDomGlobals();
         }
       };
     }
+  } catch (_) {}
+
+  /* ---- innerHTML setter: parse, don't stringify ----
+   *
+   * nodes.js's default setter does `textContent = html`, which drops
+   * markup into the DOM as literal text. This breaks React's
+   * dangerouslySetInnerHTML and any `el.innerHTML = '<b>x</b>'`:
+   * the user sees "<b>x</b>" instead of a bold "x".
+   *
+   * Real trigger: stringmanolo.qzz.io's article pages render markdown
+   * via dangerouslySetInnerHTML. First render is fine (htmlToDom parses
+   * the initial HTML). Toggling the theme re-applies the content via
+   * innerHTML, and with the old setter the raw markup leaked as text.
+   *
+   * Fix: override the setter to parse via parseHtmlInto (the same
+   * fragment parser insertAdjacentHTML uses). Preserve the original
+   * getter when it exists (nodes.js may serialize correctly on read;
+   * we only need to fix the write path). */
+  try {
+    const desc = Object.getOwnPropertyDescriptor(proto, 'innerHTML');
+    const getter = desc && typeof desc.get === 'function'
+      ? desc.get
+      : function () {
+          let out = '';
+          const kids = this.childNodes;
+          if (kids) for (let i = 0; i < kids.length; i++) {
+            const c = kids[i];
+            if (c.nodeType === 3) out += (c.data || '');
+            else if (c.nodeType === 1) {
+              try { out += (c.outerHTML || c.textContent || ''); } catch (_) {}
+            }
+          }
+          return out;
+        };
+    Object.defineProperty(proto, 'innerHTML', {
+      configurable: true,
+      enumerable: desc ? desc.enumerable : false,
+      get: getter,
+      set: function (v) {
+        try {
+          const d = this.ownerDocument || doc;
+          if (typeof this.removeChild === 'function') {
+            while (this.firstChild) this.removeChild(this.firstChild);
+          }
+          const html = String(v == null ? '' : v);
+          if (html) parseHtmlInto(html, '', d, this);
+        } catch (_) {}
+      },
+    });
   } catch (_) {}
 
   /* ---- lang / dir reflection ---- */

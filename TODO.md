@@ -26,4 +26,5 @@
 - Add webp support
 - Port to android and desktop (replace terminal UI by real UI and embed in apk)
 - Arreglar los select
-
+- Save TUI state when terminal on the background
+- control + C should also close the console

@@ -1,17 +1,49 @@
 #include <ncurses.h>
 #include <langinfo.h>
 #include <locale.h>
+#include <signal.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 #include "quickjs.h"
 
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
 
+/* ---- SIGWINCH / SIGCONT handling ----
+ *
+ * SIGWINCH: kernel sends it when the terminal is resized.
+ * SIGCONT:  kernel sends it when the process is resumed after a pause.
+ *           Termux sends SIGCONT when you switch back to it from another
+ *           app.
+ *
+ * Both cases leave ncurses with a stale screen model: ncurses thinks
+ * the terminal still shows what it last drew, but the terminal emulator
+ * may have been resized or its alt-screen state may have changed while
+ * we were paused. Without an explicit "redraw everything" trigger, the
+ * screen shows stale content mixed with the new (the "Welcome to
+ * QJSBrowser!" ghost over a loaded page).
+ *
+ * ncurses installs its own SIGWINCH handler in initscr(). We override
+ * it here so that we can resize + redraw on our own terms. We still
+ * call resizeterm() so ncurses' internal LINES/COLS are updated.
+ * KEY_RESIZE will no longer be delivered by wgetch — we handle resize
+ * ourselves via t_check_resize(). */
+static volatile sig_atomic_t g_winch_pending = 0;
+static volatile sig_atomic_t g_cont_pending  = 0;
+
+static void on_winch(int sig) { (void)sig; g_winch_pending = 1; }
+static void on_cont (int sig) { (void)sig; g_cont_pending  = 1; }
+
 static JSValue t_init(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
   (void)c; (void)v; (void)ac; (void)av;
   initscr(); raw(); noecho(); nonl(); keypad(stdscr, TRUE);
-  nodelay(stdscr, TRUE); curs_set(1); return JS_UNDEFINED;
+  nodelay(stdscr, TRUE); curs_set(1);
+  /* Install AFTER initscr so we replace ncurses' own handlers. */
+  signal(SIGWINCH, on_winch);
+  signal(SIGCONT,  on_cont);
+  return JS_UNDEFINED;
 }
 static JSValue t_end(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
   (void)c; (void)v; (void)ac; (void)av;
@@ -227,6 +259,28 @@ static JSValue t_clearok(JSContext *c, JSValueConst v, int ac, JSValueConst *av)
   return JS_UNDEFINED;
 }
 
+/* Returns 1 if a redraw is needed (resize or resume happened), 0 otherwise.
+ * Side effect: on SIGWINCH, ncurses' size is updated via resizeterm();
+ * in both cases, clearok(stdscr, TRUE) is set so the next refresh()
+ * repaints from scratch. JS calls this at the top of the event loop;
+ * if it returns non-zero, controller.render() runs, which repaints
+ * everything. */
+static JSValue t_check_resize(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
+  (void)v; (void)ac; (void)av;
+  if (!g_winch_pending && !g_cont_pending) return JS_NewInt32(c, 0);
+  g_winch_pending = 0;
+  g_cont_pending  = 0;
+
+  struct winsize ws;
+  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) {
+    if (ws.ws_row != LINES || ws.ws_col != COLS) {
+      resizeterm(ws.ws_row, ws.ws_col);
+    }
+  }
+  clearok(stdscr, TRUE);
+  return JS_NewInt32(c, 1);
+}
+
 static JSValue t_mouse_enable(JSContext *c, JSValueConst v, int ac, JSValueConst *av) {
   (void)c; (void)v; (void)ac; (void)av;
   mmask_t supported = mousemask(
@@ -338,6 +392,7 @@ static const JSCFunctionListEntry tui_funcs[] = {
   JS_CFUNC_DEF("setCursor", 1, t_set_cursor),
   JS_CFUNC_DEF("ungetch", 1, t_ungetch),
   JS_CFUNC_DEF("clearok", 0, t_clearok),
+  JS_CFUNC_DEF("check_resize", 0, t_check_resize),
   JS_CFUNC_DEF("mouseEnable", 0, t_mouse_enable),
   JS_CFUNC_DEF("mouseDisable", 0, t_mouse_disable),
   JS_CFUNC_DEF("getMouse", 0, t_get_mouse),

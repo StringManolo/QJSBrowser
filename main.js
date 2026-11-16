@@ -133,21 +133,10 @@ installDomGlobals();
   } catch (_) {}
 
   /* ---- innerHTML setter: parse, don't stringify ----
-   *
-   * nodes.js's default setter does `textContent = html`, which drops
-   * markup into the DOM as literal text. This breaks React's
-   * dangerouslySetInnerHTML and any `el.innerHTML = '<b>x</b>'`:
-   * the user sees "<b>x</b>" instead of a bold "x".
-   *
-   * Real trigger: stringmanolo.qzz.io's article pages render markdown
-   * via dangerouslySetInnerHTML. First render is fine (htmlToDom parses
-   * the initial HTML). Toggling the theme re-applies the content via
-   * innerHTML, and with the old setter the raw markup leaked as text.
-   *
-   * Fix: override the setter to parse via parseHtmlInto (the same
-   * fragment parser insertAdjacentHTML uses). Preserve the original
-   * getter when it exists (nodes.js may serialize correctly on read;
-   * we only need to fix the write path). */
+   * nodes.js's default setter does `textContent = html`, which leaves
+   * markup as literal text. This breaks React's dangerouslySetInnerHTML.
+   * Trigger: toggling the theme on stringmanolo.qzz.io re-applies
+   * article content via innerHTML and the raw HTML leaked as text. */
   try {
     const desc = Object.getOwnPropertyDescriptor(proto, 'innerHTML');
     const getter = desc && typeof desc.get === 'function'
@@ -450,6 +439,19 @@ httpClient.setCallbacks({
 controller.render();
 
 while (controller.isRunning()) {
+  /* Handle terminal resize (SIGWINCH) and process resume (SIGCONT, e.g.
+   * Termux app switch). Both leave ncurses thinking the screen is up to
+   * date when it isn't; tui.check_resize detects the flag and, if set,
+   * updates ncurses' size + clearok. Then controller.render() repaints
+   * from scratch. Called at the TOP of the loop so that an EINTR +
+   * continue from epoll_wait also runs it (signal handler sets flag,
+   * epoll_wait interrupts, continue jumps here). */
+  try {
+    if (typeof tui.check_resize === 'function') {
+      if (tui.check_resize()) controller.render();
+    }
+  } catch (_) {}
+
   let timeout = -1;
   if (scheduler.hasWork()) timeout = 0;
   else {

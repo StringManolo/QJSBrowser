@@ -1,28 +1,43 @@
-/* DOM → segments. Byte-identical to html-to-text for well-formed HTML.
+/* DOM → segments. See header of previous versions for full context.
  *
- * Reads *properties* (node.value, node.checked) for form state, not
- * attributes. React controlled inputs write the property, not the
- * attribute (to preserve cursor position), so reading the attribute
- * would show stale default values after every re-render.
+ * Fixes layered in this version:
  *
- * <button> uses textContent as its label (not the value attribute) —
- * React writes the label as a text child, not as value="". And we do
- * NOT walk into its children (the label is already in the form segment),
- * so the text isn't duplicated.
+ * 1. Whitespace-only text nodes with newlines are skipped. Pretty-printed
+ *    HTML inserts '\n    ' between tags. Browsers collapse those to
+ *    nothing between blocks. Without this, each becomes a line break —
+ *    the ~20 blank lines above the navbar on stringmanolo.qzz.io.
  *
- * If nodeMap is provided, populates it with elementId → Element DOM.
+ * 2. position:fixed subtrees skipped entirely.
  *
- * Click-through: pageView.lineAt() rebuilds segments on every render
- * and drops custom properties (elementId, _node). Only linkN survives.
- * So for text inside an ancestor with React onClick we register a
- * synthetic link ({n, href:null, node}) and set linkN — the click
- * handler dispatches a real DOM click on `node`, which bubbles to the
- * React onClick ancestor. This is what makes <div onClick> cards work.
+ * 3. Flex/grid row containers: only <div> becomes inline. This keeps
+ *    the stringmanolo nav (div.links + button.theme) on one line, but
+ *    leaves <h1>/<h2>/<p> as blocks even when their parent is flex —
+ *    without that, Google consent's button + heading + paragraph
+ *    glued together into one line. flex-direction: column disables
+ *    even the div exception (children stack vertically).
  *
- * Invisible-color fix: raw CSS colors below a luminance threshold
- * (dark text on what is presumed a dark terminal) are replaced by the
- * theme's default page color. The site's link colors (#0066cc etc.)
- * are above the threshold and survive, so links stay blue. */
+ * 4. Table layout. <tr> block-breaks before/after (one row per line).
+ *    <td>/<th> emit " │ " separator between cells (first cell of a row
+ *    emits nothing). Without this, "Nombre del foroTemasMensajesÚltimo
+ *    mensaje" glued together — table headers rendered as one text run.
+ *
+ * 5. Horizontal rules only for EXPLICIT border-top / border-bottom. The
+ *    `border` shorthand is a box border (buttons, inputs, cards) and
+ *    must NOT emit an HR — earlier, every bordered box emitted TWO
+ *    bars, turning Google's consent page into a wall of ─────.
+ *
+ * 6. HR width comes from opts.width (page column width). On resize,
+ *    the controller re-serializes so bars match the new width.
+ *
+ * 7. ANSI-color blacklist: dark CSS colors replaced by theme page color
+ *    so #333 text on black terminal is readable; blue links survive.
+ *
+ * Click-through: pageView.lineAt() rebuilds segments and drops custom
+ * properties (elementId, _node). Only linkN survives. For text inside
+ * an ancestor with React onClick we register a synthetic link
+ * ({n, href:null, node}) and set linkN — the click handler dispatches
+ * a real DOM click on `node`, which bubbles to the React onClick.
+ */
 
 import { resolveUrl } from 'src/base/url.js';
 import { parseStylesheet, parseInlineStyle } from 'src/css/parser.js';
@@ -35,12 +50,14 @@ const BLOCK_TAGS = ['p','div','h1','h2','h3','h4','h5','h6',
                     'blockquote','pre','ul','ol','table','form',
                     'article','section','header','footer','main',
                     'nav','aside','figure','figcaption','details',
-                    'summary','fieldset','address'];
+                    'summary','fieldset','address',
+                    'table','thead','tbody','tfoot','caption'];
 const INLINE_BG_TAGS = new Set(['code','kbd','samp','mark','pre']);
 const TEXT_INPUT_TYPES = new Set(['text','email','tel','url','number','search','password']);
 const CLICKABLE_KINDS = new Set(['submit', 'reset', 'button']);
-const SKIP_SUBTREE_TAGS = new Set(['style','script','title','noscript','template']);
+const SKIP_SUBTREE_TAGS = new Set(['style','script','title','noscript','template','colgroup','col']);
 const REACT_CLICK_MAX_DEPTH = 6;
+const MIN_HR_WIDTH = 20;
 
 function parseDim(v) {
   if (!v) return 0;
@@ -79,21 +96,20 @@ function svgSize(node) {
   return null;
 }
 
-/* ANSI-color blacklist for "invisible on dark terminal":
- *   0  = black
- *   8  = bright black (= dark gray on most terminals)
- *   232-244 = dark gray shades in the 256-color palette
- * Everything else (including blue #4 for links, cyan #6, and the
- * "bright" range 9-15) is preserved. The idea: if a page hardcodes a
- * dark color assuming a light background, the terminal will be black
- * and the text disappears. Replacing with the theme's page color makes
- * the text readable without touching the link colors (blue #0066cc
- * maps to ANSI 4, not in the blacklist). */
 function isInvisibleOnBlack(idx) {
   if (idx < 0) return false;
   if (idx === 0 || idx === 8) return true;
   if (idx >= 232 && idx <= 244) return true;
   return false;
+}
+
+function hasVisibleBorder(decls, side) {
+  const val = decls['border-' + side];
+  if (!val) return false;
+  const s = String(val).toLowerCase().trim();
+  if (!s || s === 'none' || s === '0') return false;
+  if (s.startsWith('none') || s.startsWith('0 ') || s === '0px') return false;
+  return true;
 }
 
 function buildClickableMap(root) {
@@ -104,25 +120,22 @@ function buildClickableMap(root) {
       const keys = Object.keys(n);
       for (let i = 0; i < keys.length; i++) {
         const k = keys[i];
-        if (k.length > 13 && k.charCodeAt(0) === 95 &&
-            k.startsWith('__reactProps$')) {
+        if (k.length > 13 && k.charCodeAt(0) === 95 && k.startsWith('__reactProps$')) {
           const p = n[k];
-          if (p && typeof p.onClick === 'function') {
-            map.set(n, true);
-            break;
-          }
+          if (p && typeof p.onClick === 'function') { map.set(n, true); break; }
         }
       }
     } catch (_) {}
-    if (n.childNodes) {
-      for (let i = 0; i < n.childNodes.length; i++) visit(n.childNodes[i]);
-    }
+    if (n.childNodes) for (let i = 0; i < n.childNodes.length; i++) visit(n.childNodes[i]);
   }
   visit(root);
   return map;
 }
 
-export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
+export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap, opts) {
+  opts = opts || {};
+  const pageWidth = Math.max(MIN_HR_WIDTH, opts.width || 40);
+
   const rules = [];
   for (const css of cssTexts || []) for (const rule of parseStylesheet(css)) rules.push(rule);
 
@@ -135,12 +148,10 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
   const clickable = buildClickableMap(root);
 
   function nearestClickable(node) {
-    let cur = node;
-    let d = 0;
+    let cur = node, d = 0;
     while (cur && d < REACT_CLICK_MAX_DEPTH) {
       if (clickable.has(cur)) return cur;
-      cur = cur.parentNode;
-      d++;
+      cur = cur.parentNode; d++;
     }
     return null;
   }
@@ -151,6 +162,29 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
     linkN++;
     links.push({ n: linkN, href: null, node, text: '' });
     return linkN;
+  }
+
+  function computeDecls() {
+    const decls = {};
+    for (const e of _stack) {
+      const d = TAG_DEFAULTS[e.tag];
+      if (d) Object.assign(decls, d);
+    }
+    const applicable = [];
+    for (const rule of rules) {
+      for (const sel of rule.selectors) {
+        for (let k = _stack.length - 1; k >= 0; k--) {
+          if (matches(sel, _stack[k])) {
+            applicable.push({ spec: specificity(sel), order: rule.order, declarations: rule.declarations });
+            break;
+          }
+        }
+      }
+    }
+    applicable.sort((a, b) => a.spec !== b.spec ? a.spec - b.spec : a.order - b.order);
+    for (const app of applicable) Object.assign(decls, app.declarations);
+    for (const e of _stack) if (e.inlineStyle) Object.assign(decls, e.inlineStyle);
+    return decls;
   }
 
   function makeEntry(node) {
@@ -188,6 +222,7 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
     }
 
     if (tag === 'ol') entry.count = 0;
+    if (tag === 'tr') entry.cellCount = 0;
 
     if (tag === 'button' || tag === 'select') {
       entry.classes = new Set();
@@ -198,32 +233,10 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
   }
 
   function currentStyle() {
-    const decls = {};
-    for (const e of _stack) {
-      const d = TAG_DEFAULTS[e.tag];
-      if (d) Object.assign(decls, d);
-    }
-
-    const applicable = [];
-    for (const rule of rules) {
-      for (const sel of rule.selectors) {
-        for (let k = _stack.length - 1; k >= 0; k--) {
-          if (matches(sel, _stack[k])) {
-            applicable.push({ spec: specificity(sel), order: rule.order, declarations: rule.declarations });
-            break;
-          }
-        }
-      }
-    }
-    applicable.sort((a, b) => a.spec !== b.spec ? a.spec - b.spec : a.order - b.order);
-    for (const app of applicable) Object.assign(decls, app.declarations);
-    for (const e of _stack) if (e.inlineStyle) Object.assign(decls, e.inlineStyle);
+    const decls = computeDecls();
 
     const fg = parseCssColor(decls['color']);
     let fgAnsi = snapToAnsi(fg, -1);
-    /* Drop dark-on-dark colors so the theme's default page color takes
-     * over. Preserves link colors (blue #4, cyan #6) and bright colors
-     * (9-15), which are visible on black. */
     if (isInvisibleOnBlack(fgAnsi)) fgAnsi = -1;
 
     const innermost = _stack[_stack.length - 1];
@@ -248,7 +261,11 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
       else if (lvl === 4) pairOverride = theme.pairs.heading4;
     }
 
-    return { fgAnsi, bgAnsi, bold, underline, indent, pre, hidden, pairOverride };
+    return {
+      fgAnsi, bgAnsi, bold, underline, indent, pre, hidden, pairOverride,
+      borderTop: hasVisibleBorder(decls, 'top'),
+      borderBottom: hasVisibleBorder(decls, 'bottom'),
+    };
   }
 
   function emitBlockBreak(tag) {
@@ -260,6 +277,34 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
     if (lastText.endsWith('\n\n')) return;
     if (lastText.endsWith('\n')) segments.push({ text: '\n', linkN: null });
     else segments.push({ text: '\n\n', linkN: null });
+  }
+
+  function emitHorizontalRule() {
+    for (let i = segments.length - 1; i >= 0; i--) {
+      const s = segments[i];
+      if (s._isHr) return;
+      const t = s.text || '';
+      if (t && /[^\s]/.test(t)) break;
+    }
+    while (segments.length > 0) {
+      const last = segments[segments.length - 1];
+      if (last.text && last.text.endsWith('\n\n') && !last.linkN) {
+        const trimmed = last.text.replace(/\n+$/, '\n');
+        if (trimmed === '\n') { segments.pop(); continue; }
+        last.text = trimmed;
+      }
+      break;
+    }
+    if (segments.length > 0) {
+      const last = segments[segments.length - 1];
+      if (!(last.text || '').endsWith('\n')) segments.push({ text: '\n', linkN: null });
+    }
+    segments.push({
+      text: '─'.repeat(pageWidth) + '\n',
+      linkN: null,
+      pair: theme.pairs.separator,
+      _isHr: true,
+    });
   }
 
   function topLink() {
@@ -279,8 +324,10 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
     const s = currentStyle();
     if (s.hidden) return;
 
+    if (!s.pre && /^\s*\n\s*$/.test(raw)) return;
+
     let text = s.pre ? decodeHtmlEntities(raw)
-                     : decodeHtmlEntities(raw.replace(/[ \t]+/g, ' '));
+                     : decodeHtmlEntities(raw.replace(/\s+/g, ' '));
     if (s.pre && text === '') return;
 
     const a = topLink();
@@ -335,10 +382,9 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
 
     if (CLICKABLE_KINDS.has(kind) && segments.length > 0) {
       const last = segments[segments.length - 1];
-      if (last.type === 'form') {
-        segments.push({ text: ' ', linkN: null });
-      } else if (last.text && last.text.length > 0 &&
-                 !last.text.endsWith('\n') && !last.text.endsWith(' ')) {
+      if (last.type === 'form') segments.push({ text: ' ', linkN: null });
+      else if (last.text && last.text.length > 0 &&
+               !last.text.endsWith('\n') && !last.text.endsWith(' ')) {
         segments.push({ text: ' ', linkN: null });
       }
     }
@@ -468,8 +514,7 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
     let label = node.getAttribute('aria-label') || '';
     if (!label) {
       for (const c of node.childNodes) {
-        if (c.nodeType === 1 &&
-            (c.localName === 'title' || c.localName === 'desc')) {
+        if (c.nodeType === 1 && (c.localName === 'title' || c.localName === 'desc')) {
           const t = (c.textContent || '').trim();
           if (t) { label = t; break; }
         }
@@ -506,11 +551,15 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
 
   function enterElement(node) {
     const tag = node.localName;
+
     if (tag === 'form') {
       emitBlockBreak('form');
       _stack.push(makeEntry(node));
+      const s = currentStyle();
+      if (s.borderTop) emitHorizontalRule();
       return;
     }
+
     if (tag === 'li') {
       const depth = _stack.filter(e => e.tag === 'ul' || e.tag === 'ol').length;
       const indent = '  '.repeat(depth);
@@ -528,15 +577,40 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
       _stack.push(makeEntry(node));
       return;
     }
-    if (BLOCK_TAGS.includes(tag)) emitBlockBreak(tag);
-    _stack.push(makeEntry(node));
+
+    /* Flex/grid row container: only <div> becomes inline. This keeps the
+     * stringmanolo nav (div + button) on one line, but leaves <h1>/<p>
+     * as blocks even when their parent is flex — without that, Google
+     * consent's button + heading + paragraph glued together on one line.
+     * flex-direction: column disables even the div exception. */
+    let inHorizontalFlow = false;
+    if (_stack.length > 0) {
+      const parentDecls = computeDecls();
+      const parentDisplay = String(parentDecls['display'] || '').toLowerCase();
+      const parentDir = String(parentDecls['flex-direction'] || '').toLowerCase();
+      const isFlex = parentDisplay === 'flex' || parentDisplay === 'inline-flex';
+      const isGrid = parentDisplay === 'grid' || parentDisplay === 'inline-grid';
+      const rowDir = !parentDir || parentDir === 'row' || parentDir === 'row-reverse';
+      if ((isFlex && rowDir) || isGrid) inHorizontalFlow = true;
+    }
+    const shouldBlock = BLOCK_TAGS.includes(tag) &&
+                        !(inHorizontalFlow && tag === 'div');
+
+    if (shouldBlock) emitBlockBreak(tag);
+    const entry = makeEntry(node);
+    entry.wasBlock = shouldBlock;
+    _stack.push(entry);
+
+    const s = currentStyle();
+    if (s.borderTop) emitHorizontalRule();
   }
 
   function exitElement(node) {
     const entry = _stack[_stack.length - 1];
     const tag = node.localName;
 
-    if (!currentStyle().hidden) {
+    const s = currentStyle();
+    if (!s.hidden) {
       if (tag === 'a' && entry.n) {
         links[entry.n - 1].text = entry.accumulated.trim();
       }
@@ -546,11 +620,13 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
         return;
       }
       if (tag === 'form') {
+        if (s.borderBottom) emitHorizontalRule();
         emitBlockBreak('form');
         _stack.pop();
         return;
       }
-      if (BLOCK_TAGS.includes(tag)) emitBlockBreak(tag);
+      if (s.borderBottom) emitHorizontalRule();
+      if (entry.wasBlock) emitBlockBreak(tag);
     }
     _stack.pop();
   }
@@ -562,13 +638,50 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
 
     const tag = node.localName;
 
+    if (node.getAttribute) {
+      const inline = node.getAttribute('style');
+      if (inline && /(?:^|;)\s*position\s*:\s*fixed/i.test(inline)) return;
+    }
+
     if (SKIP_SUBTREE_TAGS.has(tag)) return;
 
     if (tag === 'br') { segments.push({ text: '\n', linkN: null }); return; }
-    if (tag === 'hr') { emitBlockBreak('hr'); segments.push({ text: '────\n', linkN: null }); return; }
+    if (tag === 'hr') { emitHorizontalRule(); return; }
     if (tag === 'img') { pushImage(node); return; }
     if (tag === 'input') { enterInput(node); return; }
     if (tag === 'svg') { pushSvg(node); return; }
+
+    /* Table row: one line per row. Cells inside emit " │ " separators
+     * via the special-case below. This fixes the "Nombre del
+     * foroTemasMensajesÚltimo mensaje" gluing on forums. */
+    if (tag === 'tr') {
+      emitBlockBreak('tr');
+      const entry = makeEntry(node);
+      entry.cellCount = 0;
+      _stack.push(entry);
+      for (const c of node.childNodes) walk(c);
+      _stack.pop();
+      emitBlockBreak('tr');
+      return;
+    }
+
+    /* Table cell: emit " │ " separator before (except the first cell of
+     * the row), then walk children normally. If the cell contains block
+     * content (e.g. an <img> + text), the block children will break
+     * naturally — the cell separator is inserted before all of it. */
+    if (tag === 'td' || tag === 'th') {
+      const parent = _stack[_stack.length - 1];
+      if (parent && parent.tag === 'tr') {
+        if (parent.cellCount > 0) {
+          segments.push({ text: ' │ ', linkN: null });
+        }
+        parent.cellCount++;
+      }
+      _stack.push(makeEntry(node));
+      for (const c of node.childNodes) walk(c);
+      _stack.pop();
+      return;
+    }
 
     if (tag === 'option') {
       enterOption(node);

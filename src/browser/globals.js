@@ -45,18 +45,35 @@ function makeLocation(url) {
   };
 }
 
-/* Minimal MessageChannel: enough for React 18's scheduler. Delivery is
- * deferred via setTimeout so the event loop stays cooperative. */
+/* Minimal MessageChannel: enough for React 18's scheduler.
+ *
+ * Delivery is via microtask rather than setTimeout. With setTimeout, the
+ * update is queued for the next timers.runDue() iteration — but the loop
+ * may be sleeping in epoll_wait if no fd is readable, delaying the render
+ * until the next event. That manifests as "the input field shows what I
+ * typed, but Text: stays the old value until I click a button". Microtask
+ * delivery happens inside pumpJobs(), which runs immediately before
+ * mutation hooks fire and flushRender re-serializes the DOM. */
 class MessageChannelPolyfill {
   constructor() {
     this.port1 = { onmessage: null, postMessage: null, start() {}, close() {} };
     this.port2 = { onmessage: null, postMessage: null, start() {}, close() {} };
     const p1 = this.port1, p2 = this.port2;
     p2.postMessage = (data) => {
-      setTimeout(() => { if (p1.onmessage) p1.onmessage({ data }); }, 0);
+      Promise.resolve().then(() => {
+        if (p1.onmessage) {
+          try { p1.onmessage({ data }); }
+          catch (e) { console.error('[MessageChannel] ' + (e && e.message || e)); }
+        }
+      });
     };
     p1.postMessage = (data) => {
-      setTimeout(() => { if (p2.onmessage) p2.onmessage({ data }); }, 0);
+      Promise.resolve().then(() => {
+        if (p2.onmessage) {
+          try { p2.onmessage({ data }); }
+          catch (e) { console.error('[MessageChannel] ' + (e && e.message || e)); }
+        }
+      });
     };
   }
 }

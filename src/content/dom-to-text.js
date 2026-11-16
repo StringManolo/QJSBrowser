@@ -1,15 +1,18 @@
 /* DOM → segments. Byte-identical to html-to-text for well-formed HTML.
  *
- * Walks the tree in pre-order (which is the token order that html-to-text
- * iterated). CSS matching uses a virtual stack of {tag, id, classes,
- * inlineStyle} entries pushed/popped as we enter/exit elements, mirroring
- * html-to-text's behavior — including its quirks:
- *   - Button/select stack entries have no classes/style, so class-based
- *     CSS rules on <button>/<select> do NOT propagate to their children.
- *   - <option> does not push to the stack; its text is emitted as plain
- *     text (matching the current html-to-text behavior, buggy or not).
- *   - <textarea> content is captured as one raw text node and rendered
- *     via formState, never as plain text.
+ * Reads *properties* (node.value, node.checked) for form state, not
+ * attributes. React controlled inputs write the property, not the
+ * attribute (to preserve cursor position), so reading the attribute
+ * would show stale default values after every re-render.
+ *
+ * <button> uses textContent as its label (not the value attribute) —
+ * React writes the label as a text child, not as value="". And we do
+ * NOT walk into its children (the label is already in the form segment),
+ * so the text isn't duplicated.
+ *
+ * If nodeMap is provided, populates it with elementId → Element DOM.
+ * The controller uses this to dispatch real click/input events at the
+ * original node when the user interacts with the TUI.
  */
 
 import { resolveUrl } from 'src/base/url.js';
@@ -23,6 +26,7 @@ const BLOCK_TAGS = ['p','div','h1','h2','h3','h4','h5','h6',
                     'blockquote','pre','ul','ol','table','form'];
 const INLINE_BG_TAGS = new Set(['code','kbd','samp','mark','pre']);
 const TEXT_INPUT_TYPES = new Set(['text','email','tel','url','number','search','password']);
+const CLICKABLE_KINDS = new Set(['submit', 'reset', 'button']);
 
 function parseDim(v) {
   if (!v) return 0;
@@ -43,17 +47,15 @@ function fontSizeLevel(fs) {
   if (px >= 16) return 5; return 6;
 }
 
-export function domToText(root, baseUrl, theme, formState, cssTexts) {
+export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
   const rules = [];
   for (const css of cssTexts || []) for (const rule of parseStylesheet(css)) rules.push(rule);
 
   const segments = [];
   const links = [];
   const images = [];
-  const _stack = [];          /* entries: { tag, id, classes, inlineStyle, ... } */
+  const _stack = [];
   let linkN = 0;
-
-  /* --- stack entries -------------------------------------------------- */
 
   function makeEntry(node) {
     const tag = node.localName;
@@ -91,8 +93,6 @@ export function domToText(root, baseUrl, theme, formState, cssTexts) {
 
     if (tag === 'ol') entry.count = 0;
 
-    /* Match html-to-text: <button>/<select> push to stack with no classes
-     * or inline style. Tag defaults apply, but not class-based CSS. */
     if (tag === 'button' || tag === 'select') {
       entry.classes = new Set();
       entry.inlineStyle = null;
@@ -100,8 +100,6 @@ export function domToText(root, baseUrl, theme, formState, cssTexts) {
 
     return entry;
   }
-
-  /* --- style resolution ----------------------------------------------- */
 
   function currentStyle() {
     const decls = {};
@@ -150,8 +148,6 @@ export function domToText(root, baseUrl, theme, formState, cssTexts) {
 
     return { fgAnsi, bgAnsi, bold, underline, indent, pre, hidden, pairOverride };
   }
-
-  /* --- segment emission ----------------------------------------------- */
 
   function emitBlockBreak() {
     if (segments.length === 0) return;
@@ -206,19 +202,32 @@ export function domToText(root, baseUrl, theme, formState, cssTexts) {
 
     let pairId;
     if (s.fgAnsi >= 0 || s.bgAnsi >= 0) pairId = theme.lookupPair(s.fgAnsi, s.bgAnsi);
-    else if (s.pairOverride) pairId = s.pairOverride;
+    else if (s.pairOverride) pairId = theme.pairs.pairOverride;
     else if (linkNForSeg !== null) pairId = theme.pairs.link;
     else pairId = theme.pairs.page;
 
     segments.push({ text, linkN: linkNForSeg, pair: pairId, bold: s.bold, underline: s.underline });
   }
 
-  /* --- form helpers --------------------------------------------------- */
-
-  function pushFormSegment(kind, info) {
+  function pushFormSegment(kind, info, node) {
     if (!formState) return;
     info.formId = currentFormId();
     const id = formState.addElement(info);
+    if (nodeMap && node) nodeMap.set(id, node);
+
+    /* Botones consecutivos se pegan sin separación porque no hay layout
+     * inline-block. Añadimos un espacio antes de un botón clicable si
+     * el segmento anterior es otro botón o texto sin nueva línea. */
+    if (CLICKABLE_KINDS.has(kind) && segments.length > 0) {
+      const last = segments[segments.length - 1];
+      if (last.type === 'form') {
+        segments.push({ text: ' ', linkN: null });
+      } else if (last.text && last.text.length > 0 &&
+                 !last.text.endsWith('\n') && !last.text.endsWith(' ')) {
+        segments.push({ text: ' ', linkN: null });
+      }
+    }
+
     segments.push({ type: 'form', elementId: id, kind });
   }
 
@@ -231,9 +240,9 @@ export function domToText(root, baseUrl, theme, formState, cssTexts) {
         kind: t,
         name: node.getAttribute('name') || '',
         value: node.getAttribute('value') || 'on',
-        checked: node.hasAttribute('checked'),
+        checked: !!node.checked,
         disabled: node.hasAttribute('disabled'),
-      });
+      }, node);
       return;
     }
     if (t === 'submit' || t === 'reset' || t === 'button') {
@@ -242,19 +251,19 @@ export function domToText(root, baseUrl, theme, formState, cssTexts) {
         name: node.getAttribute('name') || '',
         value: node.getAttribute('value') || (t === 'submit' ? 'Submit' : t === 'reset' ? 'Reset' : 'Button'),
         disabled: node.hasAttribute('disabled'),
-      });
+      }, node);
       return;
     }
     if (t === 'password' || TEXT_INPUT_TYPES.has(t)) {
       pushFormSegment(t === 'password' ? 'password' : 'text', {
         kind: t === 'password' ? 'password' : 'text',
         name: node.getAttribute('name') || '',
-        value: node.getAttribute('value') || '',
+        value: node.value !== undefined ? node.value : (node.getAttribute('value') || ''),
         placeholder: node.getAttribute('placeholder') || '',
         size: parseDim(node.getAttribute('size')),
         disabled: node.hasAttribute('disabled'),
         readonly: node.hasAttribute('readonly'),
-      });
+      }, node);
       return;
     }
   }
@@ -269,12 +278,12 @@ export function domToText(root, baseUrl, theme, formState, cssTexts) {
       selectedIndex: -1,
     };
     el.id = formState.addElement(el);
-    node._formEl = el;   /* used by enterOption below */
+    if (nodeMap) nodeMap.set(el.id, node);
+    node._formEl = el;
     segments.push({ type: 'form', elementId: el.id, kind: 'select' });
   }
 
   function enterOption(node) {
-    /* Walk ancestors to find the enclosing <select>'s element state. */
     let el = null;
     for (let k = _stack.length - 1; k >= 0; k--) {
       if (_stack[k].tag === 'select' && _stack[k]._el && _stack[k]._el._formEl) {
@@ -297,27 +306,33 @@ export function domToText(root, baseUrl, theme, formState, cssTexts) {
     const id = formState.addElement({
       kind: 'textarea',
       name: node.getAttribute('name') || '',
-      value: node.textContent,      /* raw text — entities not decoded */
+      value: node.value !== undefined ? node.value : node.textContent,
       rows: parseDim(node.getAttribute('rows')) || 3,
       cols: parseDim(node.getAttribute('cols')) || 40,
       disabled: node.hasAttribute('disabled'),
       readonly: node.hasAttribute('readonly'),
       formId: currentFormId(),
     });
+    if (nodeMap) nodeMap.set(id, node);
     segments.push({ type: 'form', elementId: id, kind: 'textarea' });
   }
 
   function enterButton(node) {
     if (!formState) return;
     const type = (node.getAttribute('type') || 'submit').toLowerCase();
+    /* label: value attribute primero; si no hay, textContent del botón
+     * (React escribe el label como hijo de texto, no como value=""). */
+    const valueAttr = node.getAttribute('value') || '';
+    const label = valueAttr || node.textContent || '';
     pushFormSegment(
       type === 'button' ? 'button' : type === 'reset' ? 'reset' : 'submit',
       {
         kind: type === 'button' ? 'button' : type === 'reset' ? 'reset' : 'submit',
         name: node.getAttribute('name') || '',
-        value: node.getAttribute('value') || '',
+        value: label,
         disabled: node.hasAttribute('disabled'),
-      }
+      },
+      node
     );
   }
 
@@ -334,8 +349,6 @@ export function domToText(root, baseUrl, theme, formState, cssTexts) {
     });
     segments.push({ type: 'img', src, alt });
   }
-
-  /* --- walk ----------------------------------------------------------- */
 
   function enterElement(node) {
     const tag = node.localName;
@@ -395,27 +408,19 @@ export function domToText(root, baseUrl, theme, formState, cssTexts) {
 
     const tag = node.localName;
 
-    /* Leaf / void elements that don't push to the stack in html-to-text. */
     if (tag === 'br') { segments.push({ text: '\n', linkN: null }); return; }
     if (tag === 'hr') { emitBlockBreak(); segments.push({ text: '────\n', linkN: null }); return; }
     if (tag === 'img') { pushImage(node); return; }
     if (tag === 'input') { enterInput(node); return; }
 
-    /* <option> is captured into the enclosing select's options list but
-     * does NOT push to the stack; its text is emitted as plain text
-     * (matching html-to-text's current behavior). */
     if (tag === 'option') {
       enterOption(node);
       for (const c of node.childNodes) walk(c);
       return;
     }
 
-    /* <textarea>: form element with raw text content. Children are NOT
-     * walked (their text is captured via node.textContent in enterTextarea). */
     if (tag === 'textarea') { enterTextarea(node); return; }
 
-    /* <select> and <button>: form element + push to stack so children
-     * see the parent context (per html-to-text). */
     if (tag === 'select') {
       enterSelect(node);
       _stack.push(makeEntry(node));
@@ -424,14 +429,12 @@ export function domToText(root, baseUrl, theme, formState, cssTexts) {
       return;
     }
     if (tag === 'button') {
+      /* El botón consume su textContent como label en enterButton.
+       * NO caminar hijos — el texto ya está en el segment form. */
       enterButton(node);
-      _stack.push(makeEntry(node));
-      for (const c of node.childNodes) walk(c);
-      _stack.pop();
       return;
     }
 
-    /* Everything else: normal enter / recurse / exit. */
     enterElement(node);
     for (const c of node.childNodes) walk(c);
     exitElement(node);

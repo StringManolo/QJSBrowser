@@ -2,7 +2,12 @@
  *
  * Supports bubbling (target → document) and capture (document → target).
  * No capture-phase-only tricks, no passive-mode enforcement, no
- * relatedTarget — just what React + jQuery-style libs reach for. */
+ * relatedTarget — just what React + jQuery-style libs reach for.
+ *
+ * ev._handled is set to true the first time a listener runs. Used by the
+ * controller to decide whether to fall back to native behavior after
+ * dispatching a synthetic click (e.g. form submit if React didn't take
+ * over). */
 
 export class Event {
   constructor(type, init) {
@@ -15,6 +20,11 @@ export class Event {
     this.defaultPrevented = false;
     this._stopPropagation = false;
     this._stopImmediate = false;
+    this._handled = false;
+    if (init.clientX !== undefined) this.clientX = init.clientX;
+    if (init.clientY !== undefined) this.clientY = init.clientY;
+    if (init.key !== undefined) this.key = init.key;
+    if (init.button !== undefined) this.button = init.button;
   }
   stopPropagation() { this._stopPropagation = true; }
   stopImmediatePropagation() {
@@ -24,6 +34,16 @@ export class Event {
   preventDefault() {
     if (this.cancelable) this.defaultPrevented = true;
   }
+
+  /* Legacy DOM Level 2 API. React dev mode's guarded-callback wrapper
+   * creates an Event, calls evt.initEvent(...), then dispatches it to test
+   * if the native dispatch path works. Without this method, the dev build
+   * throws "initEvent is not a function" from inside executeDispatch. */
+  initEvent(type, bubbles, cancelable) {
+    this.type = String(type);
+    this.bubbles = bubbles === true;
+    this.cancelable = cancelable === true;
+  }
 }
 
 export class CustomEvent extends Event {
@@ -31,14 +51,16 @@ export class CustomEvent extends Event {
     super(type, init);
     this.detail = init && init.detail !== undefined ? init.detail : null;
   }
+  initCustomEvent(type, bubbles, cancelable, detail) {
+    this.initEvent(type, bubbles, cancelable);
+    this.detail = detail !== undefined ? detail : null;
+  }
 }
+
 
 export class EventTarget {
   constructor() { this._listeners = new Map(); }
 
-  /* The DOM signature is addEventListener(type, listener, options) where
-   * options is either a boolean (legacy: capture) or an object. React 18
-   * uses the boolean form (true = capture). Handle both. */
   addEventListener(type, listener, options) {
     if (!listener) return;
     type = String(type);
@@ -61,9 +83,7 @@ export class EventTarget {
     type = String(type);
     let capture = false;
     if (options === true) capture = true;
-    else if (options && typeof options === 'object') {
-      capture = !!options.capture;
-    }
+    else if (options && typeof options === 'object') capture = !!options.capture;
     const list = this._listeners.get(type);
     if (!list) return;
     for (let i = 0; i < list.length; i++) {
@@ -76,6 +96,8 @@ export class EventTarget {
 
   dispatchEvent(ev) {
     if (!ev || typeof ev !== 'object') return true;
+
+    ev._handled = false;
 
     const path = [];
     let n = this;
@@ -108,12 +130,19 @@ function _fire(target, ev, capturePhase) {
       const idx = list.indexOf(entry);
       if (idx >= 0) list.splice(idx, 1);
     }
+    ev._handled = true;
     try {
       if (typeof entry.listener === 'function') entry.listener.call(target, ev);
       else if (entry.listener && typeof entry.listener.handleEvent === 'function')
         entry.listener.handleEvent(ev);
     } catch (e) {
-      console.error('[event] ' + (e && e.message ? e.message : String(e)));
+      /* Log message + stack. Without the stack, "cannot read property 'tag'
+       * of null" is unattributable — it could be any of React's event
+       * plugins (SelectEventPlugin, ChangeEventPlugin, …) that inspect the
+       * fiber on the target path. */
+      const msg = e && e.message ? e.message : String(e);
+      const st  = e && e.stack ? String(e.stack) : '';
+      console.error('[event] ' + msg + (st ? '\n' + st : ''));
     }
     if (ev._stopImmediate) return;
   }

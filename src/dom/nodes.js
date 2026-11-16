@@ -5,15 +5,16 @@
  *   - Element and Document share the same querySelector logic.
  *   - style is a Proxy: el.style.color = 'red' works, kebab-cases camelCase.
  *   - classList stays in sync with the `class` attribute.
+ *   - dataset is a Proxy over `data-*` attributes (read/write/enumerate).
+ *   - value / checked are properties (like real HTMLInputElement), not
+ *     attribute reflections — React sets them via node.value = x and reads
+ *     them back; attribute-only behavior would desync after user input.
  *   - EventTarget bubbling goes up parentNode to the document.
- *   - innerHTML setter currently replaces content with text.
+ *   - innerHTML setter replaces content with text (real parser is later).
  *   - Every mutator notifies src/dom/mutation-hook.js so the active tab
  *     can be re-serialized on the next frame (dom-live-render).
- *   - isConnected gates notification so building a detached tree or a
- *     DocumentFragment doesn't spam the hook.
  *   - document.write is a no-op with a warning.
- *   - ownerDocument returns the document that created the node (or the
- *     current global document for nodes built via `new Element(...)`).
+ *   - cloneNode(deep) supported; node types preserved.
  */
 
 import { EventTarget, Event } from 'src/dom/events.js';
@@ -27,6 +28,10 @@ const DOCUMENT_FRAGMENT_NODE = 11;
 
 function kebabCase(s) {
   return s.replace(/[A-Z]/g, m => '-' + m.toLowerCase());
+}
+
+function camelCase(s) {
+  return s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 }
 
 function matchCompound(el, compound) {
@@ -205,6 +210,30 @@ export class Node extends EventTarget {
     let n = node;
     while (n) { if (n === this) return true; n = n.parentNode; }
     return false;
+  }
+
+  /* Deep clone: same node type, same data, no parentNode. */
+  cloneNode(deep) {
+    let copy;
+    if (this.nodeType === TEXT_NODE) {
+      copy = new Text(this._data);
+    } else if (this.nodeType === COMMENT_NODE) {
+      copy = new Comment(this._data);
+    } else if (this.nodeType === ELEMENT_NODE) {
+      copy = new Element(this.localName, this.namespaceURI);
+      for (const [k, v] of Object.entries(this.attributes)) {
+        copy.attributes[k] = v;
+      }
+    } else if (this.nodeType === DOCUMENT_FRAGMENT_NODE) {
+      copy = new DocumentFragment();
+    } else {
+      copy = new Node();
+    }
+    copy._ownerDocument = this._ownerDocument;
+    if (deep) {
+      for (const c of this.childNodes) copy.appendChild(c.cloneNode(true));
+    }
+    return copy;
   }
 
   get textContent() {
@@ -386,15 +415,74 @@ export class Element extends Node {
     this.attributes = Object.create(null);
     this.style      = new Style(this);
     this.classList  = new ClassList(this);
-    this.dataset    = {};
+
+    /* dataset is a Proxy over data-* attributes. */
+    const el = this;
+    this.dataset = new Proxy({}, {
+      get(_t, prop) {
+        if (typeof prop === 'symbol') return undefined;
+        return el.getAttribute('data-' + kebabCase(String(prop)));
+      },
+      set(_t, prop, v) {
+        if (typeof prop === 'symbol') return true;
+        el.setAttribute('data-' + kebabCase(String(prop)), String(v));
+        return true;
+      },
+      has(_t, prop) {
+        if (typeof prop === 'symbol') return false;
+        return el.hasAttribute('data-' + kebabCase(String(prop)));
+      },
+      deleteProperty(_t, prop) {
+        if (typeof prop === 'symbol') return true;
+        el.removeAttribute('data-' + kebabCase(String(prop)));
+        return true;
+      },
+      ownKeys() {
+        return Object.keys(el.attributes)
+          .filter(k => k.startsWith('data-'))
+          .map(k => camelCase(k.slice(5)));
+      },
+      getOwnPropertyDescriptor(_t, prop) {
+        if (typeof prop === 'symbol') return undefined;
+        if (!el.hasAttribute('data-' + kebabCase(String(prop)))) return undefined;
+        return { enumerable: true, configurable: true };
+      },
+    });
+
+    /* value / checked / disabled / name / type as properties (not pure
+     * attribute reflections) so React's controlled inputs behave: React
+     * does `node.value = x` and later reads `node.value` back, without
+     * going through attributes. Falls back to attributes when the
+     * property hasn't been explicitly set yet. */
+    this._value     = undefined;
+    this._checked   = undefined;
+    this._defaultValue  = undefined;
+    this._defaultChecked = undefined;
   }
   get nodeType() { return ELEMENT_NODE; }
   get nodeName() { return this.tagName; }
 
   setAttribute(name, value) {
-    this.attributes[String(name).toLowerCase()] = String(value);
-    if (this.isConnected) notifyMutation();
+  const lower = String(name).toLowerCase();
+  this.attributes[lower] = String(value);
+  /* Real browsers synthesize an "on<event>" function property when the
+   * corresponding attribute is set. React's isInputEventSupported check
+   * depends on this — without it React falls back to the composition
+   * polyfill, which crashes in our minimal DOM ("cannot read property
+   * 'tag' of null" from getNodeFromInstance). The no-op we install is
+   * fine: React never calls it (it's just the feature detector); real
+   * listeners go through addEventListener. */
+  if (lower === 'oninput' && !Object.getOwnPropertyDescriptor(this, 'oninput')) {
+    Object.defineProperty(this, 'oninput', {
+      configurable: true, writable: true, value: function() {},
+    });
   }
+  if (this.isConnected) notifyMutation();
+}
+
+
+
+
   getAttribute(name)    { const v = this.attributes[String(name).toLowerCase()]; return v === undefined ? null : v; }
   removeAttribute(name) {
     delete this.attributes[String(name).toLowerCase()];
@@ -407,6 +495,82 @@ export class Element extends Node {
   set id(v)       { this.setAttribute('id', v); }
   get className() { return this.getAttribute('class') || ''; }
   set className(v) { this.setAttribute('class', v); }
+
+  /* DOM properties commonly read/written by React. value/checked use
+   * the private _value / _checked slots once set, mirroring a real
+   * <input>'s "dirty value" semantics: attribute is the default, property
+   * is the live value. */
+  get value() {
+    if (this._value !== undefined) return this._value;
+    return this.getAttribute('value') || '';
+  }
+  set value(v) {
+    this._value = v === null || v === undefined ? '' : String(v);
+    if (this.isConnected) notifyMutation();
+  }
+  get checked() {
+    if (this._checked !== undefined) return this._checked;
+    return this.hasAttribute('checked');
+  }
+  set checked(v) {
+    this._checked = !!v;
+    if (this.isConnected) notifyMutation();
+  }
+  get disabled() { return this.hasAttribute('disabled'); }
+  set disabled(v) {
+    if (v) this.setAttribute('disabled', '');
+    else this.removeAttribute('disabled');
+  }
+  get name() { return this.getAttribute('name') || ''; }
+  set name(v) { this.setAttribute('name', v); }
+  get type() {
+    const attr = this.getAttribute('type');
+    if (attr !== null) return attr;
+    /* Browser defaults when the attribute is absent. React's event system
+     * dispatches onChange on <input> via ChangeEventPlugin, which checks
+     * supportedInputTypes[elem.type]. With type='' the input is skipped
+     * entirely — no change handler is ever installed. */
+    const tag = this.localName;
+    if (tag === 'input')    return 'text';
+    if (tag === 'button')   return 'submit';
+    if (tag === 'select')   return 'select-one';
+    if (tag === 'textarea') return 'textarea';
+    return '';
+  }
+  set type(v) { this.setAttribute('type', v); }
+  get placeholder() { return this.getAttribute('placeholder') || ''; }
+  set placeholder(v) { this.setAttribute('placeholder', v); }
+  get href() { return this.getAttribute('href') || ''; }
+  set href(v) { this.setAttribute('href', v); }
+  get src() { return this.getAttribute('src') || ''; }
+  set src(v) { this.setAttribute('src', v); }
+  get alt() { return this.getAttribute('alt') || ''; }
+  set alt(v) { this.setAttribute('alt', v); }
+
+  /* Selection APIs. React's SelectEventPlugin reads these to construct a
+   * synthetic 'select' event on every 'input'/'keydown'. Returning valid
+   * numbers (instead of undefined) keeps it from falling into a branch
+   * that dereferences a null fiber. */
+  get selectionStart()     { return this._selectionStart !== undefined ? this._selectionStart : 0; }
+  set selectionStart(v)    { this._selectionStart = Math.max(0, v | 0); }
+  get selectionEnd()       { return this._selectionEnd !== undefined ? this._selectionEnd : 0; }
+  set selectionEnd(v)      { this._selectionEnd = Math.max(0, v | 0); }
+  get selectionDirection() { return 'none'; }
+  set selectionDirection(_v) {}
+
+  /* contentEditable / isContentEditable: React's SelectEventPlugin checks
+   * targetNode.contentEditable === 'true' as a fast-path classifier. */
+  get contentEditable() { return this.getAttribute('contenteditable') || 'inherit'; }
+  set contentEditable(v) { this.setAttribute('contenteditable', String(v)); }
+  get isContentEditable() { return this.getAttribute('contenteditable') === 'true'; }
+
+  /* tabIndex: React reads element.tabIndex when constructing focus events. */
+  get tabIndex() {
+    const v = this.getAttribute('tabindex');
+    if (v === null) return this.localName === 'input' ? 0 : -1;
+    return parseInt(v, 10) || 0;
+  }
+  set tabIndex(v) { this.setAttribute('tabindex', String(v)); }
 
   get children() { return this.childNodes.filter(c => c.nodeType === ELEMENT_NODE); }
   get childElementCount() { return this.children.length; }
@@ -449,8 +613,31 @@ export class Element extends Node {
   getBoundingClientRect() {
     return { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };
   }
-  focus() {}
-  blur()  {}
+  getClientRects() { return []; }
+  
+  focus() {
+    const doc = this._ownerDocument || globalThis.document;
+    if (!doc) return;
+    const prev = doc._activeElement;
+    if (prev === this) return;
+    doc._activeElement = this;
+    if (prev && prev !== this) {
+      try { prev.dispatchEvent(new Event('blur', { bubbles: false })); } catch (_) {}
+    }
+    try { this.dispatchEvent(new Event('focus', { bubbles: false })); } catch (_) {}
+  }
+  blur() {
+    const doc = this._ownerDocument || globalThis.document;
+    if (!doc || doc._activeElement !== this) return;
+    doc._activeElement = null;
+    try { this.dispatchEvent(new Event('blur', { bubbles: false })); } catch (_) {}
+  }
+
+
+  /* Input-specific methods React (or app code) may call. No-ops. */
+  setSelectionRange(_start, _end, _dir) {}
+  select() {}
+  setRangeText(_replacement) {}
 }
 
 export const HTMLElement = Element;
@@ -471,13 +658,24 @@ export class Document extends Node {
     this.documentElement.appendChild(this.body);
     this.appendChild(this.documentElement);
     this.readyState = 'complete';
+    this._activeElement = null;
   }
   get nodeType() { return DOCUMENT_NODE; }
   get nodeName() { return '#document'; }
   get defaultView() { return globalThis; }
-  get activeElement() { return this.body; }
+  get activeElement() { return this._activeElement || this.body; }
   get visibilityState() { return 'visible'; }
   hasFocus() { return true; }
+  getSelection() {
+    return {
+      anchorNode: null, focusNode: null,
+      anchorOffset: 0, focusOffset: 0,
+      isCollapsed: true, rangeCount: 0,
+      getRangeAt() { throw new Error('not implemented'); },
+      removeAllRanges() {}, addRange() {},
+      toString() { return ''; },
+    };
+  }
 
   createElement(tag) {
     const el = new Element(tag);

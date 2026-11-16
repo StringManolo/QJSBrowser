@@ -13,6 +13,13 @@
  *     do not confuse tag detection. Same for <style> and <textarea>.
  *   - <style> is still extracted via regex before tokenizing (same as
  *     html-to-text), returned as `css[]`.
+ *
+ * Exports:
+ *   htmlToDom(html, baseUrl, document)  — clears body, parses into it
+ *   parseHtmlInto(html, baseUrl, document, target) — parse fragment into
+ *     an arbitrary element. Used by Element.insertAdjacentHTML (runtime
+ *     DOM mutation) which must preserve <style> tags — Vite and
+ *     example.com both inject them dynamically.
  */
 
 import { resolveUrl } from 'src/base/url.js';
@@ -67,8 +74,6 @@ function tokenize(html) {
     const attrs = parseAttrs(attrsStr);
     tokens.push({ type: 'open', tag: name, attrs, selfClose });
 
-    /* Raw-content mode: capture everything until matching close tag as
-     * one text token, so `<` inside doesn't confuse the tokenizer. */
     if (!selfClose && RAW_CONTENT_TAGS.has(name)) {
       const closeTag = '</' + name;
       const closeIdx = html.toLowerCase().indexOf(closeTag, gt + 1);
@@ -90,18 +95,15 @@ function tokenize(html) {
   return tokens;
 }
 
-export function htmlToDom(html, baseUrl, document) {
-  const styleCSS = [];
-  html = html.replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gi, (m, css) => {
-    styleCSS.push(css);
-    return '';
-  });
-
-  const body = document.body;
-  while (body.firstChild) body.removeChild(body.firstChild);
-
+/* Parses `html` into `target`, appending parsed children. Returns the
+ * array of <script> descriptors (empty for fragments — insertAdjacentHTML
+ * must not execute scripts, matching browser behavior).
+ *
+ * The #root frame's node is `target`, so top-level text and elements
+ * land directly as its children. */
+function parseInto(html, baseUrl, document, target) {
   const tokens = tokenize(html);
-  const stack = [{ tag: '#root', node: body }];
+  const stack = [{ tag: '#root', node: target }];
   const scripts = [];
 
   function current() { return stack[stack.length - 1].node; }
@@ -116,18 +118,21 @@ export function htmlToDom(html, baseUrl, document) {
   for (let ti = 0; ti < tokens.length; ti++) {
     const tok = tokens[ti];
 
-    /* Inside a raw-content element (script/style/textarea): everything is
-     * raw text until its matching close. */
+    /* Skip <html>, <head>, <body> wrapper tags. Their children are
+     * processed normally and appended to the current target. This
+     * prevents nesting <html> inside <body> (which buries <div id="root">
+     * under a tag domToText skips, so React's output never gets
+     * serialized). It also matches browser behavior in fragment
+     * context — insertAdjacentHTML ignores these tags — so the same
+     * filter is correct for parseHtmlInto. */
+    if ((tok.type === 'open' || tok.type === 'close') &&
+        (tok.tag === 'html' || tok.tag === 'head' || tok.tag === 'body')) {
+      continue;
+    }
+
     const top = stack[stack.length - 1];
+
     if (top && top.rawContent) {
-      /* Skip <html>, <head>, <body> wrapper tags. Their children are
- * processed normally and appended to document.body. This prevents
- * nesting <html> inside <body> (which buries <div id="root"> under
- * a tag domToText skips, so React's output never gets serialized). */
-if ((tok.type === 'open' || tok.type === 'close') &&
-    (tok.tag === 'html' || tok.tag === 'head' || tok.tag === 'body')) {
-  continue;
-}
       if (tok.type === 'text') { top.rawText += tok.value; continue; }
       if (tok.type === 'close' && tok.tag === top.tag) {
         if (top.tag === 'script') {
@@ -163,9 +168,7 @@ if ((tok.type === 'open' || tok.type === 'close') &&
     } else if (tok.type === 'open') {
       const tag = tok.tag;
       const el = pushElement(tag, tok.attrs);
-
       if (VOID_TAGS.has(tag) || tok.selfClose) continue;
-
       if (RAW_CONTENT_TAGS.has(tag)) {
         stack.push({ tag, node: el, rawContent: true, rawText: '' });
         continue;
@@ -178,5 +181,34 @@ if ((tok.type === 'open' || tok.type === 'close') &&
     }
   }
 
+  return scripts;
+}
+
+export function htmlToDom(html, baseUrl, document) {
+  const styleCSS = [];
+  html = html.replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gi, (m, css) => {
+    styleCSS.push(css);
+    return '';
+  });
+
+  const body = document.body;
+  while (body.firstChild) body.removeChild(body.firstChild);
+
+  const scripts = parseInto(html, baseUrl, document, body);
   return { css: styleCSS, scripts };
+}
+
+/* Parse an HTML fragment into `target`. Does NOT extract <style> — the
+ * caller wants them in the tree (e.g. insertAdjacentHTML, which is how
+ * Vite injects per-route CSS and how example.com injects its icon
+ * tweaks). Does NOT execute or collect scripts — browsers don't run
+ * scripts inserted via insertAdjacentHTML either.
+ *
+ * Note: baseUrl is passed through to resolveUrl for relative src/href.
+ * Currently insertAdjacentHTML passes '', so relative URLs in inserted
+ * HTML won't resolve to the page's origin. Fix is to plumb the tab's
+ * currentUrl into the Element.insertAdjacentHTML extension in main.js
+ * — left as a follow-up since no in-the-wild case has needed it yet. */
+export function parseHtmlInto(html, baseUrl, document, target) {
+  return parseInto(String(html || ''), baseUrl, document, target);
 }

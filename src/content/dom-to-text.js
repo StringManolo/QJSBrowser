@@ -11,9 +11,18 @@
  * so the text isn't duplicated.
  *
  * If nodeMap is provided, populates it with elementId → Element DOM.
- * The controller uses this to dispatch real click/input events at the
- * original node when the user interacts with the TUI.
- */
+ *
+ * Click-through: pageView.lineAt() rebuilds segments on every render
+ * and drops custom properties (elementId, _node). Only linkN survives.
+ * So for text inside an ancestor with React onClick we register a
+ * synthetic link ({n, href:null, node}) and set linkN — the click
+ * handler dispatches a real DOM click on `node`, which bubbles to the
+ * React onClick ancestor. This is what makes <div onClick> cards work.
+ *
+ * Invisible-color fix: raw CSS colors below a luminance threshold
+ * (dark text on what is presumed a dark terminal) are replaced by the
+ * theme's default page color. The site's link colors (#0066cc etc.)
+ * are above the threshold and survive, so links stay blue. */
 
 import { resolveUrl } from 'src/base/url.js';
 import { parseStylesheet, parseInlineStyle } from 'src/css/parser.js';
@@ -23,10 +32,15 @@ import { TAG_DEFAULTS } from 'src/css/defaults.js';
 import { decodeHtmlEntities } from 'src/content/html-entities.js';
 
 const BLOCK_TAGS = ['p','div','h1','h2','h3','h4','h5','h6',
-                    'blockquote','pre','ul','ol','table','form'];
+                    'blockquote','pre','ul','ol','table','form',
+                    'article','section','header','footer','main',
+                    'nav','aside','figure','figcaption','details',
+                    'summary','fieldset','address'];
 const INLINE_BG_TAGS = new Set(['code','kbd','samp','mark','pre']);
 const TEXT_INPUT_TYPES = new Set(['text','email','tel','url','number','search','password']);
 const CLICKABLE_KINDS = new Set(['submit', 'reset', 'button']);
+const SKIP_SUBTREE_TAGS = new Set(['style','script','title','noscript','template']);
+const REACT_CLICK_MAX_DEPTH = 6;
 
 function parseDim(v) {
   if (!v) return 0;
@@ -47,6 +61,67 @@ function fontSizeLevel(fs) {
   if (px >= 16) return 5; return 6;
 }
 
+function svgSize(node) {
+  const w = parseFloat(node.getAttribute('width'));
+  const h = parseFloat(node.getAttribute('height'));
+  if (isFinite(w) && isFinite(h) && w > 0 && h > 0)
+    return { w: Math.round(w), h: Math.round(h) };
+  const vb = node.getAttribute('viewBox');
+  if (vb) {
+    const parts = String(vb).trim().split(/[\s,]+/).filter(Boolean);
+    if (parts.length === 4) {
+      const wv = parseFloat(parts[2]);
+      const hv = parseFloat(parts[3]);
+      if (isFinite(wv) && isFinite(hv) && wv > 0 && hv > 0)
+        return { w: Math.round(wv), h: Math.round(hv) };
+    }
+  }
+  return null;
+}
+
+/* ANSI-color blacklist for "invisible on dark terminal":
+ *   0  = black
+ *   8  = bright black (= dark gray on most terminals)
+ *   232-244 = dark gray shades in the 256-color palette
+ * Everything else (including blue #4 for links, cyan #6, and the
+ * "bright" range 9-15) is preserved. The idea: if a page hardcodes a
+ * dark color assuming a light background, the terminal will be black
+ * and the text disappears. Replacing with the theme's page color makes
+ * the text readable without touching the link colors (blue #0066cc
+ * maps to ANSI 4, not in the blacklist). */
+function isInvisibleOnBlack(idx) {
+  if (idx < 0) return false;
+  if (idx === 0 || idx === 8) return true;
+  if (idx >= 232 && idx <= 244) return true;
+  return false;
+}
+
+function buildClickableMap(root) {
+  const map = new WeakMap();
+  function visit(n) {
+    if (!n || n.nodeType !== 1) return;
+    try {
+      const keys = Object.keys(n);
+      for (let i = 0; i < keys.length; i++) {
+        const k = keys[i];
+        if (k.length > 13 && k.charCodeAt(0) === 95 &&
+            k.startsWith('__reactProps$')) {
+          const p = n[k];
+          if (p && typeof p.onClick === 'function') {
+            map.set(n, true);
+            break;
+          }
+        }
+      }
+    } catch (_) {}
+    if (n.childNodes) {
+      for (let i = 0; i < n.childNodes.length; i++) visit(n.childNodes[i]);
+    }
+  }
+  visit(root);
+  return map;
+}
+
 export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
   const rules = [];
   for (const css of cssTexts || []) for (const rule of parseStylesheet(css)) rules.push(rule);
@@ -56,6 +131,27 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
   const images = [];
   const _stack = [];
   let linkN = 0;
+
+  const clickable = buildClickableMap(root);
+
+  function nearestClickable(node) {
+    let cur = node;
+    let d = 0;
+    while (cur && d < REACT_CLICK_MAX_DEPTH) {
+      if (clickable.has(cur)) return cur;
+      cur = cur.parentNode;
+      d++;
+    }
+    return null;
+  }
+
+  function registerSyntheticLink(node) {
+    if (!node) return null;
+    if (!nearestClickable(node)) return null;
+    linkN++;
+    links.push({ n: linkN, href: null, node, text: '' });
+    return linkN;
+  }
 
   function makeEntry(node) {
     const tag = node.localName;
@@ -124,11 +220,17 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
     for (const e of _stack) if (e.inlineStyle) Object.assign(decls, e.inlineStyle);
 
     const fg = parseCssColor(decls['color']);
-    const fgAnsi = snapToAnsi(fg, -1);
+    let fgAnsi = snapToAnsi(fg, -1);
+    /* Drop dark-on-dark colors so the theme's default page color takes
+     * over. Preserves link colors (blue #4, cyan #6) and bright colors
+     * (9-15), which are visible on black. */
+    if (isInvisibleOnBlack(fgAnsi)) fgAnsi = -1;
+
     const innermost = _stack[_stack.length - 1];
     const isInlineBg = innermost && INLINE_BG_TAGS.has(innermost.tag);
-    const bgAnsi = isInlineBg
+    let bgAnsi = isInlineBg
       ? snapToAnsi(parseCssColor(decls['background-color']), -1) : -1;
+    if (isInvisibleOnBlack(bgAnsi)) bgAnsi = -1;
 
     const bold = decls['font-weight'] === 'bold' ||
                  (parseInt(decls['font-weight'], 10) >= 600);
@@ -149,11 +251,11 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
     return { fgAnsi, bgAnsi, bold, underline, indent, pre, hidden, pairOverride };
   }
 
-  function emitBlockBreak() {
+  function emitBlockBreak(tag) {
     if (segments.length === 0) return;
     const last = segments[segments.length - 1];
     if (last.kind === 'bullet') return;
-    if (last.type === 'form') return;
+    if (last.type === 'form' && tag === 'form') return;
     const lastText = last.text || '';
     if (lastText.endsWith('\n\n')) return;
     if (lastText.endsWith('\n')) segments.push({ text: '\n', linkN: null });
@@ -200,13 +302,29 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
       text = text.replace(/\n/g, '\n' + pad);
     }
 
+    const innermost = _stack[_stack.length - 1];
+    const node = innermost ? innermost._el : null;
+    if (linkNForSeg === null && node) {
+      const synthetic = registerSyntheticLink(node);
+      if (synthetic !== null) {
+        linkNForSeg = synthetic;
+        links[synthetic - 1].text = text;
+      }
+    }
+
     let pairId;
     if (s.fgAnsi >= 0 || s.bgAnsi >= 0) pairId = theme.lookupPair(s.fgAnsi, s.bgAnsi);
     else if (s.pairOverride) pairId = theme.pairs.pairOverride;
     else if (linkNForSeg !== null) pairId = theme.pairs.link;
     else pairId = theme.pairs.page;
 
-    segments.push({ text, linkN: linkNForSeg, pair: pairId, bold: s.bold, underline: s.underline });
+    segments.push({
+      text,
+      linkN: linkNForSeg,
+      pair: pairId,
+      bold: s.bold,
+      underline: s.underline,
+    });
   }
 
   function pushFormSegment(kind, info, node) {
@@ -215,9 +333,6 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
     const id = formState.addElement(info);
     if (nodeMap && node) nodeMap.set(id, node);
 
-    /* Botones consecutivos se pegan sin separación porque no hay layout
-     * inline-block. Añadimos un espacio antes de un botón clicable si
-     * el segmento anterior es otro botón o texto sin nueva línea. */
     if (CLICKABLE_KINDS.has(kind) && segments.length > 0) {
       const last = segments[segments.length - 1];
       if (last.type === 'form') {
@@ -320,8 +435,6 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
   function enterButton(node) {
     if (!formState) return;
     const type = (node.getAttribute('type') || 'submit').toLowerCase();
-    /* label: value attribute primero; si no hay, textContent del botón
-     * (React escribe el label como hijo de texto, no como value=""). */
     const valueAttr = node.getAttribute('value') || '';
     const label = valueAttr || node.textContent || '';
     pushFormSegment(
@@ -347,13 +460,54 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
       width: parseDim(node.getAttribute('width')),
       height: parseDim(node.getAttribute('height')),
     });
-    segments.push({ type: 'img', src, alt });
+    const synthetic = registerSyntheticLink(node);
+    segments.push({ type: 'img', src, alt, linkN: synthetic });
+  }
+
+  function pushSvg(node) {
+    let label = node.getAttribute('aria-label') || '';
+    if (!label) {
+      for (const c of node.childNodes) {
+        if (c.nodeType === 1 &&
+            (c.localName === 'title' || c.localName === 'desc')) {
+          const t = (c.textContent || '').trim();
+          if (t) { label = t; break; }
+        }
+      }
+    }
+    if (!label) {
+      const sz = svgSize(node);
+      label = sz ? `[svg ${sz.w}×${sz.h}]` : '[svg]';
+    }
+
+    const a = topLink();
+    let linkNForSeg = null;
+    let text = label;
+    if (a && a.href) {
+      linkNForSeg = a.n;
+      a.accumulated += label;
+      if (!a.prefixEmitted) { text = `[${a.n}]` + label; a.prefixEmitted = true; }
+    } else {
+      const synthetic = registerSyntheticLink(node);
+      if (synthetic !== null) {
+        linkNForSeg = synthetic;
+        links[synthetic - 1].text = label;
+      }
+    }
+
+    segments.push({
+      text,
+      linkN: linkNForSeg,
+      pair: linkNForSeg !== null ? theme.pairs.link : theme.pairs.warning,
+      bold: false,
+      underline: false,
+    });
   }
 
   function enterElement(node) {
     const tag = node.localName;
     if (tag === 'form') {
-      emitBlockBreak();
+      emitBlockBreak('form');
       _stack.push(makeEntry(node));
       return;
     }
@@ -374,7 +528,7 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
       _stack.push(makeEntry(node));
       return;
     }
-    if (BLOCK_TAGS.includes(tag)) emitBlockBreak();
+    if (BLOCK_TAGS.includes(tag)) emitBlockBreak(tag);
     _stack.push(makeEntry(node));
   }
 
@@ -392,11 +546,11 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
         return;
       }
       if (tag === 'form') {
-        emitBlockBreak();
+        emitBlockBreak('form');
         _stack.pop();
         return;
       }
-      if (BLOCK_TAGS.includes(tag)) emitBlockBreak();
+      if (BLOCK_TAGS.includes(tag)) emitBlockBreak(tag);
     }
     _stack.pop();
   }
@@ -408,10 +562,13 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
 
     const tag = node.localName;
 
+    if (SKIP_SUBTREE_TAGS.has(tag)) return;
+
     if (tag === 'br') { segments.push({ text: '\n', linkN: null }); return; }
-    if (tag === 'hr') { emitBlockBreak(); segments.push({ text: '────\n', linkN: null }); return; }
+    if (tag === 'hr') { emitBlockBreak('hr'); segments.push({ text: '────\n', linkN: null }); return; }
     if (tag === 'img') { pushImage(node); return; }
     if (tag === 'input') { enterInput(node); return; }
+    if (tag === 'svg') { pushSvg(node); return; }
 
     if (tag === 'option') {
       enterOption(node);
@@ -429,8 +586,6 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
       return;
     }
     if (tag === 'button') {
-      /* El botón consume su textContent como label en enterButton.
-       * NO caminar hijos — el texto ya está en el segment form. */
       enterButton(node);
       return;
     }
@@ -444,7 +599,9 @@ export function domToText(root, baseUrl, theme, formState, cssTexts, nodeMap) {
 
   if (links.length > 0) {
     segments.push({ text: '\n\n─── Links ───\n', linkN: null });
-    for (const l of links) segments.push({ text: `[${l.n}] ${l.href}\n`, linkN: l.n });
+    for (const l of links) {
+      if (l.href) segments.push({ text: `[${l.n}] ${l.href}\n`, linkN: l.n });
+    }
   }
 
   let text = '';

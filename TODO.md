@@ -22,3 +22,8 @@
 - Add cache
 - Add mouse support to the console
 - Improve console UI
+- Add scroll to the console (auto scroll when copy to clipboard)
+- Add webp support
+- Port to android and desktop (replace terminal UI by real UI and embed in apk)
+- Arreglar los select
+

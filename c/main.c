@@ -48,6 +48,9 @@ static char *read_file(const char *p, size_t *len) {
     return b;
 }
 
+/* [js] console bridge — used ONLY before main.js replaces console.* with
+ * its own hookConsole wrapper. After that, console.error points at a JS
+ * function that writes to the in-TUI devConsole (F12). */
 static JSValue js_console_log(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv) {
     (void)this_val;
@@ -63,6 +66,63 @@ static JSValue js_console_log(JSContext *ctx, JSValueConst this_val,
     fputc('\n', stderr);
     fflush(stderr);
     return JS_UNDEFINED;
+}
+
+/* Emit a diagnostic through the JS console.error channel — which by the
+ * time the page is running has been hooked by main.js to write to the
+ * in-TUI dev console (F12). Falls back gracefully if console or
+ * console.error is missing or throws.
+ *
+ * Re-entrancy guard: if console.error itself triggers another module
+ * load that fails, we'd infinitely recurse. The guard lets us drop the
+ * inner log and move on.
+ *
+ * Safety: every JS API call is checked for exceptions. Even a broken
+ * log must not corrupt the loader — returning NULL still fails the
+ * module load cleanly, just without the message.
+ *
+ * Note on the QuickJS call signature: the API is
+ *   JS_Call(ctx, func_obj, this_obj, argc, argv)
+ * (not JS_CallFunctionValue / JS_CallFunctionName / etc., which are
+ * from newer QuickJS-ng or from V8). */ 
+static void js_loader_log(JSContext *ctx, const char *msg) {
+    static int in_log = 0;
+    if (in_log) return;
+    in_log = 1;
+
+    JSValue global = JS_GetGlobalObject(ctx);
+    if (JS_IsException(global)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        in_log = 0;
+        return;
+    }
+
+    JSValue console = JS_GetPropertyStr(ctx, global, "console");
+    if (JS_IsException(console)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, global);
+        in_log = 0;
+        return;
+    }
+
+    if (!JS_IsUndefined(console) && !JS_IsNull(console)) {
+        JSValue errFn = JS_GetPropertyStr(ctx, console, "error");
+        if (JS_IsException(errFn)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        } else if (JS_IsFunction(ctx, errFn)) {
+            JSValue arg = JS_NewString(ctx, msg);
+            JSValue ret = JS_Call(ctx, errFn, global, 1, &arg);
+            if (JS_IsException(ret)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+            }
+            JS_FreeValue(ctx, ret);
+            JS_FreeValue(ctx, arg);
+        }
+        JS_FreeValue(ctx, errFn);
+    }
+    JS_FreeValue(ctx, console);
+    JS_FreeValue(ctx, global);
+    in_log = 0;
 }
 
 /* Drain QuickJS microtasks (promise callbacks) from the event loop.
@@ -131,10 +191,33 @@ static JSModuleDef *browser_module_loader(JSContext *ctx,
     if (!strcmp(module_name, "fs")              && r->fs)    return r->fs(ctx, module_name);
     if (!strcmp(module_name, "dns")             && r->dns)   return r->dns(ctx, module_name);
 
+    char buf[1024];
+
+    /* Diagnostic: log every request that reaches the fallback path.
+     * Our own modules (src slash js, main.js) are legitimate — they
+     * live on disk and get loaded through this same callback. But a
+     * request for a Vite chunk filename (hash-like, e.g.
+     * "index-CtL5pFWs.js") means page JS called NATIVE import() — our
+     * ESM transpiler missed that particular import() expression.
+     * Flag those loudly so we can find the offender. */
+    int is_bare = strchr(module_name, '/') == NULL;
+    int is_internal = strncmp(module_name, "src/", 4) == 0 ||
+                      strncmp(module_name, "./src/", 6) == 0 ||
+                      strcmp(module_name, "main.js") == 0;
+
+    if (is_bare && !is_internal) {
+        snprintf(buf, sizeof(buf),
+                 "[loader] native import() reached C loader: %s — "
+                 "ESM transpiler missed this expression", module_name);
+        js_loader_log(ctx, buf);
+    }
+
     size_t len;
     char *src = read_file(module_name, &len);
     if (!src) {
-        fprintf(stderr, "[loader] cannot read module: %s\n", module_name);
+        snprintf(buf, sizeof(buf),
+                 "[loader] cannot read module: %s", module_name);
+        js_loader_log(ctx, buf);
         return NULL;
     }
     JSValue v = JS_Eval(ctx, src, len, module_name,
@@ -143,7 +226,10 @@ static JSModuleDef *browser_module_loader(JSContext *ctx,
     if (JS_IsException(v)) {
         JSValue exc = JS_GetException(ctx);
         const char *s = JS_ToCString(ctx, exc);
-        fprintf(stderr, "[loader] %s: %s\n", module_name, s ? s : "?");
+        snprintf(buf, sizeof(buf),
+                 "[loader] compile failed for %s: %s",
+                 module_name, s ? s : "?");
+        js_loader_log(ctx, buf);
         JS_FreeCString(ctx, s);
         JS_FreeValue(ctx, exc);
         JS_FreeValue(ctx, v);

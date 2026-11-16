@@ -6,19 +6,21 @@ import zlib  from 'zlib';
 import fs    from 'fs';
 import dns   from 'dns';
 
-import { buildKeyMap }      from 'src/base/keys.js';
-import { createScheduler }  from 'src/base/scheduler.js';
-import { createTimers }     from 'src/base/timers.js';
-import { installGlobals }   from 'src/browser/globals.js';
-import { installDomGlobals } from 'src/browser/dom-globals.js';
-import { createTheme }      from 'src/ui/theme.js';
-import { createConsole }    from 'src/ui/console.js';
-import { createImageView }  from 'src/ui/image-view.js';
-import { createHttpClient } from 'src/net/http-client.js';
-import { createCookieJar }  from 'src/net/cookies.js';
-import { createSettings }   from 'src/browser/settings.js';
-import { createTabManager } from 'src/browser/tab-manager.js';
-import { createController } from 'src/browser/controller.js';
+import { buildKeyMap }        from 'src/base/keys.js';
+import { createScheduler }    from 'src/base/scheduler.js';
+import { createTimers }       from 'src/base/timers.js';
+import { installGlobals }     from 'src/browser/globals.js';
+import { installDomGlobals }  from 'src/browser/dom-globals.js';
+import { parseHtmlInto }      from 'src/content/html-to-dom.js';
+import { createTheme }        from 'src/ui/theme.js';
+import { createConsole }      from 'src/ui/console.js';
+import { createImageView }    from 'src/ui/image-view.js';
+import { createHttpClient }   from 'src/net/http-client.js';
+import { createCookieJar }    from 'src/net/cookies.js';
+import { createSettings }     from 'src/browser/settings.js';
+import { createTabManager }   from 'src/browser/tab-manager.js';
+import { createController }   from 'src/browser/controller.js';
+import { Event }              from 'src/dom/events.js';
 
 tui.init();
 tui.mouseEnable();
@@ -66,21 +68,259 @@ installGlobals({
       return (tab && tab.currentUrl) || '';
     } catch (_) { return ''; }
   },
+  setUrl: (newUrl, kind) => {
+    try {
+      const tab = tabManager.active();
+      if (!tab) return;
+
+      const target = String(newUrl || '');
+      if (!target || target === 'about:blank') return;
+
+      if (kind === 'pushstate' || kind === 'replacestate') {
+        tab.currentUrl = target;
+        try { tab.omnibox.setText(target); } catch (_) {}
+        return;
+      }
+
+      const opts = (kind === 'popstate') ? { fromHistory: true }
+                 : (kind === 'reload')   ? { reload: true }
+                 : {};
+      realController.navigate(tab, target, opts);
+    } catch (e) {
+      try { console.error('[setUrl] ' + (e && e.message || e)); } catch (_) {}
+    }
+  },
 });
 
 installDomGlobals();
 
-/* Redirect every console.* call to the in-TUI console.
- *
- * Before this hook, console.log/console.error were the C-backed
- * js_console_log function, which does fputs("[js] ", stderr). Page-JS
- * errors therefore landed raw on fd 2, desyncing ncurses' model of the
- * physical screen — the [js] ... lines that bled into the status bar.
- *
- * After this hook, NOTHING goes to stderr: every log lands in
- * devConsole, reachable with F12. The old fallback that also wrote to
- * stderr when devConsole was hidden is removed: the hidden console is
- * not a reason to corrupt the TUI. */
+/* DOM extensions that nodes.js and dom-globals.js do NOT provide.
+ * Runs AFTER installDomGlobals() so document.createElement exists. */
+(function extendElementPrototype() {
+  const doc = globalThis.document;
+  if (!doc) return;
+
+  let proto = null;
+  try { proto = Object.getPrototypeOf(doc.createElement('div')); } catch (_) {}
+  if (!proto) return;
+
+  /* ---- insertAdjacentHTML ---- */
+  try {
+    if (typeof proto.insertAdjacentHTML !== 'function') {
+      proto.insertAdjacentHTML = function (pos, html) {
+        const d = this.ownerDocument || doc;
+        const scratch = d.createElement('div');
+        parseHtmlInto(html, '', d, scratch);
+        const nodes = Array.prototype.slice.call(scratch.childNodes || []);
+        pos = String(pos).toLowerCase();
+        if (pos === 'beforebegin') {
+          if (this.parentNode) for (const n of nodes) this.parentNode.insertBefore(n, this);
+        } else if (pos === 'afterbegin') {
+          const first = this.firstChild;
+          for (const n of nodes) this.insertBefore(n, first);
+        } else if (pos === 'beforeend') {
+          for (const n of nodes) this.appendChild(n);
+        } else if (pos === 'afterend') {
+          if (this.parentNode) {
+            const next = this.nextSibling;
+            for (const n of nodes) this.parentNode.insertBefore(n, next);
+          }
+        } else {
+          throw new Error("insertAdjacentHTML: invalid position '" + pos + "'");
+        }
+      };
+    }
+  } catch (_) {}
+
+  /* ---- innerHTML setter: parse, don't stringify ----
+   *
+   * nodes.js's default setter does `textContent = html`, which drops
+   * markup into the DOM as literal text. This breaks React's
+   * dangerouslySetInnerHTML and any `el.innerHTML = '<b>x</b>'`:
+   * the user sees "<b>x</b>" instead of a bold "x".
+   *
+   * Real trigger: stringmanolo.qzz.io's article pages render markdown
+   * via dangerouslySetInnerHTML. First render is fine (htmlToDom parses
+   * the initial HTML). Toggling the theme re-applies the content via
+   * innerHTML, and with the old setter the raw markup leaked as text.
+   *
+   * Fix: override the setter to parse via parseHtmlInto (the same
+   * fragment parser insertAdjacentHTML uses). Preserve the original
+   * getter when it exists (nodes.js may serialize correctly on read;
+   * we only need to fix the write path). */
+  try {
+    const desc = Object.getOwnPropertyDescriptor(proto, 'innerHTML');
+    const getter = desc && typeof desc.get === 'function'
+      ? desc.get
+      : function () {
+          let out = '';
+          const kids = this.childNodes;
+          if (kids) for (let i = 0; i < kids.length; i++) {
+            const c = kids[i];
+            if (c.nodeType === 3) out += (c.data || '');
+            else if (c.nodeType === 1) {
+              try { out += (c.outerHTML || c.textContent || ''); } catch (_) {}
+            }
+          }
+          return out;
+        };
+    Object.defineProperty(proto, 'innerHTML', {
+      configurable: true,
+      enumerable: desc ? desc.enumerable : false,
+      get: getter,
+      set: function (v) {
+        try {
+          const d = this.ownerDocument || doc;
+          if (typeof this.removeChild === 'function') {
+            while (this.firstChild) this.removeChild(this.firstChild);
+          }
+          const html = String(v == null ? '' : v);
+          if (html) parseHtmlInto(html, '', d, this);
+        } catch (_) {}
+      },
+    });
+  } catch (_) {}
+
+  /* ---- lang / dir reflection ---- */
+  try {
+    if (!Object.getOwnPropertyDescriptor(proto, 'lang')) {
+      Object.defineProperty(proto, 'lang', {
+        configurable: true,
+        get() { return this.getAttribute ? (this.getAttribute('lang') || '') : ''; },
+        set(v) { if (this.setAttribute) this.setAttribute('lang', String(v)); },
+      });
+    }
+  } catch (_) {}
+  try {
+    if (!Object.getOwnPropertyDescriptor(proto, 'dir')) {
+      Object.defineProperty(proto, 'dir', {
+        configurable: true,
+        get() { return this.getAttribute ? (this.getAttribute('dir') || '') : ''; },
+        set(v) { if (this.setAttribute) this.setAttribute('dir', String(v)); },
+      });
+    }
+  } catch (_) {}
+
+  /* ---- window.getComputedStyle ---- */
+  try {
+    if (typeof globalThis.getComputedStyle !== 'function') {
+      globalThis.getComputedStyle = function () {
+        return { getPropertyValue: () => '', length: 0 };
+      };
+    }
+  } catch (_) {}
+
+  /* ---- Element.scrollIntoView / scrollTo / scrollBy ---- */
+  try {
+    if (typeof proto.scrollIntoView !== 'function') proto.scrollIntoView = function () {};
+    if (typeof proto.scrollTo       !== 'function') proto.scrollTo       = function () {};
+    if (typeof proto.scrollBy       !== 'function') proto.scrollBy       = function () {};
+  } catch (_) {}
+
+  /* ---- innerText (dual-path install) ---- */
+  const innerTextGet = function () {
+    try {
+      const tc = this.textContent;
+      if (tc !== undefined && tc !== null) return String(tc);
+    } catch (_) {}
+    let out = '';
+    const kids = this.childNodes;
+    if (kids && kids.length) {
+      for (let i = 0; i < kids.length; i++) {
+        const c = kids[i];
+        if (!c) continue;
+        if (c.nodeType === 3) out += (c.data || '');
+        else if (c.nodeType === 1) {
+          try {
+            const v = c.textContent;
+            if (v != null) out += String(v);
+          } catch (_) {}
+        }
+      }
+    }
+    return out;
+  };
+  const innerTextSet = function (v) {
+    try {
+      const d = this.ownerDocument || doc;
+      if (typeof this.removeChild === 'function') {
+        while (this.firstChild) this.removeChild(this.firstChild);
+      }
+      if (typeof this.appendChild === 'function' &&
+          d && typeof d.createTextNode === 'function') {
+        this.appendChild(d.createTextNode(String(v)));
+      }
+    } catch (_) {}
+  };
+
+  let installed = false;
+
+  if (!Object.getOwnPropertyDescriptor(proto, 'innerText')) {
+    try {
+      Object.defineProperty(proto, 'innerText', {
+        configurable: true,
+        enumerable: false,
+        get: innerTextGet,
+        set: innerTextSet,
+      });
+      installed = true;
+      try { console.log('[dom-patch] innerText: prototype OK'); } catch (_) {}
+    } catch (e) {
+      try { console.log('[dom-patch] innerText: prototype FAILED — ' +
+                        (e && e.message ? e.message : String(e))); } catch (_) {}
+    }
+  } else {
+    installed = true;
+    try { console.log('[dom-patch] innerText: prototype already present'); } catch (_) {}
+  }
+
+  if (!installed) {
+    try {
+      if (typeof doc.createElement === 'function' && !doc.createElement.__innerTextPatched) {
+        const origCreate = doc.createElement;
+        const patched = function (tag, opts) {
+          const el = origCreate.call(doc, tag, opts);
+          if (el && !('innerText' in el)) {
+            try {
+              Object.defineProperty(el, 'innerText', {
+                configurable: true,
+                enumerable: false,
+                get: innerTextGet,
+                set: innerTextSet,
+              });
+            } catch (_) {}
+          }
+          return el;
+        };
+        patched.__innerTextPatched = true;
+        try { doc.createElement = patched; } catch (_) {}
+        if (doc.createElement !== patched) {
+          try {
+            Object.defineProperty(doc, 'createElement', {
+              configurable: true, writable: true, value: patched,
+            });
+          } catch (_) {}
+        }
+        if (doc.createElement && doc.createElement.__innerTextPatched) {
+          installed = true;
+          try { console.log('[dom-patch] innerText: createElement hook OK'); } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+
+  try {
+    const test = doc.createElement('span');
+    const ok = test && ('innerText' in test) && typeof test.innerText === 'string';
+    try {
+      console.log(ok
+        ? '[dom-patch] innerText: VERIFIED on fresh element'
+        : '[dom-patch] innerText: STILL MISSING on fresh element');
+    } catch (_) {}
+  } catch (_) {}
+})();
+
+/* Redirect console.* to the in-TUI dev console. */
 (function hookConsole() {
   const _origClear = console.clear;
 

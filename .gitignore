@@ -6,3 +6,4 @@ quickjs-*/
 quickjs-*.tar.xz
 qjsNetworkSockets-main.tar.gz
 qjsNetworkSockets-main
+stb_image.h

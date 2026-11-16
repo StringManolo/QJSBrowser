@@ -133,21 +133,11 @@ installDomGlobals();
   } catch (_) {}
 
   /* ---- innerHTML setter: parse, don't stringify ----
-   *
-   * nodes.js's default setter does `textContent = html`, which drops
-   * markup into the DOM as literal text. This breaks React's
-   * dangerouslySetInnerHTML and any `el.innerHTML = '<b>x</b>'`:
-   * the user sees "<b>x</b>" instead of a bold "x".
-   *
-   * Real trigger: stringmanolo.qzz.io's article pages render markdown
-   * via dangerouslySetInnerHTML. First render is fine (htmlToDom parses
-   * the initial HTML). Toggling the theme re-applies the content via
-   * innerHTML, and with the old setter the raw markup leaked as text.
-   *
-   * Fix: override the setter to parse via parseHtmlInto (the same
-   * fragment parser insertAdjacentHTML uses). Preserve the original
-   * getter when it exists (nodes.js may serialize correctly on read;
-   * we only need to fix the write path). */
+   * nodes.js's default setter does `textContent = html`, which leaves
+   * markup as literal text. This breaks React's dangerouslySetInnerHTML
+   * and any `el.innerHTML = '<b>x</b>'`. Trigger: toggling the theme
+   * on stringmanolo.qzz.io re-applies article content via innerHTML,
+   * and the raw HTML leaked as text. */
   try {
     const desc = Object.getOwnPropertyDescriptor(proto, 'innerHTML');
     const getter = desc && typeof desc.get === 'function'
@@ -493,6 +483,23 @@ while (controller.isRunning()) {
 
   try { httpClient.tick(); }
   catch (e) { console.error('[tick] ' + (e.message || String(e))); }
+
+  /* Detect terminal resize (SIGWINCH) or process resume (SIGCONT, which
+   * Termux sends when you switch back to it from another app). Without
+   * this, ncurses' internal buffer is never invalidated on resume, so
+   * the screen shows stale content mixed with new renders — the
+   * "Welcome to QJSBrowser!" ghost over a loaded page. tui.check_resize
+   * returns 0 if nothing happened, or a bitmask: 1 = SIGWINCH (resized),
+   * 2 = SIGCONT (resumed). Either way, force a full clear + redraw. */
+  try {
+    if (typeof tui.check_resize === 'function') {
+      const r = tui.check_resize();
+      if (r) {
+        if (typeof tui.clearok === 'function') tui.clearok();
+        controller.render();
+      }
+    }
+  } catch (_) {}
 }
 
 cookieJar.save();

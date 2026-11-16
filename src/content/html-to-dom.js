@@ -120,6 +120,14 @@ export function htmlToDom(html, baseUrl, document) {
      * raw text until its matching close. */
     const top = stack[stack.length - 1];
     if (top && top.rawContent) {
+      /* Skip <html>, <head>, <body> wrapper tags. Their children are
+ * processed normally and appended to document.body. This prevents
+ * nesting <html> inside <body> (which buries <div id="root"> under
+ * a tag domToText skips, so React's output never gets serialized). */
+if ((tok.type === 'open' || tok.type === 'close') &&
+    (tok.tag === 'html' || tok.tag === 'head' || tok.tag === 'body')) {
+  continue;
+}
       if (tok.type === 'text') { top.rawText += tok.value; continue; }
       if (tok.type === 'close' && tok.tag === top.tag) {
         if (top.tag === 'script') {

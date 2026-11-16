@@ -76,40 +76,22 @@ installGlobals({
       const target = String(newUrl || '');
       if (!target || target === 'about:blank') return;
 
-      const oldUrl  = tab.currentUrl || '';
-      const oldBase = oldUrl.split('#')[0];
-      const newBase = target.split('#')[0];
-
-      /* Hash-only change on the SAME document: don't fetch (that would
-       * reload the SPA and lose state). Update tab URL, then dispatch
-       * hashchange/popstate on a microtask so React isn't re-entered
-       * mid-dispatch — same principle as the pumpJobs-at-end-of-
-       * handleInput fix. Microtasks flush inside pumpJobs(200), so the
-       * router's setState commits in the same frame. */
-      if (kind === 'hashchange' || (kind === 'popstate' && oldBase === newBase)) {
-        tab.currentUrl = target;
-        try { tab.omnibox.setText(target); } catch (_) {}
-        Promise.resolve().then(() => {
-          try {
-            const type = (kind === 'popstate') ? 'popstate' : 'hashchange';
-            globalThis.dispatchEvent(new Event(type, { bubbles: false }));
-          } catch (_) {}
-        });
-        return;
-      }
-
-      /* pushState/replaceState: silent URL change, no event (caller
-       * is responsible for re-rendering; only back/forward fire
-       * popstate per spec). */
+      /* pushState/replaceState: silent URL mutation, no event, no fetch.
+       * Per spec, only back/forward fire popstate; the caller is
+       * responsible for updating the view. */
       if (kind === 'pushstate' || kind === 'replacestate') {
         tab.currentUrl = target;
         try { tab.omnibox.setText(target); } catch (_) {}
         return;
       }
 
-      /* Real navigation (host/path changed, or explicit reload). */
-      realController.navigate(tab, target,
-        kind === 'reload' ? { fromHistory: true } : {});
+      /* Every other kind goes through navigate(), which detects
+       * hash-only changes (dispatch event + push history, no fetch)
+       * vs real navigation (fetch + replace on fromHistory). */
+      const opts = (kind === 'popstate') ? { fromHistory: true }
+                 : (kind === 'reload')   ? { reload: true }
+                 : {};
+      realController.navigate(tab, target, opts);
     } catch (e) {
       try { console.error('[setUrl] ' + (e && e.message || e)); } catch (_) {}
     }
@@ -119,40 +101,20 @@ installGlobals({
 installDomGlobals();
 
 /* DOM extensions that nodes.js and dom-globals.js do NOT provide.
- *
- * Per the audit: getBoundingClientRect, focus, blur, click, remove,
+ * Runs AFTER installDomGlobals() so document.createElement exists.
+ * See the audit: getBoundingClientRect, focus, blur, click, remove,
  * matches, closest, contains, classList, style.setProperty,
  * createComment, createDocumentFragment, querySelector(All), children
- * are all implemented in src/dom/nodes.js — do NOT duplicate them here.
- *
- * What IS missing and belongs here:
- *   - insertAdjacentHTML    (example.com's s.js calls it)
- *   - lang / dir reflection (example.com's lang picker reads these)
- *   - innerText             (CRA calculators read e.target.innerText)
- *   - window.getComputedStyle (React + libraries on commit)
- *   - Element.scrollIntoView / scrollTo / scrollBy (routers, popovers)
- *
- * Runs AFTER installDomGlobals() so document.createElement exists.
- * Console.log calls before hookConsole go to stderr via the C shim;
- * that is intentional so patch failures are visible even without F12. */
+ * are all implemented in src/dom/nodes.js — do NOT duplicate them here. */
 (function extendElementPrototype() {
   const doc = globalThis.document;
-  if (!doc) {
-    try { console.log('[dom-patch] no document — aborting'); } catch (_) {}
-    return;
-  }
+  if (!doc) return;
 
   let proto = null;
   try { proto = Object.getPrototypeOf(doc.createElement('div')); } catch (_) {}
-  if (!proto) {
-    try { console.log('[dom-patch] no element prototype — aborting'); } catch (_) {}
-    return;
-  }
+  if (!proto) return;
 
-  /* ==================================================================
-   * insertAdjacentHTML
-   * Positions per DOM spec. Scripts parsed but not executed (matches
-   * browser behavior for insertAdjacentHTML). */
+  /* ---- insertAdjacentHTML ---- */
   try {
     if (typeof proto.insertAdjacentHTML !== 'function') {
       proto.insertAdjacentHTML = function (pos, html) {
@@ -180,12 +142,7 @@ installDomGlobals();
     }
   } catch (_) {}
 
-  /* ==================================================================
-   * lang / dir as reflected attributes.
-   * example.com's script sets p.lang = 'en' and then checks p.lang == 'ar'
-   * to pick the user's language. Without reflection, the setter creates
-   * a shadow property that never touches the `lang` attribute and the
-   * getter returns undefined. */
+  /* ---- lang / dir reflection ---- */
   try {
     if (!Object.getOwnPropertyDescriptor(proto, 'lang')) {
       Object.defineProperty(proto, 'lang', {
@@ -205,11 +162,7 @@ installDomGlobals();
     }
   } catch (_) {}
 
-  /* ==================================================================
-   * window.getComputedStyle — MISSING per audit. React reads
-   * computed style on mount for transition/visibility checks; some
-   * libraries (Headless UI, Radix) use it for behavior. A zeroed-out
-   * stub is enough to stop the crash. */
+  /* ---- window.getComputedStyle ---- */
   try {
     if (typeof globalThis.getComputedStyle !== 'function') {
       globalThis.getComputedStyle = function () {
@@ -218,25 +171,14 @@ installDomGlobals();
     }
   } catch (_) {}
 
-  /* ==================================================================
-   * Element.scrollIntoView / scrollTo / scrollBy — MISSING per audit.
-   * Popovers, modals (Radix, Headless UI), and routers call
-   * scrollIntoView after mounting. No-op is correct here: there is no
-   * scroll geometry to target. */
+  /* ---- Element.scrollIntoView / scrollTo / scrollBy ---- */
   try {
-    if (typeof proto.scrollIntoView !== 'function') {
-      proto.scrollIntoView = function () {};
-    }
-  } catch (_) {}
-  try {
-    if (typeof proto.scrollTo !== 'function') proto.scrollTo = function () {};
-    if (typeof proto.scrollBy !== 'function') proto.scrollBy = function () {};
+    if (typeof proto.scrollIntoView !== 'function') proto.scrollIntoView = function () {};
+    if (typeof proto.scrollTo       !== 'function') proto.scrollTo       = function () {};
+    if (typeof proto.scrollBy       !== 'function') proto.scrollBy       = function () {};
   } catch (_) {}
 
-  /* ==================================================================
-   * innerText — MISSING per audit (verified empirically: the DOM
-   * prototype in nodes.js has no innerText). Two independent install
-   * paths so a restrictive proto doesn't lose the API. */
+  /* ---- innerText (dual-path install) ---- */
   const innerTextGet = function () {
     try {
       const tc = this.textContent;
@@ -323,24 +265,18 @@ installDomGlobals();
         if (doc.createElement && doc.createElement.__innerTextPatched) {
           installed = true;
           try { console.log('[dom-patch] innerText: createElement hook OK'); } catch (_) {}
-        } else {
-          try { console.log('[dom-patch] innerText: createElement hook rejected'); } catch (_) {}
         }
       }
-    } catch (e) {
-      try { console.log('[dom-patch] innerText: createElement hook threw — ' +
-                        (e && e.message ? e.message : String(e))); } catch (_) {}
-    }
+    } catch (_) {}
   }
 
-  /* Final verification on a fresh element. */
   try {
     const test = doc.createElement('span');
     const ok = test && ('innerText' in test) && typeof test.innerText === 'string';
     try {
       console.log(ok
         ? '[dom-patch] innerText: VERIFIED on fresh element'
-        : '[dom-patch] innerText: STILL MISSING on fresh element (installed=' + installed + ')');
+        : '[dom-patch] innerText: STILL MISSING on fresh element');
     } catch (_) {}
   } catch (_) {}
 })();

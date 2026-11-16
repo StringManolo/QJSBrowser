@@ -32,10 +32,24 @@ export function createController(deps) {
   const tabBar  = createTabBar(tui, theme);
 
   const dialog = createSettingsDialog(
-    tui, theme, settings, cookieJar, tabManager,
-    () => { for (const t of tabManager.list()) t.history.clear(); },
-    deps.onToggleConsole || null
-  );
+  tui, theme, settings, cookieJar, tabManager,
+  () => {
+    let total = 0;
+    for (const t of tabManager.list()) {
+      total += t.history.length;
+      t.history.clear();
+    }
+    return total;
+  },
+  deps.onToggleConsole || null,
+  (msg) => {
+    const tab = tabManager.active();
+    if (!tab) return;
+    tab.statusText = msg;
+    requestRender();
+  }
+);
+
 
   if (!globalThis.fetch) {
     globalThis.fetch = (input, init) => {
@@ -291,7 +305,21 @@ export function createController(deps) {
     }
 
     tui.refresh();
-    tui.flushImages(cursorY, cursorX);
+    /* When the settings dialog is open, don't draw images. They sit on a
+     * separate terminal layer (kitty / sixel / iTerm2 protocols), so the
+     * dialog's text cells can't cover them — images end up overlapping the
+     * menu. Skipping flushImages leaves the dialog unobstructed.
+     *
+     * If the terminal retains image pixels from the previous frame (kitty
+     * is notorious for this — images are cached and not erased by text),
+     * we need to also clear them. The clearImages() call below does that
+     * IF your tui.so exposes it. If not, the dialog will be readable but
+     * ghost images may peek through around the edges — see below. */
+    if (!dialog.isOpen()) {
+      tui.flushImages(cursorY, cursorX);
+    } else if (typeof tui.clearImages === 'function') {
+      try { tui.clearImages(); } catch (_) {}
+    }
   }
 
   function handleInput() {

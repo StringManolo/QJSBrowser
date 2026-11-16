@@ -134,10 +134,9 @@ installDomGlobals();
 
   /* ---- innerHTML setter: parse, don't stringify ----
    * nodes.js's default setter does `textContent = html`, which leaves
-   * markup as literal text. This breaks React's dangerouslySetInnerHTML
-   * and any `el.innerHTML = '<b>x</b>'`. Trigger: toggling the theme
-   * on stringmanolo.qzz.io re-applies article content via innerHTML,
-   * and the raw HTML leaked as text. */
+   * markup as literal text. This breaks React's dangerouslySetInnerHTML.
+   * Trigger: toggling the theme on stringmanolo.qzz.io re-applies
+   * article content via innerHTML and the raw HTML leaked as text. */
   try {
     const desc = Object.getOwnPropertyDescriptor(proto, 'innerHTML');
     const getter = desc && typeof desc.get === 'function'
@@ -440,6 +439,19 @@ httpClient.setCallbacks({
 controller.render();
 
 while (controller.isRunning()) {
+  /* Handle terminal resize (SIGWINCH) and process resume (SIGCONT, e.g.
+   * Termux app switch). Both leave ncurses thinking the screen is up to
+   * date when it isn't; tui.check_resize detects the flag and, if set,
+   * updates ncurses' size + clearok. Then controller.render() repaints
+   * from scratch. Called at the TOP of the loop so that an EINTR +
+   * continue from epoll_wait also runs it (signal handler sets flag,
+   * epoll_wait interrupts, continue jumps here). */
+  try {
+    if (typeof tui.check_resize === 'function') {
+      if (tui.check_resize()) controller.render();
+    }
+  } catch (_) {}
+
   let timeout = -1;
   if (scheduler.hasWork()) timeout = 0;
   else {
@@ -483,23 +495,6 @@ while (controller.isRunning()) {
 
   try { httpClient.tick(); }
   catch (e) { console.error('[tick] ' + (e.message || String(e))); }
-
-  /* Detect terminal resize (SIGWINCH) or process resume (SIGCONT, which
-   * Termux sends when you switch back to it from another app). Without
-   * this, ncurses' internal buffer is never invalidated on resume, so
-   * the screen shows stale content mixed with new renders — the
-   * "Welcome to QJSBrowser!" ghost over a loaded page. tui.check_resize
-   * returns 0 if nothing happened, or a bitmask: 1 = SIGWINCH (resized),
-   * 2 = SIGCONT (resumed). Either way, force a full clear + redraw. */
-  try {
-    if (typeof tui.check_resize === 'function') {
-      const r = tui.check_resize();
-      if (r) {
-        if (typeof tui.clearok === 'function') tui.clearok();
-        controller.render();
-      }
-    }
-  } catch (_) {}
 }
 
 cookieJar.save();

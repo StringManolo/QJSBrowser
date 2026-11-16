@@ -59,9 +59,7 @@ export function createController(deps) {
    *
    * Without resolution, '/writeups/foo.json' fed to parseUrl() returns
    * null (no scheme/host), the httpClient errors with 'Invalid URL',
-   * and the SPA shows its generic "Error loading ..." message — which
-   * is exactly what stringmanolo.qzz.io did when clicking a writeup
-   * card. */
+   * and the SPA shows its generic "Error loading ..." message. */
   if (!globalThis.fetch) {
     globalThis.fetch = (input, init) => {
       let rawUrl;
@@ -168,6 +166,10 @@ export function createController(deps) {
   function refreshTabFromDom(tab) {
     tab.domDirty = false;
 
+    const { cols } = tui.size();
+    const pageW = Math.max(20, cols - 2);
+    tab._lastPageW = pageW;
+
     const formSnapshot = new Map();
     for (const el of tab.formState.elements.values()) {
       if (el.name && (el.kind === 'text' || el.kind === 'password' || el.kind === 'textarea')) {
@@ -177,6 +179,10 @@ export function createController(deps) {
     const focused = tab.formState.getFocused();
     const focusCursor = focused ? tab.formState.cursorPos() : 0;
 
+    /* Capture the live DOM node that currently holds focus BEFORE we
+     * blow away the form state. React reuses the same DOM node when it
+     * re-renders a controlled <input>, so after domToText re-traverses
+     * the tree we can reattach focus by node identity. */
     const activeNode = (typeof globalThis.document !== 'undefined')
       ? globalThis.document.activeElement
       : null;
@@ -185,7 +191,7 @@ export function createController(deps) {
     const newNodes = new Map();
     const parsed = domToText(
       globalThis.document.body, tab.currentUrl, theme, tab.formState,
-      tab._css || [], newNodes
+      tab._css || [], newNodes, { width: pageW }
     );
     tab.domNodes = newNodes;
     tab.pageView.updateContent(parsed.segments, parsed.links);
@@ -259,6 +265,20 @@ export function createController(deps) {
     const { rows, cols } = tui.size();
     const tab = tabManager.active();
     if (!tab) return;
+
+    /* If the terminal width changed since the last serialization, force
+     * a re-serialize. Horizontal rules (───) are emitted at pageWidth;
+     * on resize they need to be regenerated at the new width. Only
+     * triggers on pure resize (React re-renders already set domDirty
+     * themselves). tab._lastPageW is undefined on the first render of
+     * a new tab — no comparison, and refreshTabFromDom / handleResponse
+     * will set it. */
+    const pageW = Math.max(20, cols - 2);
+    if (tab._lastPageW !== undefined && tab._lastPageW !== pageW &&
+        domOwner.tabId === tab.id && domOwner.navId === tab.navId) {
+      tab.domDirty = true;
+    }
+    tab._lastPageW = pageW;
 
     if (tab.domDirty && domOwner.tabId === tab.id && domOwner.navId === tab.navId) {
       refreshTabFromDom(tab);
@@ -530,82 +550,55 @@ export function createController(deps) {
   }
 
   function handlePageClick(tab, relX, relY, pageW) {
-  const line = tab.pageView.lineAt(relY, pageW);
-  if (!line) {
-    tab.mode = 'page';
+    const line = tab.pageView.lineAt(relY, pageW);
+    if (!line) { tab.mode = 'page'; tab.formState.blur(); tab.pageView.invalidate(); return; }
+
+    let cx = 0;
+    for (const seg of line) {
+      if (seg.kind === 'img') {
+        if (seg.linkN !== null && seg.linkN !== undefined) {
+          const link = tab.pageView.links.find(l => l.n === seg.linkN);
+          if (link) {
+            if (link.href) { navigate(tab, link.href); return; }
+            if (link.node && typeof link.node.dispatchEvent === 'function') {
+              try {
+                const ev = new Event('click', { bubbles: true, cancelable: true });
+                link.node.dispatchEvent(ev);
+              } catch (_) {}
+              return;
+            }
+          }
+        }
+        cx += seg.cols;
+        continue;
+      }
+      const w = (seg.text || '').length;
+      if (w > 0 && relX >= cx && relX < cx + w) {
+        if (seg.elementId && tab.formState.get(seg.elementId)) {
+          activateFormElement(tab, seg.elementId);
+          return;
+        }
+        if (seg.linkN !== null && seg.linkN !== undefined) {
+          const link = tab.pageView.links.find(l => l.n === seg.linkN);
+          if (link) {
+            if (link.href) { navigate(tab, link.href); return; }
+            if (link.node && typeof link.node.dispatchEvent === 'function') {
+              try {
+                const ev = new Event('click', { bubbles: true, cancelable: true });
+                link.node.dispatchEvent(ev);
+              } catch (_) {}
+              return;
+            }
+          }
+        }
+        break;
+      }
+      cx += w;
+    }
     tab.formState.blur();
     tab.pageView.invalidate();
-    return;
+    tab.mode = 'page';
   }
-
-  let cx = 0;
-  for (const seg of line) {
-    if (seg.kind === 'img') {
-      /* Image segments can carry a synthetic link for click-through
-       * (registered in pushImage). Handle both real links and node
-       * dispatch just like text below. */
-      if (seg.linkN !== null && seg.linkN !== undefined) {
-        const link = tab.pageView.links.find(l => l.n === seg.linkN);
-        if (link) {
-          if (link.href) { navigate(tab, link.href); return; }
-          if (link.node) {
-            try {
-              const ev = new Event('click', { bubbles: true, cancelable: true });
-              link.node.dispatchEvent(ev);
-            } catch (_) {}
-            return;
-          }
-        }
-      }
-      cx += seg.cols;
-      continue;
-    }
-
-    const w = (seg.text || '').length;
-    if (w > 0 && relX >= cx && relX < cx + w) {
-      /* Case 1: form control. */
-      if (seg.elementId && tab.formState.get(seg.elementId)) {
-        activateFormElement(tab, seg.elementId);
-        return;
-      }
-
-      /* Case 2: link (real or synthetic).
-       *
-       * linkN survives pageView.lineAt() (text segments that had
-       * elementId lose it because lineAt reconstructs the object;
-       * linkN is preserved because it's used for rendering). That's
-       * why the "Read full writeup →" <div onClick> cards work: they
-       * have a synthetic link {href:null, node:<innermost>} registered
-       * at domToText time, and clicking dispatches a real DOM click on
-       * the node, which bubbles to the React onClick ancestor and
-       * navigates. */
-      if (seg.linkN !== null && seg.linkN !== undefined) {
-        const link = tab.pageView.links.find(l => l.n === seg.linkN);
-        if (link) {
-          if (link.href) {
-            navigate(tab, link.href);
-            return;
-          }
-          if (link.node && typeof link.node.dispatchEvent === 'function') {
-            try {
-              const ev = new Event('click', { bubbles: true, cancelable: true });
-              link.node.dispatchEvent(ev);
-            } catch (_) {}
-            return;
-          }
-        }
-      }
-
-      /* Case 3: no link, no form — plain text. Blur any focus and stop. */
-      break;
-    }
-    cx += w;
-  }
-
-  tab.formState.blur();
-  tab.pageView.invalidate();
-  tab.mode = 'page';
-} 
 
   function activateFormElement(tab, elementId) {
     const el = tab.formState.get(elementId);
@@ -764,6 +757,7 @@ export function createController(deps) {
     tab.formState.reset();
     tab.domDirty = false;
     tab.domNodes = null;
+    tab._lastPageW = undefined;
     tab.omnibox.setText(url);
     tab.pageView.setContent('Loading ' + url + ' …', []);
     httpClient.fetch(url, { ...options, tabId: tab.id, navId: tab.navId });
@@ -922,10 +916,15 @@ export function createController(deps) {
         endMutationBatch();
       }
 
+      const { cols } = tui.size();
+      const pageW = Math.max(20, cols - 2);
+      tab._lastPageW = pageW;
+
       tab._css = css;
       tab.domNodes = new Map();
       const parsed = domToText(
-        globalThis.document.body, url, theme, tab.formState, css, tab.domNodes
+        globalThis.document.body, url, theme, tab.formState, css, tab.domNodes,
+        { width: pageW }
       );
       tab.domDirty = false;
       tab.pageView.setContent(parsed.segments, parsed.links);

@@ -3,10 +3,17 @@
  * Evaluates in the global scope via indirect eval. Captures console.log/
  * warn/error from anywhere (browser internals, user code) into the output
  * panel. Drains globalThis._lastPumpError (set by C's js_pump_jobs) into
- * the panel as errors after every pump, so unhandled rejections surface
- * here instead of corrupting ncurses via stderr.
+ * the panel as errors after every pump.
  *
- * Multiline input is fully visible (last up-to-4 lines shown).
+ * Paste-safe submission: pressing Enter with balanced input does NOT
+ * evaluate immediately. It sets pendingRun; the drain loop in main.js
+ * calls flushPending() only after stdin is empty. If more bytes arrive
+ * before the drain ends, they are treated as paste continuation: the
+ * suppressed newline is reinserted and pendingRun is cleared. This
+ * batches a multi-line paste into a single eval instead of running each
+ * line as a separate submission (which would break `const x = 1` on
+ * line 1 followed by `x` on line 2, since QuickJS scopes const/let to a
+ * single eval).
  *
  * Keys:
  *   Tab         complete identifier (globals, dotted paths)
@@ -33,6 +40,7 @@ export function createConsole({ tui, theme }) {
   let historyIdx = -1;
   let savedInput = '';
   let scrollY    = 0;
+  let pendingRun = false;    /* Enter suppressed; awaiting end-of-batch */
 
   const P = theme.pairs;
   const pairBg     = P.page    != null ? P.page    : 1;
@@ -145,9 +153,6 @@ export function createConsole({ tui, theme }) {
 
   /* --- QuickJS microtask pump ----------------------------------------- */
 
-  /* Drain C-side accumulated pump errors into the panel. Never trust
-   * globalThis._lastPumpError to be a string — the C side may have left
-   * it undefined/null, or user code may have overwritten it. */
   function drainPumpErrors() {
     const err = globalThis._lastPumpError;
     if (!err) return;
@@ -167,7 +172,7 @@ export function createConsole({ tui, theme }) {
 
   function run() {
     const code = input.trim();
-    if (!code) return;
+    if (!code) { input = ''; cursor = 0; return; }
 
     pushOutput({ kind: 'input', text: '> ' + code });
     history.push(code);
@@ -178,8 +183,8 @@ export function createConsole({ tui, theme }) {
     let result, error;
     try { result = (0, eval)(code); } catch (e) { error = e; }
 
-    /* Drain microtasks the eval may have scheduled (e.g. Promise.resolve()
-     * .then(console.log)). Errors from C-side pumps surface in the panel. */
+    /* Drain microtasks the eval may have scheduled. Errors from C-side
+     * pumps surface in the panel via _lastPumpError. */
     pumpJobsAndDrain();
 
     if (error) {
@@ -205,12 +210,16 @@ export function createConsole({ tui, theme }) {
     scrollY = 0;
   }
 
+  /* Called by main.js after the getch() drain loop ends. If Enter was
+   * suppressed earlier and no further input arrived, execute now. */
+  function flushPending() {
+    if (!pendingRun) return;
+    pendingRun = false;
+    if (looksBalanced(input)) run();
+  }
+
   /* --- Tab completion -------------------------------------------------- */
 
-  /* Completes the identifier immediately before the cursor. Supports
-   * `ident` (globals) and `path.to.ident` (properties). Deliberately does
-   * NOT track user-declared variables — that requires real parsing and is
-   * where every REPL completion gets buggy. */
   function complete() {
     try {
       const upToCursor = input.slice(0, cursor);
@@ -231,8 +240,6 @@ export function createConsole({ tui, theme }) {
       }
       if (baseObj === null || baseObj === undefined) return;
 
-      /* Collect from own properties + up to 2 prototype levels.
-       * Stops at Object.prototype to avoid toString/hasOwnProperty noise. */
       const cands = [];
       const seen  = new Set();
       let   obj   = Object(baseObj);
@@ -265,7 +272,6 @@ export function createConsole({ tui, theme }) {
         if (cp.length > lastPart.length) {
           insertText = cp;
         } else {
-          /* No extra chars to insert — just list the candidates. */
           const shown = cands.length > MAX_COMPLETION_HINTS
             ? cands.slice(0, MAX_COMPLETION_HINTS).join('   ') +
               '   … (' + (cands.length - MAX_COMPLETION_HINTS) + ' more)'
@@ -278,7 +284,7 @@ export function createConsole({ tui, theme }) {
       const before = input.slice(0, cursor - lastPart.length) + insertText;
       input  = before + input.slice(cursor);
       cursor = before.length;
-    } catch (_) { /* completion is best-effort, never throw */ }
+    } catch (_) { /* best-effort */ }
   }
 
   /* --- public API ------------------------------------------------------ */
@@ -286,35 +292,51 @@ export function createConsole({ tui, theme }) {
   function isVisible() { return visible; }
   function toggle() {
     visible = !visible;
+    if (!visible) pendingRun = false;
     tui.setCursor(visible ? 1 : 0);
   }
   function close() {
     if (!visible) return;
     visible = false;
+    pendingRun = false;
     tui.setCursor(0);
   }
 
   /* --- key handling ---------------------------------------------------- */
 
   function handleKey(ch) {
+    /* Cancel keys: discard any suppressed Enter without reinserting it. */
     if (ch === tui.KEY_F12 || ch === 27 /* ESC */) {
+      pendingRun = false;
       if (ch === 27 && input.length > 0) { input = ''; cursor = 0; return; }
       close();
       return;
     }
-    if (ch === 12 /* Ctrl+L */) { clearOutput(); return; }
-    if (ch === 21 /* Ctrl+U */) { input = ''; cursor = 0; return; }
-    if (ch === 3  /* Ctrl+C */) { input = ''; cursor = 0; return; }
-    if (ch === 9  /* Tab */)    { complete(); return; }
+    if (ch === 12 /* Ctrl+L */) { pendingRun = false; clearOutput(); return; }
+    if (ch === 21 /* Ctrl+U */) { pendingRun = false; input = ''; cursor = 0; return; }
+    if (ch === 3  /* Ctrl+C */) { pendingRun = false; input = ''; cursor = 0; return; }
+    if (ch === 9  /* Tab */)    { pendingRun = false; complete(); return; }
 
+    /* Enter: defer evaluation. flushPending() decides at end of batch. */
     if (ch === tui.KEY_ENTER || ch === 10 || ch === 13) {
-      if (looksBalanced(input)) run();
-      else {
+      if (looksBalanced(input)) {
+        pendingRun = true;
+      } else {
         input = input.slice(0, cursor) + '\n' + input.slice(cursor);
         cursor++;
       }
       return;
     }
+
+    /* Any other key arriving with pendingRun set means the previous Enter
+     * was part of a paste (its batch had more bytes to come). Reinsert the
+     * suppressed newline and cancel the auto-run so this becomes one eval. */
+    if (pendingRun) {
+      input = input.slice(0, cursor) + '\n' + input.slice(cursor);
+      cursor++;
+      pendingRun = false;
+    }
+
     if (ch === tui.KEY_BACKSPACE || ch === 8 || ch === 127) {
       if (cursor > 0) {
         input = input.slice(0, cursor - 1) + input.slice(cursor);
@@ -443,5 +465,6 @@ export function createConsole({ tui, theme }) {
     isVisible, toggle, close,
     handleKey, render,
     appendOutput, clearOutput,
+    flushPending,
   };
 }

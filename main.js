@@ -8,6 +8,9 @@ import dns   from 'dns';
 
 import { buildKeyMap }      from 'src/base/keys.js';
 import { createScheduler }  from 'src/base/scheduler.js';
+import { createTimers }     from 'src/base/timers.js';
+import { installGlobals }   from 'src/browser/globals.js';
+import { installDomGlobals } from 'src/browser/dom-globals.js';
 import { createTheme }      from 'src/ui/theme.js';
 import { createConsole }    from 'src/ui/console.js';
 import { createImageView }  from 'src/ui/image-view.js';
@@ -36,6 +39,7 @@ const tabManager = createTabManager(tui, theme, imageView);
 tabManager.add();
 
 const scheduler  = createScheduler();
+const timers     = createTimers();
 const httpClient = createHttpClient(net, epfd, tls, cookieJar, zlib, dns);
 
 let devConsole = null;
@@ -53,22 +57,39 @@ const realController = createController({
 
 devConsole = createConsole({ tui, theme });
 
-/* Route console.* through the panel in addition to stderr (when hidden).
- *
- * The C-level logger (js_console_log) writes raw bytes to stderr. That
- * bypasses ncurses entirely — in raw() mode \n advances without returning
- * to column 0, so repeated calls end up further right; ncurses never
- * repaints those cells. Two rules:
- *   - While the console is visible, skip stderr: the panel IS the output.
- *   - While hidden, call stderr for `2>log` debugging, but force a full
- *     repaint (clearok) so the next refresh scrubs the corruption. */
+installGlobals({
+  tui,
+  timers,
+  getUrl: () => {
+    try {
+      const tab = tabManager.active();
+      return (tab && tab.currentUrl) || '';
+    } catch (_) { return ''; }
+  },
+});
+
+installDomGlobals();
+
 (function hookConsole() {
   const _origLog   = console.log;
   const _origError = console.error;
   const _origClear = console.clear;
-  function wrap(orig, kind) {
+
+  let stderrBudget = 10;
+  let stderrWindowStart = Date.now();
+  function canWriteStderr() {
+    const now = Date.now();
+    if (now - stderrWindowStart > 1000) {
+      stderrBudget = 10;
+      stderrWindowStart = now;
+    }
+    if (stderrBudget > 0) { stderrBudget--; return true; }
+    return false;
+  }
+
+  function wrap(orig, kind, isErrorLevel) {
     return function (...args) {
-      if (!devConsole.isVisible()) {
+      if (isErrorLevel && !devConsole.isVisible() && canWriteStderr()) {
         try { orig.apply(console, args); } catch (_) {}
         if (typeof tui.clearok === 'function') {
           try { tui.clearok(); } catch (_) {}
@@ -77,11 +98,11 @@ devConsole = createConsole({ tui, theme });
       try { devConsole.appendOutput(kind, args); } catch (_) {}
     };
   }
-  console.log   = wrap(_origLog,   'log');
-  console.warn  = wrap(_origLog,   'log');
-  console.info  = wrap(_origLog,   'log');
-  console.debug = wrap(_origLog,   'log');
-  console.error = wrap(_origError, 'error');
+  console.log   = wrap(_origLog,   'log',   false);
+  console.warn  = wrap(_origLog,   'log',   false);
+  console.info  = wrap(_origLog,   'log',   false);
+  console.debug = wrap(_origLog,   'log',   false);
+  console.error = wrap(_origError, 'error', true);
   console.clear = function (...args) {
     try { if (typeof _origClear === 'function') _origClear.apply(console, args); }
     catch (_) {}
@@ -102,12 +123,18 @@ function closeConsoleAndRedraw() {
 }
 
 function routeInput() {
+  /* Console owns the keyboard while visible. */
   if (devConsole.isVisible()) {
     let ch;
     while ((ch = tui.getch()) !== tui.ERR) {
       devConsole.handleKey(ch);
       if (!devConsole.isVisible()) { redrawAfterConsoleClosed(); return; }
     }
+    /* End of stdin batch. If Enter was pressed mid-batch and no further
+     * bytes arrived, this is a typed submission → run it. If bytes did
+     * arrive, handleKey already reinserted the suppressed newline and
+     * cleared pendingRun, so this is a no-op for pastes. */
+    devConsole.flushPending();
     return;
   }
 
@@ -116,7 +143,7 @@ function routeInput() {
   if (ch === tui.KEY_F12) { closeConsoleAndRedraw(); return; }
 
   if (typeof tui.ungetch !== 'function') {
-    console.log('[console] tui.ungetch missing; rebuild lib/tui.so');
+    console.error('[console] tui.ungetch missing; rebuild lib/tui.so');
     return;
   }
   tui.ungetch(ch);
@@ -135,6 +162,17 @@ const controller = {
     }
   },
 };
+
+function pumpAndDrain() {
+  if (typeof pumpJobs === 'function') {
+    try { pumpJobs(100); } catch (_) {}
+  }
+  const err = globalThis._lastPumpError;
+  if (err) {
+    globalThis._lastPumpError = '';
+    try { devConsole.appendOutput('error', [String(err)]); } catch (_) {}
+  }
+}
 
 httpClient.setCallbacks({
   onStatus:   (url, msg, opts)  => {
@@ -188,11 +226,17 @@ while (controller.isRunning()) {
     if (httpClient.hasJobs() && (timeout < 0 || timeout > 1000)) timeout = 1000;
   }
 
+  const due = timers.nextDue();
+  if (due !== Infinity) {
+    const ms = Math.max(0, due - Date.now());
+    if (timeout < 0 || ms < timeout) timeout = ms;
+  }
+
   let events;
   try { events = net.epoll_wait(epfd, 16, timeout); }
   catch (e) {
     const msg = e.message || String(e);
-    if (!/Interrupted system call|EINTR/i.test(msg)) console.log('[epoll_wait] ' + msg);
+    if (!/Interrupted system call|EINTR/i.test(msg)) console.error('[epoll_wait] ' + msg);
     continue;
   }
 
@@ -200,19 +244,24 @@ while (controller.isRunning()) {
     try {
       if (ev.fd === 0) controller.handleInput();
       else httpClient.onEvent(ev);
-    } catch (e) { console.log('[event loop] ' + (e.message || String(e))); }
+    } catch (e) { console.error('[event loop] ' + (e.message || String(e))); }
   }
+
+  try { timers.runDue(Date.now(), 50); }
+  catch (e) { console.error('[timers] ' + (e.message || String(e))); }
+
+  pumpAndDrain();
 
   if (scheduler.hasWork()) {
     try { scheduler.runOne(); }
-    catch (e) { console.log('[task] ' + (e.message || String(e))); }
+    catch (e) { console.error('[task] ' + (e.message || String(e))); }
   }
 
   try { controller.flushRender(); }
-  catch (e) { console.log('[render] ' + (e.message || String(e))); }
+  catch (e) { console.error('[render] ' + (e.message || String(e))); }
 
   try { httpClient.tick(); }
-  catch (e) { console.log('[tick] ' + (e.message || String(e))); }
+  catch (e) { console.error('[tick] ' + (e.message || String(e))); }
 }
 
 cookieJar.save();

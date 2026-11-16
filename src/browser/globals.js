@@ -1,5 +1,6 @@
 /* Browser-shaped globals that page JS (React, Webpack, Vite, polyfills)
- * touch during bootstrap. No DOM yet — that's PR 2. */
+ * touch during bootstrap. No DOM yet — that's PR 2. Idempotent: safe to
+ * call twice (checks existence before defining). */
 
 function makeStorage() {
   const m = new Map();
@@ -25,6 +26,7 @@ function makeLocation(url) {
   }
   const pathOnly = path.split('?')[0].split('#')[0] || '/';
   const search   = path.includes('?') ? '?' + path.split('?')[1].split('#')[0] : '';
+  const hash     = path.includes('#') ? '#' + path.split('#')[1] : '';
   const origin   = host ? scheme + '://' + host + (port ? ':' + port : '') : 'null';
   return {
     href: url,
@@ -34,12 +36,14 @@ function makeLocation(url) {
     port,
     pathname: pathOnly,
     search,
-    hash: '',
+    hash,
     origin,
     toString() { return url; },
-    assign() {},
-    replace() {},
-    reload() {},
+    /* Navigation from JS is not wired yet (needs a callback into the
+     * controller). Surface the limitation rather than silently no-op. */
+    assign()  { console.warn('[location] navigation not implemented yet'); },
+    replace() { console.warn('[location] navigation not implemented yet'); },
+    reload()  { console.warn('[location] reload not implemented yet'); },
   };
 }
 
@@ -73,12 +77,10 @@ export function installGlobals({ tui, timers, getUrl }) {
   function readSize() {
     try { return tui.size(); } catch (_) { return { rows: 24, cols: 80 }; }
   }
-  const sizeDef = { configurable: true, get() { return readSize().cols; } };
-  const sizeDefH = { configurable: true, get() { return readSize().rows; } };
-  Object.defineProperty(g, 'innerWidth',  sizeDef);
-  Object.defineProperty(g, 'innerHeight', sizeDefH);
-  Object.defineProperty(g, 'outerWidth',  { configurable: true, get: sizeDef.get });
-  Object.defineProperty(g, 'outerHeight', { configurable: true, get: sizeDefH.get });
+  Object.defineProperty(g, 'innerWidth',  { configurable: true, get() { return readSize().cols; } });
+  Object.defineProperty(g, 'innerHeight', { configurable: true, get() { return readSize().rows; } });
+  Object.defineProperty(g, 'outerWidth',  { configurable: true, get() { return readSize().cols; } });
+  Object.defineProperty(g, 'outerHeight', { configurable: true, get() { return readSize().rows; } });
   Object.defineProperty(g, 'devicePixelRatio', { value: 1, configurable: true });
   Object.defineProperty(g, 'scrollX', { value: 0, configurable: true });
   Object.defineProperty(g, 'scrollY', { value: 0, configurable: true });
@@ -99,11 +101,11 @@ export function installGlobals({ tui, timers, getUrl }) {
     };
   }
 
-  /* storage */
+  /* storage (in-memory; persistence is a separate PR) */
   if (!g.localStorage)   g.localStorage   = makeStorage();
   if (!g.sessionStorage) g.sessionStorage = makeStorage();
 
-  /* matchMedia (always "no match") */
+  /* matchMedia (always "no match" — no CSS media query engine yet) */
   if (!g.matchMedia) {
     g.matchMedia = (q) => ({
       matches: false,
@@ -119,12 +121,12 @@ export function installGlobals({ tui, timers, getUrl }) {
   g.clearTimeout  = timers.clearTimeout;
   g.clearInterval = timers.clearInterval;
 
-  /* requestAnimationFrame — ~16 ms granularity is fine for a terminal */
+  /* requestAnimationFrame — 16 ms granularity is fine for a terminal */
   if (!g.requestAnimationFrame) {
     g.requestAnimationFrame = (fn) => {
       return timers.setTimeout(() => {
         try { fn(g.performance.now()); }
-        catch (e) { console.log('[rAF] ' + (e && e.message ? e.message : String(e))); }
+        catch (e) { console.error('[rAF] ' + (e && e.message ? e.message : String(e))); }
       }, 16);
     };
     g.cancelAnimationFrame = (id) => timers.clearTimeout(id);
@@ -140,11 +142,10 @@ export function installGlobals({ tui, timers, getUrl }) {
     Object.defineProperty(g, 'location', {
       configurable: true,
       get() { return makeLocation(getUrl ? getUrl() : ''); },
-      set(_v) { /* TODO: navigate — PR 4+ */ },
     });
   }
 
-  /* history — no-ops that must exist so routers don't crash */
+  /* history — no-op stubs so routers don't crash */
   if (!g.history) {
     g.history = {
       length: 1,
@@ -160,6 +161,5 @@ export function installGlobals({ tui, timers, getUrl }) {
     if (!g.console.warn)  g.console.warn  = g.console.log;
     if (!g.console.info)  g.console.info  = g.console.log;
     if (!g.console.debug) g.console.debug = g.console.log;
-    if (!g.console.trace) g.console.trace = g.console.log;
   }
 }

@@ -70,39 +70,32 @@ installGlobals({
 
 installDomGlobals();
 
+/* Redirect every console.* call to the in-TUI console.
+ *
+ * Before this hook, console.log/console.error were the C-backed
+ * js_console_log function, which does fputs("[js] ", stderr). Page-JS
+ * errors therefore landed raw on fd 2, desyncing ncurses' model of the
+ * physical screen — the [js] ... lines that bled into the status bar.
+ *
+ * After this hook, NOTHING goes to stderr: every log lands in
+ * devConsole, reachable with F12. The old fallback that also wrote to
+ * stderr when devConsole was hidden is removed: the hidden console is
+ * not a reason to corrupt the TUI. */
 (function hookConsole() {
-  const _origLog   = console.log;
-  const _origError = console.error;
   const _origClear = console.clear;
 
-  let stderrBudget = 10;
-  let stderrWindowStart = Date.now();
-  function canWriteStderr() {
-    const now = Date.now();
-    if (now - stderrWindowStart > 1000) {
-      stderrBudget = 10;
-      stderrWindowStart = now;
-    }
-    if (stderrBudget > 0) { stderrBudget--; return true; }
-    return false;
-  }
-
-  function wrap(orig, kind, isErrorLevel) {
+  function wrap(kind) {
     return function (...args) {
-      if (isErrorLevel && !devConsole.isVisible() && canWriteStderr()) {
-        try { orig.apply(console, args); } catch (_) {}
-        if (typeof tui.clearok === 'function') {
-          try { tui.clearok(); } catch (_) {}
-        }
-      }
       try { devConsole.appendOutput(kind, args); } catch (_) {}
     };
   }
-  console.log   = wrap(_origLog,   'log',   false);
-  console.warn  = wrap(_origLog,   'log',   false);
-  console.info  = wrap(_origLog,   'log',   false);
-  console.debug = wrap(_origLog,   'log',   false);
-  console.error = wrap(_origError, 'error', true);
+
+  console.log   = wrap('log');
+  console.warn  = wrap('log');
+  console.info  = wrap('log');
+  console.debug = wrap('log');
+  console.error = wrap('error');
+
   console.clear = function (...args) {
     try { if (typeof _origClear === 'function') _origClear.apply(console, args); }
     catch (_) {}
@@ -160,7 +153,10 @@ const controller = {
 
 function pumpAndDrain() {
   if (typeof pumpJobs === 'function') {
-    try { pumpJobs(100); } catch (_) {}
+    try { pumpJobs(200); } catch (e) {
+      console.error('[pumpJobs] ' + (e && e.message));
+      console.error('[pumpJobs] ' + (e && e.stack));
+    }
   }
   const err = globalThis._lastPumpError;
   if (err) {

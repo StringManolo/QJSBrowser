@@ -37,6 +37,35 @@ export function createController(deps) {
     deps.onToggleConsole || null
   );
 
+  if (!globalThis.fetch) {
+    globalThis.fetch = (input, init) => {
+      const url = typeof input === 'string' ? input : String(input);
+      const opts = init || {};
+      const method = (opts.method || 'GET').toUpperCase();
+      const body = (opts.body !== undefined && opts.body !== null)
+                   ? String(opts.body) : null;
+      return httpClient.fetchPromise(url, { method, body }).then(({ resp }) => {
+        const h = resp.headers || {};
+        return {
+          ok: resp.status >= 200 && resp.status < 300,
+          status: resp.status,
+          statusText: resp.statusText || '',
+          url,
+          headers: {
+            get: (n) => h[n.toLowerCase()] || null,
+            has: (n) => n.toLowerCase() in h,
+            forEach: (cb) => Object.entries(h).forEach(([k, v]) => cb(v, k)),
+          },
+          text: () => Promise.resolve(resp.body),
+          json: () => Promise.resolve(JSON.parse(resp.body)),
+          arrayBuffer: () => Promise.resolve(
+            resp.rawBytes ? resp.rawBytes.buffer : new ArrayBuffer(0)),
+          blob: () => Promise.reject(new Error('fetch().blob() not supported')),
+        };
+      });
+    };
+  }
+
   let running = true;
   let domOwner = { tabId: null, navId: 0 };
 

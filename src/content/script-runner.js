@@ -1,95 +1,118 @@
-/* Executes a list of <script> entries in document order.
- *
- * - Inline scripts run synchronously.
- * - External scripts are fetched via httpClient.fetchPromise (which
- *   rejects if the tab is aborted mid-navigation).
- * - Each script is wrapped in try/catch: an error in one does not stop
- *   the others (matches browser behavior). Errors are caught INSIDE
- *   runOne, logged there, and NOT re-thrown. The chain continues.
- * - If the tab navigates away (navId changes), the chain quietly stops.
- * - On eval failure of an external script, log status, content-type,
- *   body length and a body preview so we can tell apart "HTML error
- *   page", "chunked markers still present", "real syntax error".
- */
+import { createModuleLoader } from './esm-loader.js';
+import { resolveUrl } from 'src/base/url.js';
 
 export function runScripts(scripts, ctx) {
   const startNavId = ctx.tab.navId;
   const isStale = () => ctx.tab.navId !== startNavId;
 
+  const loader = createModuleLoader({
+    fetchSource: (url) => fetchScriptSource(url, ctx),
+    resolveSpecifier: resolveModuleSpecifier,
+  });
+
   let chain = Promise.resolve();
   for (const s of scripts) {
     chain = chain.then(() => {
       if (isStale()) return;
-      return runOne(s, ctx);
+      return runOne(s, ctx, loader);
     });
   }
   return chain;
 }
 
-/* QuickJS's Error.stack does not include the "Name: message" header that
- * V8 prepends. Reconstruct it so logs are useful. */
-function formatScriptError(e) {
-  if (!e) return 'Error';
-  const name = e.name || 'Error';
-  const msg  = e.message || '';
-  const stack = e.stack ? String(e.stack) : '';
-  if (msg && !stack.startsWith(name + ':'))
-    return name + ': ' + msg + (stack ? '\n' + stack : '');
-  if (msg) return name + ': ' + msg;
-  return stack || String(e);
+function resolveModuleSpecifier(spec, baseUrl) {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(spec)) return spec;
+  if (spec.startsWith('//')) return 'http:' + spec;
+  if (spec.startsWith('/') || spec.startsWith('./') || spec.startsWith('../')) {
+    return resolveUrl(baseUrl, spec);
+  }
+  if (spec.startsWith('#')) {
+    const hash = baseUrl.indexOf('#');
+    return (hash >= 0 ? baseUrl.slice(0, hash) : baseUrl) + spec;
+  }
+  throw new Error('bare import specifier "' + spec + '" is not supported');
 }
 
-function runOne(script, ctx) {
+function fetchScriptSource(url, ctx) {
+  return ctx.httpClient.fetchPromise(url, {
+    tabId: ctx.tab.id,
+    navId: ctx.tab.navId,
+  }).then(({ resp }) => {
+    if (!resp) throw new Error('no response for ' + url);
+    if (resp.status >= 400) throw new Error('HTTP ' + resp.status + ' for ' + url);
+    return resp.body || '';
+  });
+}
+
+function dbgErr(e) {
+  if (e === null || e === undefined) return String(e);
+  if (typeof e === 'string') return e;
+  if (typeof e === 'object') {
+    try {
+      if (e.name || e.message) {
+        return (e.name || 'Error') + ': ' + (e.message || '') +
+               (e.stack ? '\n' + e.stack : '');
+      }
+      const s = JSON.stringify(e);
+      if (s && s !== '{}') return s;
+      const keys = Object.keys(e);
+      if (keys.length) return keys.map(k => k + '=' + String(e[k])).join(', ');
+      return Object.prototype.toString.call(e);
+    } catch (_) { return String(e); }
+  }
+  return String(e);
+}
+
+function runOne(script, ctx, loader) {
   const type = (script.type || 'text/javascript').toLowerCase().trim();
 
-  /* Skip non-JS data scripts (<script type="application/json"> etc.). */
+  if (script.element && typeof script.element.hasAttribute === 'function' &&
+      script.element.hasAttribute('nomodule')) {
+    return Promise.resolve();
+  }
+
   if (type && type !== 'text/javascript' && type !== 'application/javascript' &&
       type !== 'text/ecmascript' && type !== 'application/ecmascript' &&
       type !== 'module') {
     return Promise.resolve();
   }
-  if (type === 'module') {
-    console.warn('[script] type="module" not supported yet — skipping ' +
-                 (script.src || '(inline)'));
-    return Promise.resolve();
-  }
+
+  if (type === 'module') return runModule(script, ctx, loader);
 
   if (script.src) {
-    return ctx.httpClient.fetchPromise(script.src, {
-      tabId: ctx.tab.id,
-      navId: ctx.tab.navId,
-    }).then(({ resp }) => {
-      if (!resp || !resp.body) {
-        console.warn('[script] empty body for ' + script.src);
-        return;
-      }
-      try {
-        (0, eval)(resp.body);
-      } catch (e) {
-        const ct = (resp.headers && resp.headers['content-type']) || '(none)';
-        const preview = String(resp.body)
-          .slice(0, 400)
-          .replace(/\r/g, '\\r')
-          .replace(/\n/g, '\\n');
-        console.error('[script] eval failed for ' + script.src);
-        console.error('[script]   status=' + resp.status +
-                      ' content-type=' + ct +
-                      ' body-length=' + resp.body.length);
-        console.error('[script]   error: ' + formatScriptError(e));
-        console.error('[script]   body preview: ' + preview);
+    return fetchScriptSource(script.src, ctx).then((body) => {
+      try { (0, eval)(body); }
+      catch (e) {
+        console.error('[script] eval failed for ' + script.src + ': ' + dbgErr(e));
       }
     }).catch((e) => {
-      console.error('[script] fetch failed for ' + script.src + ': ' +
-                    formatScriptError(e));
+      console.error('[script] fetch failed for ' + script.src + ': ' + dbgErr(e));
     });
   }
 
   if (script.inline && script.inline.length > 0) {
-    try {
-      (0, eval)(script.inline);
-    } catch (e) {
-      console.error('[script] inline eval failed: ' + formatScriptError(e));
+    try { (0, eval)(script.inline); }
+    catch (e) {
+      console.error('[script] inline eval failed: ' + dbgErr(e));
     }
+  }
+  return Promise.resolve();
+}
+
+let inlineModuleCounter = 0;
+
+function runModule(script, ctx, loader) {
+  if (script.src) {
+    return loader.load(script.src).catch((e) => {
+      console.error('[module] ' + script.src + ' failed: ' + dbgErr(e));
+    });
+  }
+  if (script.inline && script.inline.length > 0) {
+    const base = ctx.url.split('#')[0];
+    const url = base + '#inline-module-' + (++inlineModuleCounter);
+    return loader.loadInline(url, script.inline).catch((e) => {
+      console.error('[module] inline failed: ' + dbgErr(e));
+    });
   }
   return Promise.resolve();
 }

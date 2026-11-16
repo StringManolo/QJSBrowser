@@ -8,9 +8,14 @@
  *   - EventTarget bubbling goes up parentNode to the document.
  *   - innerHTML setter currently replaces content with text; a real HTML
  *     parser arrives in a later PR.
+ *   - Every mutator notifies src/dom/mutation-hook.js so the active tab
+ *     can be re-serialized on the next frame (dom-live-render).
+ *   - isConnected gates notification so building a detached tree or a
+ *     DocumentFragment doesn't spam the hook.
  */
 
 import { EventTarget, Event } from 'src/dom/events.js';
+import { notifyMutation, beginMutationBatch, endMutationBatch } from 'src/dom/mutation-hook.js';
 
 const ELEMENT_NODE = 1;
 const TEXT_NODE    = 3;
@@ -23,9 +28,6 @@ function kebabCase(s) {
   return s.replace(/[A-Z]/g, m => '-' + m.toLowerCase());
 }
 
-/* Match one compound selector (no whitespace) against an element.
- * Supports: tag, #id, .class (multiple), [attr], [attr=value].
- * Does NOT support pseudo-classes or sibling combinators. */
 function matchCompound(el, compound) {
   if (!el || el.nodeType !== ELEMENT_NODE) return false;
   const re = /([a-zA-Z][\w-]*)?(#[\w-]+)?((?:\.[\w-]+)*)((?:\[[^\]]+\])*)/;
@@ -59,7 +61,6 @@ function matchCompound(el, compound) {
   return true;
 }
 
-/* Does some ancestor of `node` match parts[idx], recursively up? */
 function ancestorMatches(node, parts, idx) {
   let n = node;
   while (n && n.nodeType === ELEMENT_NODE) {
@@ -72,8 +73,6 @@ function ancestorMatches(node, parts, idx) {
   return false;
 }
 
-/* Walk children (depth-first) and collect elements matching the last part
- * of a compound selector whose ancestor chain matches the preceding parts. */
 function queryFrom(root, selector) {
   const results = [];
   for (const compound of String(selector).split(',').map(s => s.trim()).filter(Boolean)) {
@@ -123,16 +122,32 @@ export class Node extends EventTarget {
     return i > 0 ? s[i - 1] : null;
   }
 
+  /* Connected to the document? Gates mutation notification. */
+  get isConnected() {
+    let n = this;
+    while (n) {
+      if (n.nodeType === DOCUMENT_NODE) return true;
+      n = n.parentNode;
+    }
+    return false;
+  }
+
   appendChild(child) {
     if (!child) throw new TypeError('appendChild: node is required');
     if (child.nodeType === DOCUMENT_FRAGMENT_NODE) {
-      const kids = child.childNodes.slice();
-      for (const k of kids) this.appendChild(k);
+      beginMutationBatch();
+      try {
+        const kids = child.childNodes.slice();
+        for (const k of kids) this.appendChild(k);
+      } finally {
+        endMutationBatch();
+      }
       return child;
     }
     if (child.parentNode) child.parentNode.removeChild(child);
     child.parentNode = this;
     this.childNodes.push(child);
+    if (this.isConnected) notifyMutation();
     return child;
   }
 
@@ -142,14 +157,20 @@ export class Node extends EventTarget {
     if (ref === child) return child;
     if (ref.parentNode !== this) throw new Error('insertBefore: ref is not a child');
     if (child.nodeType === DOCUMENT_FRAGMENT_NODE) {
-      const kids = child.childNodes.slice();
-      for (const k of kids) this.insertBefore(k, ref);
+      beginMutationBatch();
+      try {
+        const kids = child.childNodes.slice();
+        for (const k of kids) this.insertBefore(k, ref);
+      } finally {
+        endMutationBatch();
+      }
       return child;
     }
     if (child.parentNode) child.parentNode.removeChild(child);
     child.parentNode = this;
     const idx = this.childNodes.indexOf(ref);
     this.childNodes.splice(idx, 0, child);
+    if (this.isConnected) notifyMutation();
     return child;
   }
 
@@ -158,6 +179,7 @@ export class Node extends EventTarget {
     if (idx < 0) throw new Error('removeChild: node is not a child');
     this.childNodes.splice(idx, 1);
     child.parentNode = null;
+    if (this.isConnected) notifyMutation();
     return child;
   }
 
@@ -168,6 +190,7 @@ export class Node extends EventTarget {
     this.childNodes[idx] = newChild;
     newChild.parentNode = this;
     oldChild.parentNode = null;
+    if (this.isConnected) notifyMutation();
     return oldChild;
   }
 
@@ -191,6 +214,8 @@ export class Node extends EventTarget {
     this.childNodes = [];
     if (v !== null && v !== undefined && String(v).length > 0) {
       this.appendChild(new Text(String(v)));
+    } else if (this.isConnected) {
+      notifyMutation();
     }
   }
 
@@ -224,11 +249,11 @@ export class Text extends Node {
   get nodeType() { return TEXT_NODE; }
   get nodeName() { return '#text'; }
   get nodeValue() { return this._data; }
-  set nodeValue(v) { this._data = String(v == null ? '' : v); }
+  set nodeValue(v) { this._data = String(v == null ? '' : v); if (this.isConnected) notifyMutation(); }
   get data() { return this._data; }
-  set data(v) { this._data = String(v == null ? '' : v); }
+  set data(v) { this._data = String(v == null ? '' : v); if (this.isConnected) notifyMutation(); }
   get textContent() { return this._data; }
-  set textContent(v) { this._data = String(v == null ? '' : v); }
+  set textContent(v) { this._data = String(v == null ? '' : v); if (this.isConnected) notifyMutation(); }
   get length() { return this._data.length; }
 }
 
@@ -350,11 +375,17 @@ export class Element extends Node {
   get nodeType() { return ELEMENT_NODE; }
   get nodeName() { return this.tagName; }
 
-  setAttribute(name, value)    { this.attributes[String(name).toLowerCase()] = String(value); }
-  getAttribute(name)           { const v = this.attributes[String(name).toLowerCase()]; return v === undefined ? null : v; }
-  removeAttribute(name)        { delete this.attributes[String(name).toLowerCase()]; }
-  hasAttribute(name)           { return String(name).toLowerCase() in this.attributes; }
-  getAttributeNames()          { return Object.keys(this.attributes); }
+  setAttribute(name, value) {
+    this.attributes[String(name).toLowerCase()] = String(value);
+    if (this.isConnected) notifyMutation();
+  }
+  getAttribute(name)    { const v = this.attributes[String(name).toLowerCase()]; return v === undefined ? null : v; }
+  removeAttribute(name) {
+    delete this.attributes[String(name).toLowerCase()];
+    if (this.isConnected) notifyMutation();
+  }
+  hasAttribute(name)    { return String(name).toLowerCase() in this.attributes; }
+  getAttributeNames()   { return Object.keys(this.attributes); }
 
   get id()        { return this.getAttribute('id') || ''; }
   set id(v)       { this.setAttribute('id', v); }
@@ -382,8 +413,6 @@ export class Element extends Node {
 
   get innerHTML() { return this.childNodes.map(serialize).join(''); }
   set innerHTML(html) {
-    /* Rough fallback until the real parser lands in a later PR: keep the
-     * raw text so at least `el.innerHTML = ''` clears content correctly. */
     this.textContent = String(html == null ? '' : html);
   }
   get outerHTML() { return serialize(this); }

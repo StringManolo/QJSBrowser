@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>QJSBrowser React Real App Test</title>
+</head>
+<body>
+
+<h2>React Real App Test</h2>
+<p>Tests useState, useEffect, dynamic lists, and event handlers.</p>
+
+<div id="root"></div>
+
+<div id="log"></div>
+
+<script>
+function logReact(msg, ok) {
+  var box = document.getElementById('log');
+  if (!box) return;
+  var p = document.createElement('p');
+  p.textContent = (ok ? '✓ ' : '✗ ') + msg;
+  p.style.color = ok ? '#66ff66' : '#ff4444';
+  box.appendChild(p);
+}
+
+/* Captured by the app's useEffect. */
+window.__effectLog = [];
+</script>
+
+<script>
+/* Wait for React + ReactDOM to be available. */
+document.addEventListener('DOMContentLoaded', function() {
+  if (typeof React === 'undefined' || typeof ReactDOM === 'undefined') {
+    logReact('React or ReactDOM missing', false);
+    return;
+  }
+  logReact('React + ReactDOM globals loaded', true);
+
+  try {
+    var container = document.getElementById('root');
+    var root = ReactDOM.createRoot(container);
+
+    function App() {
+      var countState = React.useState(0);
+      var count = countState[0];
+      var setCount = countState[1];
+
+      var itemsState = React.useState(['alpha', 'beta']);
+      var items = itemsState[0];
+      var setItems = itemsState[1];
+
+      var textState = React.useState('hello');
+      var text = textState[0];
+      var setText = textState[1];
+
+      React.useEffect(function() {
+        window.__effectLog.push(count);
+      }, [count]);
+
+      return React.createElement('div', { id: 'app' },
+        React.createElement('h1', { id: 'title' }, 'React Real App'),
+        React.createElement('p', null,
+          'Count: ',
+          React.createElement('span', { id: 'count' }, String(count))
+        ),
+        React.createElement('button', {
+          id: 'inc',
+          onClick: function() { setCount(count + 1); }
+        }, '+1'),
+        React.createElement('button', {
+          id: 'add-item',
+          onClick: function() { setItems(items.concat(['item-' + items.length])); }
+        }, 'Add item'),
+        React.createElement('ul', { id: 'items' },
+          items.map(function(it, i) {
+            return React.createElement('li', { key: i }, it);
+          })
+        ),
+        React.createElement('input', {
+          id: 'txt',
+          value: text,
+          onChange: function(e) { setText(e.target.value); }
+        }),
+        React.createElement('p', { id: 'txt-display' }, 'Text: ' + text)
+      );
+    }
+
+    root.render(React.createElement(App));
+    logReact('root.render(<App/>) called', true);
+
+    /* React 18 concurrent mode commits async. Poll until the app mounts,
+     * then run the interaction tests. */
+    var waited = 0;
+    function pollMount() {
+      waited += 50;
+      var app = document.getElementById('app');
+      if (app) { runInteractionTests(container); return; }
+      if (waited >= 2000) {
+        logReact('App did not mount within 2s', false);
+        logReact('  root.innerHTML: ' +
+                 JSON.stringify(container.innerHTML.slice(0, 200)), false);
+        return;
+      }
+      setTimeout(pollMount, 50);
+    }
+    pollMount();
+  } catch (e) {
+    logReact('React threw: ' + (e && e.stack || String(e)), false);
+  }
+
+  function runInteractionTests(container) {
+    logReact('App mounted', true);
+
+    var countEl = document.getElementById('count');
+    var incBtn  = document.getElementById('inc');
+    var addBtn  = document.getElementById('add-item');
+    var itemsUl = document.getElementById('items');
+    var txtEl   = document.getElementById('txt');
+
+    if (!countEl || !incBtn || !addBtn || !itemsUl || !txtEl) {
+      logReact('Missing elements after mount — partial render', false);
+      return;
+    }
+    logReact('All expected elements present', true);
+
+    logReact('Initial count = ' + countEl.textContent,
+        countEl.textContent === '0');
+
+    var initialItems = itemsUl.children.length;
+    logReact('Initial items count = ' + initialItems, initialItems === 2);
+
+    logReact('Initial input value = ' + JSON.stringify(txtEl.value),
+        txtEl.value === 'hello');
+
+    /* --- Test 1: click +1 → count becomes 1 --- */
+    incBtn.click();
+    waitFor(function() { return countEl.textContent === '1'; }, 500,
+      function() {
+        logReact('After click +1: count = ' + countEl.textContent, true);
+        testAddItem();
+      },
+      function() {
+        logReact('After click +1: count still ' + countEl.textContent +
+                 ' (expected 1)', false);
+        testAddItem();
+      });
+
+    function testAddItem() {
+      addBtn.click();
+      waitFor(function() { return itemsUl.children.length === 3; }, 500,
+        function() {
+          logReact('After click Add item: items = ' + itemsUl.children.length, true);
+          logReact('Third item text = ' +
+                   JSON.stringify(itemsUl.children[2].textContent),
+              itemsUl.children[2].textContent === 'item-2');
+          testEffect();
+        },
+        function() {
+          logReact('After click Add item: items = ' +
+                   itemsUl.children.length + ' (expected 3)', false);
+          testEffect();
+        });
+    }
+
+    function testEffect() {
+      /* useEffect runs after commit. By the time both interactions above
+       * committed, __effectLog should contain at least [0, 1]. */
+      var log = window.__effectLog;
+      var ok = log.indexOf(0) !== -1 && log.indexOf(1) !== -1;
+      logReact('useEffect ran on count changes: [' + log.join(', ') + ']', ok);
+      logReact('DONE — React Real App is functional', true);
+    }
+  }
+
+  function waitFor(predicate, timeoutMs, onOk, onFail) {
+    var elapsed = 0;
+    function step() {
+      if (predicate()) { onOk(); return; }
+      elapsed += 50;
+      if (elapsed >= timeoutMs) { onFail(); return; }
+      setTimeout(step, 50);
+    }
+    setTimeout(step, 50);
+  }
+});
+</script>
+
+<!-- 
+<script src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script> 
+-->
+
+<script src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.development.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.development.js"></script>
+
+</body>
+</html>

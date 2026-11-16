@@ -4,6 +4,7 @@ import { domToText }      from 'src/content/dom-to-text.js';
 import { runScripts }     from 'src/content/script-runner.js';
 import { resetDocument, setReadyState } from 'src/browser/dom-globals.js';
 import { setMutationHook, beginMutationBatch, endMutationBatch } from 'src/dom/mutation-hook.js';
+import { Event }          from 'src/dom/events.js';
 import { drawWindow }     from 'src/ui/window.js';
 import { createToolbar }  from 'src/ui/toolbar.js';
 import { createTabBar }   from 'src/ui/tab-bar.js';
@@ -57,15 +58,10 @@ export function createController(deps) {
   }
   function flushRender() {
     if (!(dirty && Date.now() - lastRender >= MIN_RENDER_MS)) return;
-    const tab = tabManager.active();
-    if (tab && tab.domDirty && domOwner.tabId === tab.id && domOwner.navId === tab.navId) {
-      refreshTabFromDom(tab);
-    } else if (tab) {
-      tab.domDirty = false;
-    }
     render();
   }
 
+/*
   function refreshTabFromDom(tab) {
     tab.domDirty = false;
 
@@ -81,9 +77,12 @@ export function createController(deps) {
     const focusCursor  = focused ? tab.formState.cursorPos() : 0;
 
     tab.formState.reset();
+    const newNodes = new Map();
     const parsed = domToText(
-      globalThis.document.body, tab.currentUrl, theme, tab.formState, tab._css || []
+      globalThis.document.body, tab.currentUrl, theme, tab.formState,
+      tab._css || [], newNodes
     );
+    tab.domNodes = newNodes;
     tab.pageView.updateContent(parsed.segments, parsed.links);
 
     for (const el of tab.formState.elements.values()) {
@@ -103,6 +102,74 @@ export function createController(deps) {
       }
     }
   }
+  */
+
+  function refreshTabFromDom(tab) {
+  tab.domDirty = false;
+
+  const formSnapshot = new Map();
+  for (const el of tab.formState.elements.values()) {
+    if (el.name && (el.kind === 'text' || el.kind === 'password' || el.kind === 'textarea')) {
+      formSnapshot.set(el.name + '|' + el.kind, el.value);
+    }
+  }
+  const focused = tab.formState.getFocused();
+  const focusCursor = focused ? tab.formState.cursorPos() : 0;
+
+  /* Capture the live DOM node that currently holds focus BEFORE we
+   * blow away the form state. React reuses the same DOM node when it
+   * re-renders a controlled <input> (same position, no key change),
+   * so after domToText re-traverses the tree we can reattach focus by
+   * node identity. This matters because simple React inputs often
+   * have no `name` attribute, which makes the name|kind heuristic a
+   * no-op and drops focus on every keystroke. */
+  const activeNode = (typeof globalThis.document !== 'undefined')
+    ? globalThis.document.activeElement
+    : null;
+
+  tab.formState.reset();
+  const newNodes = new Map();
+  const parsed = domToText(
+    globalThis.document.body, tab.currentUrl, theme, tab.formState,
+    tab._css || [], newNodes
+  );
+  tab.domNodes = newNodes;
+  tab.pageView.updateContent(parsed.segments, parsed.links);
+
+  for (const el of tab.formState.elements.values()) {
+    if (el.name && (el.kind === 'text' || el.kind === 'password' || el.kind === 'textarea')) {
+      const key = el.name + '|' + el.kind;
+      if (formSnapshot.has(key)) el.value = formSnapshot.get(key);
+    }
+  }
+
+  /* Restore focus. Primary path: match by DOM node identity. Fallback:
+   * match by name+kind for the edge case where React replaced the node
+   * (activeElement becomes <body>) and the element does carry a name. */
+  let restored = false;
+  if (activeNode && activeNode !== globalThis.document.body) {
+    for (const [id, node] of newNodes) {
+      if (node === activeNode) {
+        const el = tab.formState.get(id);
+        if (el && (el.kind === 'text' || el.kind === 'password' || el.kind === 'textarea')) {
+          tab.formState.focus(id);
+          tab.formState.moveCursorTo(focusCursor);
+          restored = true;
+        }
+        break;
+      }
+    }
+  }
+  if (!restored && focused && focused.name) {
+    for (const [id, el] of tab.formState.elements) {
+      if (el.name === focused.name && el.kind === focused.kind) {
+        tab.formState.focus(id);
+        tab.formState.moveCursorTo(focusCursor);
+        break;
+      }
+    }
+  }
+}
 
   function isStale(options) {
     if (!options || options.navId === undefined) return false;
@@ -141,6 +208,16 @@ export function createController(deps) {
     const { rows, cols } = tui.size();
     const tab = tabManager.active();
     if (!tab) return;
+
+    /* If React committed since the last paint (domDirty = true), re-serialize
+     * the DOM here so any render() path — synchronous from handleInput,
+     * throttled from flushRender, or explicit from navigation — picks up
+     * the latest state in one place. */
+    if (tab.domDirty && domOwner.tabId === tab.id && domOwner.navId === tab.navId) {
+      refreshTabFromDom(tab);
+    } else {
+      tab.domDirty = false;
+    }
 
     tab.cursorPos = null;
     tui.erase();
@@ -209,7 +286,11 @@ export function createController(deps) {
           tab.mode = 'page';
         } else {
           const nextId = tab.formState.tabNext(1);
-          if (nextId) { tab.formState.focus(nextId); tab.pageView.invalidate(); }
+          if (nextId) {
+            tab.formState.focus(nextId);
+            focusNodeFor(tab, nextId);
+            tab.pageView.invalidate();
+          }
           else tab.mode = 'omnibox';
         }
         continue;
@@ -221,7 +302,60 @@ export function createController(deps) {
         handlePageKey(tab, ch);
       }
     }
+
+    /* Drain pending microtasks here — OUTSIDE any event dispatch.
+     *
+     * React 18 classifies 'input'/'change' as ContinuousEventPriority
+     * (not Discrete like 'click'/'keydown'). Discrete events run flushSync
+     * at the end of dispatch, so the commit completes before dispatchEvent
+     * returns. Continuous events schedule the render via the React
+     * scheduler (MessageChannel = microtask in our polyfill) and return
+     * immediately. If we don't pump, the synchronous render() below paints
+     * stale segments; the visible output only catches up on the next click.
+     *
+     * Why not pump inside dispatchEvent? Because pumping while React is
+     * mid-dispatch (currentUpdatePriority still set, batch config still
+     * active) makes React think the pump's work belongs to that dispatch.
+     * React commits state while its own dispatch stack is still half
+     * unwound — buttons and controlled inputs both break. Pumping here,
+     * after all React dispatch handlers have returned, is safe. */
+    if (typeof pumpJobs === 'function') {
+      try { pumpJobs(200); } catch (_) {}
+    }
     render();
+  }
+
+  function focusNodeFor(tab, elementId) {
+    const node = tab.domNodes && tab.domNodes.get(elementId);
+    if (node && typeof node.focus === 'function') {
+      try { node.focus(); } catch (_) {}
+    }
+  }
+
+  /* Write node[prop] bypassing any instance-level setter. React 18 installs
+   * a custom value/checked setter on the instance to track changes; if we
+   * used node.value = x directly, React's tracker would see the new value
+   * and refuse to fire onChange (React's guard: "value hasn't changed").
+   * Writing through the prototype's descriptor leaves the tracker stale,
+   * so the input event we dispatch right after triggers onChange normally. */
+  function setNativeProp(node, prop, value) {
+    const proto = Object.getPrototypeOf(node);
+    const desc = proto ? Object.getOwnPropertyDescriptor(proto, prop) : null;
+    if (desc && typeof desc.set === 'function') {
+      desc.set.call(node, value);
+    } else {
+      node[prop] = value;
+    }
+  }
+
+  function syncNodeFromFormState(tab, elementId) {
+    const el = tab.formState.get(elementId);
+    const node = tab.domNodes && tab.domNodes.get(elementId);
+    if (!el || !node) return;
+    if (node.value !== el.value) {
+      setNativeProp(node, 'value', el.value);
+      node.dispatchEvent(new Event('input', { bubbles: true, cancelable: false }));
+    }
   }
 
   function handleOmniboxKey(tab, ch) {
@@ -259,15 +393,35 @@ export function createController(deps) {
       if (ch === keys.HOME)        { fs.moveCursorTo(0); tab.pageView.invalidate(); return; }
       if (ch === keys.END)         { fs.moveCursorTo(9999); tab.pageView.invalidate(); return; }
       if (ch === keys.BACKSPACE || ch === keys.NC_BACKSP || ch === keys.BACKSPACE2) {
-        if (fs.backspace()) tab.pageView.invalidate();
+        if (fs.backspace()) {
+          syncNodeFromFormState(tab, focusedId);
+          tab.pageView.invalidate();
+        }
         return;
       }
-      if (ch === keys.DELETE) { if (fs.del()) tab.pageView.invalidate(); return; }
+      if (ch === keys.DELETE) {
+        if (fs.del()) {
+          syncNodeFromFormState(tab, focusedId);
+          tab.pageView.invalidate();
+        }
+        return;
+      }
       if (ch === keys.ENTER || ch === keys.ENTER2 || ch === keys.NC_ENTER) {
-        submitForm(tab); return;
+        const node = tab.domNodes && tab.domNodes.get(focusedId);
+        if (node) {
+          const ev = new Event('keydown', { bubbles: true, cancelable: true });
+          ev.key = 'Enter';
+          node.dispatchEvent(ev);
+          if (ev._handled) return;
+        }
+        submitForm(tab);
+        return;
       }
       if (ch >= 32 && ch < 127) {
-        if (fs.type(String.fromCharCode(ch))) tab.pageView.invalidate();
+        if (fs.type(String.fromCharCode(ch))) {
+          syncNodeFromFormState(tab, focusedId);
+          tab.pageView.invalidate();
+        }
         return;
       }
     }
@@ -357,14 +511,7 @@ export function createController(deps) {
       const w = (seg.text || '').length;
       if (w > 0 && relX >= cx && relX < cx + w) {
         if (seg.elementId) {
-          const el = tab.formState.get(seg.elementId);
-          if (!el) break;
-          if (el.kind === 'checkbox' || el.kind === 'radio') tab.formState.toggle(seg.elementId);
-          else if (el.kind === 'submit' || el.kind === 'button') {
-            if (el.kind === 'submit') submitForm(tab, el);
-          } else if (el.kind === 'reset') resetForm(tab, el);
-          else tab.formState.focus(seg.elementId);
-          tab.pageView.invalidate();
+          activateFormElement(tab, seg.elementId);
           return;
         }
         if (seg.linkN !== null) {
@@ -378,6 +525,61 @@ export function createController(deps) {
     tab.formState.blur();
     tab.pageView.invalidate();
     tab.mode = 'page';
+  }
+
+  function activateFormElement(tab, elementId) {
+    const el = tab.formState.get(elementId);
+    if (!el) return;
+    const node = tab.domNodes && tab.domNodes.get(elementId);
+
+    if (el.kind === 'checkbox' || el.kind === 'radio') {
+      if (node) {
+        if (el.kind === 'checkbox') {
+          setNativeProp(node, 'checked', !node.checked);
+        } else {
+          const group = el.name;
+          if (group) {
+            for (const [id2, n2] of tab.domNodes) {
+              if (id2 === elementId) continue;
+              const el2 = tab.formState.get(id2);
+              if (el2 && el2.kind === 'radio' && el2.name === group) {
+                if (n2 && n2.checked !== undefined) setNativeProp(n2, 'checked', false);
+              }
+            }
+          }
+          setNativeProp(node, 'checked', true);
+        }
+        const ev = new Event('click', { bubbles: true, cancelable: true });
+        node.dispatchEvent(ev);
+        if (!ev._handled) {
+          tab.formState.toggle(elementId);
+        }
+        tab.pageView.invalidate();
+        return;
+      }
+      tab.formState.toggle(elementId);
+      tab.pageView.invalidate();
+      return;
+    }
+
+    if (el.kind === 'submit' || el.kind === 'button' || el.kind === 'reset') {
+      if (node) {
+        const ev = new Event('click', { bubbles: true, cancelable: true });
+        node.dispatchEvent(ev);
+        if (ev._handled) {
+          tab.pageView.invalidate();
+          return;
+        }
+      }
+      if (el.kind === 'submit') submitForm(tab, el);
+      else if (el.kind === 'reset') resetForm(tab, el);
+      tab.pageView.invalidate();
+      return;
+    }
+
+    tab.formState.focus(elementId);
+    focusNodeFor(tab, elementId);
+    tab.pageView.invalidate();
   }
 
   function submitForm(tab, buttonEl) {
@@ -418,6 +620,7 @@ export function createController(deps) {
       tab.omnibox.clear();
       tab.mode = 'omnibox';
       tab.statusText = 'New Tab';
+      tab.domNodes = null;
     }
   }
 
@@ -456,6 +659,7 @@ export function createController(deps) {
     tab.formState.blur();
     tab.formState.reset();
     tab.domDirty = false;
+    tab.domNodes = null;
     tab.omnibox.setText(url);
     tab.pageView.setContent('Loading ' + url + ' …', []);
     httpClient.fetch(url, { ...options, tabId: tab.id, navId: tab.navId });
@@ -513,8 +717,6 @@ export function createController(deps) {
     if (tab === tabManager.active()) render();
   }
 
-  /* Run scripts + fire DOMContentLoaded + load. Bails out silently on
-   * navigation (navId changes while scripts are still executing). */
   function executePageScripts(tab, scripts, url) {
     const startNavId = tab.navId;
     const isStale = () => tab.navId !== startNavId;
@@ -542,8 +744,6 @@ export function createController(deps) {
   }
 
   function handleResponse(tabId, url, resp, options) {
-    /* Promise wrapper intercept: script-runner and future window.fetch
-     * resolve here instead of going through the page-render path. */
     if (options && options._promise) {
       try { options._promise.resolve({ url, resp, options }); } catch (_) {}
       return;
@@ -619,7 +819,10 @@ export function createController(deps) {
       }
 
       tab._css = css;
-      const parsed = domToText(globalThis.document.body, url, theme, tab.formState, css);
+      tab.domNodes = new Map();
+      const parsed = domToText(
+        globalThis.document.body, url, theme, tab.formState, css, tab.domNodes
+      );
       tab.domDirty = false;
       tab.pageView.setContent(parsed.segments, parsed.links);
       plainLen = parsed.text.length;
@@ -641,8 +844,6 @@ export function createController(deps) {
         }
       }
 
-      /* Kick off script execution. Async — this function returns while
-       * scripts still run. DOMContentLoaded and load fire from inside. */
       if (scripts.length > 0) executePageScripts(tab, scripts, url);
       else {
         setReadyState('interactive');
@@ -657,6 +858,7 @@ export function createController(deps) {
       tab.pageView.setContent(resp.body, []);
       plainLen = resp.body.length;
       domOwner = { tabId: null, navId: 0 };
+      tab.domNodes = null;
     }
 
     tab.statusText = `HTTP ${resp.status} ${resp.statusText} — ${plainLen} chars, ${linksCount} links, ${imagesCount} images`;
